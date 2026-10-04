@@ -1,0 +1,331 @@
+{#
+  @fileoverview Шаблон пересылки сообщения.
+  Генерирует callback-обработчик, который пересылает исходное сообщение
+  в один или несколько чатов назначения.
+#}
+
+{% set source_mode = sourceMessageIdSource or 'current_message' %}
+{% set linked_source_node_id = sourceMessageNodeId or '' %}
+
+# Обработчик пересылки сообщения: {{ nodeId }}
+{% if linked_source_node_id %}
+# Привязанный узел-источник: {{ linked_source_node_id }}
+{% endif %}
+
+async def _extract_forward_message_id_{{ safeName }}(raw_message_data):
+    """Извлекает числовой message_id из сохранённых данных сообщения."""
+    if not raw_message_data:
+        return None
+
+    _message_data = raw_message_data
+    if isinstance(_message_data, str):
+        try:
+            _message_data = json.loads(_message_data)
+        except Exception:
+            return None
+
+    if not isinstance(_message_data, dict):
+        return None
+
+    _raw_message_id = _message_data.get("message_id")
+    if _raw_message_id in (None, ""):
+        return None
+
+    try:
+        return int(str(_raw_message_id).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+async def _load_forward_message_from_log_{{ safeName }}(callback_query: types.CallbackQuery, linked_node_id: str = "", use_last_logged: bool = False):
+    """Пытается получить message_id из bot_messages для привязанного узла или последнего сообщения."""
+    db_pool_ref = globals().get("db_pool")
+    project_id = globals().get("PROJECT_ID")
+
+    if not db_pool_ref:
+        return None
+
+    source_chat_id = callback_query.message.chat.id
+    user_id = callback_query.from_user.id
+    chat_lookup_id = str(source_chat_id)
+    actor_lookup_id = str(user_id)
+
+    try:
+        async with db_pool_ref.acquire() as conn:
+            if linked_node_id:
+                if project_id is not None:
+                    _linked_row = await conn.fetchrow(
+                        """
+                        SELECT message_data
+                        FROM bot_messages
+                        WHERE project_id = $1
+                          AND user_id = $2
+                          AND node_id = $3
+                          AND message_type = 'bot'
+                          AND message_data->>'message_id' IS NOT NULL
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """,
+                        project_id,
+                        chat_lookup_id,
+                        linked_node_id,
+                    )
+                else:
+                    _linked_row = await conn.fetchrow(
+                        """
+                        SELECT message_data
+                        FROM bot_messages
+                        WHERE user_id = $1
+                          AND node_id = $2
+                          AND message_type = 'bot'
+                          AND message_data->>'message_id' IS NOT NULL
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """,
+                        chat_lookup_id,
+                        linked_node_id,
+                    )
+
+                if _linked_row:
+                    _linked_message_id = await _extract_forward_message_id_{{ safeName }}(_linked_row.get("message_data"))
+                    if _linked_message_id is not None:
+                        return _linked_message_id
+
+            if use_last_logged:
+                _lookup_ids = [chat_lookup_id]
+                if actor_lookup_id not in _lookup_ids:
+                    _lookup_ids.append(actor_lookup_id)
+
+                for _lookup_id in _lookup_ids:
+                    if project_id is not None:
+                        _last_row = await conn.fetchrow(
+                            """
+                            SELECT message_data
+                            FROM bot_messages
+                            WHERE project_id = $1
+                              AND user_id = $2
+                              AND message_data->>'message_id' IS NOT NULL
+                            ORDER BY created_at DESC
+                            LIMIT 1
+                            """,
+                            project_id,
+                            _lookup_id,
+                        )
+                    else:
+                        _last_row = await conn.fetchrow(
+                            """
+                            SELECT message_data
+                            FROM bot_messages
+                            WHERE user_id = $1
+                              AND message_data->>'message_id' IS NOT NULL
+                            ORDER BY created_at DESC
+                            LIMIT 1
+                            """,
+                            _lookup_id,
+                        )
+
+                    if _last_row:
+                        _last_message_id = await _extract_forward_message_id_{{ safeName }}(_last_row.get("message_data"))
+                        if _last_message_id is not None:
+                            return _last_message_id
+    except Exception as e:
+        logging.warning(f"forward_message node {{ nodeId }}: failed to load source from bot_messages: {e}")
+
+    return None
+
+
+async def _resolve_forward_message_source_{{ safeName }}(callback_query: types.CallbackQuery):
+    """Определяет исходный чат и message_id для пересылки."""
+    user_id = callback_query.from_user.id
+    source_chat_id = callback_query.message.chat.id
+    source_message_id = callback_query.message.message_id
+    linked_source_node_id = {{ linked_source_node_id | escape_python_string }}
+
+    if linked_source_node_id and {{ source_mode | escape_python_string }} == "current_message":
+        _linked_message_id = await _load_forward_message_from_log_{{ safeName }}(
+            callback_query,
+            linked_node_id=linked_source_node_id,
+            use_last_logged=False,
+        )
+        if _linked_message_id is not None:
+            return source_chat_id, _linked_message_id
+
+    if {{ source_mode | escape_python_string }} == "current_message" and source_chat_id > 0:
+        _fallback_message_id = await _load_forward_message_from_log_{{ safeName }}(
+            callback_query,
+            linked_node_id=linked_source_node_id,
+            use_last_logged=True,
+        )
+        if _fallback_message_id is not None:
+            return source_chat_id, _fallback_message_id
+
+    if {{ source_mode | escape_python_string }} == "last_message":
+        _last_message_id = await _load_forward_message_from_log_{{ safeName }}(
+            callback_query,
+            linked_node_id=linked_source_node_id,
+            use_last_logged=True,
+        )
+        if _last_message_id is not None:
+            return source_chat_id, _last_message_id
+        return source_chat_id, source_message_id
+
+    if {{ source_mode | escape_python_string }} == "last_bot_message":
+        _last_bot_msg_id = user_data.get(user_id, {}).get("last_bot_message_id")
+        if _last_bot_msg_id is not None:
+            try:
+                return source_chat_id, int(_last_bot_msg_id)
+            except (TypeError, ValueError):
+                pass
+        # Fallback на last_message если last_bot_message_id не найден
+        _fallback_id = await _load_forward_message_from_log_{{ safeName }}(
+            callback_query,
+            linked_node_id=linked_source_node_id,
+            use_last_logged=True,
+        )
+        if _fallback_id is not None:
+            return source_chat_id, _fallback_id
+        return source_chat_id, source_message_id
+
+    if {{ source_mode | escape_python_string }} == "manual":
+        raw_source_message_id = {{ sourceMessageId | escape_python_string }}
+    elif {{ source_mode | escape_python_string }} == "variable":
+        _all_vars = await init_all_user_vars(user_id)
+        raw_source_message_id = _all_vars.get({{ sourceMessageVariableName | escape_python_string }}, "")
+    else:
+        raw_source_message_id = str(source_message_id)
+
+    raw_source_message_id = str(raw_source_message_id).strip()
+    if raw_source_message_id:
+        try:
+            source_message_id = int(raw_source_message_id)
+        except ValueError:
+            logging.warning(
+                f"forward_message node {{ nodeId }}: source message id '{raw_source_message_id}' is not numeric, using current message"
+            )
+
+    return source_chat_id, source_message_id
+
+
+async def _resolve_forward_message_targets_{{ safeName }}(callback_query: types.CallbackQuery):
+    """Собирает список уникальных чатов назначения с опциональным thread_id."""
+    user_id = callback_query.from_user.id
+    target_chat_ids = []
+    target_thread_ids = {}
+    _all_vars = None
+
+{% for recipient in targetRecipients %}
+{% if recipient.targetChatIdSource == 'admin_ids' %}
+    for admin_id in ADMIN_IDS:
+        if admin_id not in target_chat_ids:
+            target_chat_ids.append(admin_id)
+{% elif recipient.targetChatIdSource == 'variable' %}
+    if _all_vars is None:
+        _all_vars = await init_all_user_vars(user_id)
+    _raw_target_chat_id = _all_vars.get({{ recipient.targetChatVariableName | escape_python_string }}, "")
+    _raw_target_chat_id = str(_raw_target_chat_id).strip()
+    if _raw_target_chat_id:
+        try:
+            _normalized_target_chat_id = int(_raw_target_chat_id)
+            if {{ (recipient.targetChatType or 'user') | escape_python_string }} == 'group' and _normalized_target_chat_id > 0:
+                _normalized_target_chat_id = int(f"-100{_normalized_target_chat_id}")
+        except ValueError:
+            _normalized_target_chat_id = _raw_target_chat_id
+        if _normalized_target_chat_id not in target_chat_ids:
+            target_chat_ids.append(_normalized_target_chat_id)
+{%- if recipient.targetThreadIdSource == 'variable' and recipient.targetThreadIdVariable %}
+            if _all_vars is None:
+                _all_vars = await init_all_user_vars(user_id)
+            _thread_var_val = _all_vars.get({{ recipient.targetThreadIdVariable | escape_python_string }}, "")
+            if _thread_var_val:
+                try:
+                    target_thread_ids[_normalized_target_chat_id] = int(str(_thread_var_val).strip())
+                except (TypeError, ValueError):
+                    pass
+{%- elif recipient.targetThreadId %}
+            _thread_id_raw = {{ recipient.targetThreadId | escape_python_string }}
+            if _thread_id_raw:
+                try:
+                    target_thread_ids[_normalized_target_chat_id] = int(_thread_id_raw)
+                except (TypeError, ValueError):
+                    pass
+{%- endif %}
+{% else %}
+    _raw_target_chat_id = {{ recipient.targetChatId | escape_python_string }}
+    if _raw_target_chat_id:
+        try:
+            _normalized_target_chat_id = int(_raw_target_chat_id)
+            if {{ (recipient.targetChatType or 'user') | escape_python_string }} == 'group' and _normalized_target_chat_id > 0:
+                _normalized_target_chat_id = int(f"-100{_normalized_target_chat_id}")
+        except ValueError:
+            _normalized_target_chat_id = _raw_target_chat_id
+        if _normalized_target_chat_id not in target_chat_ids:
+            target_chat_ids.append(_normalized_target_chat_id)
+{%- if recipient.targetThreadIdSource == 'variable' and recipient.targetThreadIdVariable %}
+            if _all_vars is None:
+                _all_vars = await init_all_user_vars(user_id)
+            _thread_var_val = _all_vars.get({{ recipient.targetThreadIdVariable | escape_python_string }}, "")
+            if _thread_var_val:
+                try:
+                    target_thread_ids[_normalized_target_chat_id] = int(str(_thread_var_val).strip())
+                except (TypeError, ValueError):
+                    pass
+{%- elif recipient.targetThreadId %}
+            _thread_id_raw = {{ recipient.targetThreadId | escape_python_string }}
+            if _thread_id_raw:
+                try:
+                    target_thread_ids[_normalized_target_chat_id] = int(_thread_id_raw)
+                except (TypeError, ValueError):
+                    pass
+{%- endif %}
+{% endif %}
+{% endfor %}
+
+    return target_chat_ids, target_thread_ids
+
+
+@dp.callback_query(lambda c: c.data == "{{ nodeId }}")
+async def handle_callback_{{ safeName }}(callback_query: types.CallbackQuery, state: FSMContext = None):
+    """Пересылает сообщение в один или несколько чатов назначения."""
+    user_id = callback_query.from_user.id
+    source_chat_id, source_message_id = await _resolve_forward_message_source_{{ safeName }}(callback_query)
+    target_chat_ids, target_thread_ids = await _resolve_forward_message_targets_{{ safeName }}(callback_query)
+
+    logging.info(
+        f"forward_message node {{ nodeId }} triggered by {user_id}; source_chat_id={source_chat_id}, source_message_id={source_message_id}, targets={target_chat_ids}, thread_ids={target_thread_ids}"
+    )
+
+    if not target_chat_ids:
+        await callback_query.answer("Не удалось определить чат назначения", show_alert=True)
+        return
+
+    sent_count = 0
+    for target_chat_id in target_chat_ids:
+        try:
+{% if hideAuthor %}
+            await bot.copy_message(
+                chat_id=target_chat_id,
+                from_chat_id=source_chat_id,
+                message_id=source_message_id,
+                message_thread_id=target_thread_ids.get(target_chat_id),
+                disable_notification={{ disableNotification | to_python_boolean }},
+            )
+{% else %}
+            await bot.forward_message(
+                chat_id=target_chat_id,
+                from_chat_id=source_chat_id,
+                message_id=source_message_id,
+                message_thread_id=target_thread_ids.get(target_chat_id),
+                disable_notification={{ disableNotification | to_python_boolean }},
+            )
+{% endif %}
+            sent_count += 1
+        except Exception as e:
+            logging.error(
+                f"forward_message node {{ nodeId }}: failed to {% if hideAuthor %}copy{% else %}forward{% endif %} to {target_chat_id} from {source_chat_id}/{source_message_id}: {e}"
+            )
+
+    if sent_count == 0:
+        await callback_query.answer("Не удалось переслать сообщение", show_alert=True)
+        return
+
+    await callback_query.answer("Сообщение переслано")

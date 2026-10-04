@@ -1,0 +1,259 @@
+{#
+  Конфигурация бота
+
+  @fileoverview Настройки бота: токены, администраторы, проект, FSM-хранилище (PostgreSQL или Redis)
+  @param {boolean} userDatabaseEnabled - Включена ли база данных пользователей
+  @param {number|null} projectId - ID проекта для сохранения в базу данных
+#}
+
+{# Загрузка переменных окружения #}
+# Загрузка переменных окружения из .env файла
+load_dotenv()
+
+{# Токен бота #}
+# Токен вашего бота (получите у @BotFather)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+# Идентификатор токена бота для сегментации данных в БД и Redis
+TOKEN_ID = int(os.getenv("TOKEN_ID", "0"))
+
+{# Настройка логирования #}
+# Настройка логирования с поддержкой UTF-8
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+{# Подавление логирования asyncpg (настраивается через .env) #}
+# Подавление всех сообщений от asyncpg (настраивается через .env)
+if os.getenv("DISABLE_ASYNC_LOG", "true").lower() == "true":
+    logging.getLogger("asyncpg").setLevel(logging.CRITICAL)
+
+{# Создание бота #}
+# Создание бота
+bot = Bot(token=BOT_TOKEN)
+
+{%- if protectContent %}
+# Глобальная защита контента от копирования/пересылки
+PROTECT_CONTENT = os.getenv("PROTECT_CONTENT", "false").lower() == "true"
+
+def _protect_content_kwargs(kwargs=None):
+    if kwargs is None:
+        kwargs = {}
+    if PROTECT_CONTENT and "protect_content" not in kwargs:
+        kwargs["protect_content"] = True
+    return kwargs
+
+def _wrap_bot_protect_content(bot_instance):
+    """Добавляет protect_content=True ко всем основным исходящим сообщениям бота."""
+    method_names = [
+        "send_message",
+        "send_photo",
+        "send_video",
+        "send_document",
+        "send_audio",
+        "send_animation",
+        "send_voice",
+        "send_sticker",
+        "send_media_group",
+    ]
+
+    for method_name in method_names:
+        original = getattr(bot_instance, method_name, None)
+        if original is None:
+            continue
+
+        async def protected_send(*args, __original=original, **kwargs):
+            kwargs = _protect_content_kwargs(kwargs)
+            return await __original(*args, **kwargs)
+
+        setattr(bot_instance, method_name, protected_send)
+
+_wrap_bot_protect_content(bot)
+{%- endif %}
+
+{# Список администраторов #}
+# Список администраторов (загружается из .env)
+ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.strip()]
+
+{# Конфигурация проекта #}
+{%- if projectId %}
+# ┌─────────────────────────────────────────┐
+# │        Конфигурация проекта             │
+# └─────────────────────────────────────────┘
+# ID проекта для сохранения в базу данных
+PROJECT_ID = int(os.getenv("PROJECT_ID", "{{ projectId }}"))
+logging.info(f"📁 PROJECT_ID: {PROJECT_ID}")
+{%- endif %}
+
+# Директория проекта
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+logging.info(f"📁 PROJECT_DIR: {PROJECT_DIR}")
+
+{# Хранилище состояний (временное) #}
+# Хранилище пользователей (временное состояние)
+user_data = {}
+all_user_vars = {}  # Глобальные переменные пользователя
+
+# Кэш Telegram file_id в памяти процесса: url -> file_id (только для текущего TOKEN_ID)
+# Заполняется из media_file_tokens при старте и после первой успешной отправки
+_media_file_id_cache: dict = {}
+
+{%- if hasRateCounterNodes %}
+# In-memory счётчики rate_counter: ключ -> deque временных меток
+_rate_counter_deques: dict = {}
+{%- endif %}
+
+{% include 'media/partials/media-file-id-helpers.py.jinja2' %}
+
+# Redis — опциональное хранилище (задаётся через REDIS_URL в .env)
+REDIS_URL = os.getenv("REDIS_URL")
+_redis_client = None
+
+{# Webhook режим — включается если WEBHOOK_URL задан в окружении #}
+# Webhook режим — включается автоматически при наличии WEBHOOK_URL
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080"))
+
+{# Валидация: при webhook режиме REDIS_URL обязателен #}
+# Валидация: при webhook режиме REDIS_URL обязателен
+# FSM состояния не могут жить в памяти процесса между апдейтами
+if WEBHOOK_URL and not REDIS_URL:
+    raise RuntimeError(
+        "❌ REDIS_URL обязателен при использовании webhook режима. "
+        "Добавьте REDIS_URL в переменные окружения."
+    )
+
+# Функция инициализации Redis (вызывается асинхронно при старте)
+async def init_redis_client():
+    """Инициализирует Redis клиент если REDIS_URL задан. Возвращает True если Redis успешно подключён.
+    При stampede на mass-restore делает несколько попыток с backoff + jitter.
+    """
+    global _redis_client
+    if not REDIS_URL:
+        return False
+    import asyncio as _asyncio_redis
+    import random as _random_redis
+    import redis.asyncio as _redis_lib
+    # Не передаём maint_notifications_config: в redis.asyncio (redis-py 7.x)
+    # AbstractConnection его не принимает — TypeError при from_url.
+
+    _max_attempts = 8
+    _base_delay = 0.25
+    _last_error = None
+    for _attempt in range(1, _max_attempts + 1):
+        try:
+            _redis_client = _redis_lib.from_url(
+                REDIS_URL,
+                decode_responses=False,
+                socket_connect_timeout=2,
+            )
+            await _redis_client.ping()
+            logging.info("🔴 Redis подключён успешно")
+            return True
+        except Exception as e:
+            _last_error = e
+            _redis_client = None
+            if _attempt >= _max_attempts:
+                break
+            _delay = min(4.0, _base_delay * (2 ** (_attempt - 1)))
+            _delay += _random_redis.uniform(0, 0.2)
+            logging.warning(
+                f"⚠️ Redis attempt {_attempt}/{_max_attempts} failed: {e}; retry in {_delay:.2f}s"
+            )
+            await _asyncio_redis.sleep(_delay)
+    logging.warning(f"⚠️ Не удалось подключиться к Redis: {_last_error}")
+    _redis_client = None
+    return False
+
+{# Кастомное FSM-хранилище на основе PostgreSQL #}
+# Кастомное хранилище FSM на основе PostgreSQL (bot_users.user_data JSONB)
+# Примечание: update_user_data_in_db определяется позже в файле — это нормально для Python
+# (функция вызывается в runtime, не при определении класса)
+class PostgresStorage(BaseStorage):
+    """Хранит FSM состояния в поле user_data таблицы bot_users."""
+
+    async def set_state(self, key: StorageKey, state: StateType = None) -> None:
+        uid = key.user_id
+        val = state.state if state else None
+        if uid not in user_data:
+            user_data[uid] = {}
+        user_data[uid]["__fsm_state__"] = val
+        try:
+            await update_user_data_in_db(uid, "__fsm_state__", val)
+        except Exception:
+            pass
+
+    async def get_state(self, key: StorageKey) -> str | None:
+        uid = key.user_id
+        return user_data.get(uid, {}).get("__fsm_state__")
+
+    async def set_data(self, key: StorageKey, data: dict) -> None:
+        uid = key.user_id
+        import json as _j
+        val = _j.dumps(data, ensure_ascii=False)
+        if uid not in user_data:
+            user_data[uid] = {}
+        user_data[uid]["__fsm_data__"] = val
+        try:
+            await update_user_data_in_db(uid, "__fsm_data__", val)
+        except Exception:
+            pass
+
+    async def get_data(self, key: StorageKey) -> dict:
+        uid = key.user_id
+        raw = user_data.get(uid, {}).get("__fsm_data__", "{}")
+        try:
+            import json as _j
+            return _j.loads(raw) if raw else {}
+        except Exception:
+            return {}
+
+    async def close(self) -> None:
+        pass
+
+{# Класс RedisStorage для FSM (используется если REDIS_URL задан) #}
+{%- include 'redis-storage/redis-storage.py.jinja2' %}
+
+{# Выбор FSM-хранилища: Redis если REDIS_URL задан и подключён, иначе PostgresStorage #}
+# Глобальный флаг: Redis успешно подключён
+_redis_connected = False
+
+# Создаем Dispatcher — будет переинициализирован после проверки Redis
+dp = Dispatcher(storage=PostgresStorage())
+
+{# База данных #}
+{%- if userDatabaseEnabled %}
+# ┌─────────────────────────────────────────┐
+# │           Настройки базы данных         │
+# └─────────────────────────────────────────┘
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# ┌─────────────────────────────────────────┐
+# │      Пул соединений с базой данных    │
+# └─────────────────────────────────────────┘
+db_pool = None
+{%- else %}
+
+# Пул соединений с базой данных (БД выключена — остаётся None,
+# объявляем всегда для защиты от NameError в коде контента и main())
+db_pool = None
+{%- endif %}
+
+{%- if hasUserbotNodes %}
+# ┌─────────────────────────────────────────┐
+# │        Telethon Userbot клиент          │
+# └─────────────────────────────────────────┘
+_USERBOT_API_ID = int(os.getenv("USERBOT_API_ID", "0"))
+_USERBOT_API_HASH = os.getenv("USERBOT_API_HASH", "")
+_USERBOT_SESSION = os.getenv("USERBOT_SESSION_STRING", "")
+
+userbot_client = TelegramClient(
+    StringSession(_USERBOT_SESSION),
+    _USERBOT_API_ID,
+    _USERBOT_API_HASH
+) if _USERBOT_API_ID and _USERBOT_API_HASH and _USERBOT_SESSION else None
+{%- endif %}

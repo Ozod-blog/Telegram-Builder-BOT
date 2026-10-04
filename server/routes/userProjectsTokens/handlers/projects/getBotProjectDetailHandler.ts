@@ -1,0 +1,72 @@
+/**
+ * @fileoverview Хендлер получения деталей проекта для Telegram-бота
+ *
+ * Возвращает информацию о конкретном проекте + статус запущенного бота.
+ * Принимает либо числовой project_id, либо callback-строку вида "project_42".
+ * Проверяет что проект принадлежит пользователю по telegram_id.
+ * Не требует браузерной сессии.
+ *
+ * @module userProjectsTokens/handlers/projects/getBotProjectDetailHandler
+ */
+
+import type { Request, Response } from "express";
+import { storage } from "../../../../storages/storage";
+import { getBotActorId } from "../../../../middleware/bot-api-actor";
+
+/**
+ * Извлекает числовой ID из строки вида "project_42" или "42"
+ * @param raw - Строка с ID
+ * @returns Числовой ID или NaN
+ */
+function parseProjectId(raw: string): number {
+    // Убираем любой нечисловой префикс вида "project_", "proj_" и т.д.
+    const match = raw.match(/(\d+)$/);
+    return match ? parseInt(match[1], 10) : NaN;
+}
+
+/**
+ * Возвращает детали проекта и статус бота.
+ * Параметр :id может быть числом (42) или callback-строкой (project_42).
+ *
+ * @param req - query: telegram_id, params: id
+ * @param res - { id, name, description, createdAt, updatedAt }
+ */
+export async function getBotProjectDetailHandler(req: Request, res: Response): Promise<void> {
+    try {
+        const projectId = parseProjectId(req.params.id);
+        const telegramId = getBotActorId(req);
+        if (telegramId === null) {
+            res.status(401).json({ error: "UNAUTHORIZED" });
+            return;
+        }
+
+        if (isNaN(projectId)) {
+            res.status(400).json({ error: "Некорректный project_id" });
+            return;
+        }
+
+        const project = await storage.getBotProject(projectId);
+
+        if (!project) {
+            res.status(404).json({ error: "Проект не найден" });
+            return;
+        }
+
+        // Проверяем доступ: владелец или коллаборатор
+        if (!(await storage.hasProjectAccess(projectId, telegramId))) {
+            res.status(403).json({ error: "Нет доступа к этому проекту" });
+            return;
+        }
+
+        res.json({
+            id: project.id,
+            name: project.name,
+            description: project.description,
+            createdAt: project.createdAt,
+            updatedAt: project.updatedAt,
+        });
+    } catch (error: any) {
+        console.error("Ошибка получения деталей проекта:", error);
+        res.status(500).json({ error: "Не удалось получить детали проекта" });
+    }
+}

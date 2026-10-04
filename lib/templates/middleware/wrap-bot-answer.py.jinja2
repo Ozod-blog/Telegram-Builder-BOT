@@ -1,0 +1,232 @@
+{#
+  Патчинг Message.answer / Message.answer_photo / Message.answer_video /
+  Message.answer_audio / Message.answer_document для логирования исходящих сообщений
+  и вызова обработчиков outgoing_message_trigger.
+  Вызывается один раз при старте через _wrap_message_answer(bot).
+#}
+
+def _wrap_message_answer(bot_instance):
+    """Патчит Message.answer и Message.answer_photo для автоматического логирования исходящих"""
+    from aiogram.types import Message as _Message
+
+    _orig_answer = _Message.answer
+    _orig_answer_photo = _Message.answer_photo
+    _orig_answer_video = _Message.answer_video
+    _orig_answer_audio = _Message.answer_audio
+    _orig_answer_document = _Message.answer_document
+
+    async def _patched_answer(self, text, *args, node_id=None, **kwargs):
+        result = await _orig_answer(self, text, *args, **kwargs)
+        try:
+            user_id = str(self.chat.id)
+            message_data_obj = {"message_id": result.message_id if result else None}
+            if "reply_markup" in kwargs:
+                try:
+                    reply_markup = kwargs["reply_markup"]
+                    buttons_data = []
+                    if hasattr(reply_markup, "inline_keyboard"):
+                        for row in reply_markup.inline_keyboard:
+                            for btn in row:
+                                button_info = {"text": btn.text}
+                                if hasattr(btn, "callback_data") and btn.callback_data:
+                                    button_info["callback_data"] = btn.callback_data
+                                if hasattr(btn, "url") and btn.url:
+                                    button_info["url"] = btn.url
+                                buttons_data.append(button_info)
+                        if buttons_data:
+                            message_data_obj["buttons"] = buttons_data
+                            message_data_obj["keyboard_type"] = "inline"
+                    elif hasattr(reply_markup, "keyboard"):
+                        for row in reply_markup.keyboard:
+                            for btn in row:
+                                buttons_data.append({"text": btn.text})
+                        if buttons_data:
+                            message_data_obj["buttons"] = buttons_data
+                            message_data_obj["keyboard_type"] = "reply"
+                except Exception:
+                    pass
+            # Сохраняем исходящее сообщение бота асинхронно (fire-and-forget)
+            _fire_save_message(
+                user_id=user_id,
+                message_type="bot",
+                message_text=text,
+                node_id=node_id,
+                message_data=message_data_obj,
+                chat_type=self.chat.type if hasattr(self, 'chat') and self.chat else 'private',
+                chat_id=str(self.chat.id) if hasattr(self, 'chat') and self.chat and self.chat.type in ['group', 'supergroup', 'channel'] else None,
+            )
+        except Exception as e:
+            logging.warning(f"Ошибка логирования message.answer: {e}")
+        # Вызываем обработчики триггеров исходящих сообщений
+        try:
+            _omt_handlers = globals().get('_outgoing_message_trigger_handlers', [])
+            if _omt_handlers:
+                _omt_user_id = int(str(self.chat.id)) if str(self.chat.id).lstrip('-').isdigit() else 0
+                if _omt_user_id > 0:
+                    for _omt_handler in _omt_handlers:
+                        try:
+                            await _omt_handler(_omt_user_id, result.message_id if result else None, text, chat_id=_omt_user_id)
+                        except Exception as _omt_e:
+                            logging.warning(f"Ошибка в outgoing_message_trigger handler: {_omt_e}")
+        except Exception as _omt_outer_e:
+            logging.warning(f"Ошибка при вызове outgoing_message_trigger handlers: {_omt_outer_e}")
+        return result
+
+    async def _patched_answer_photo(self, photo, *args, caption=None, node_id=None, **kwargs):
+        result = await _orig_answer_photo(self, photo, *args, caption=caption, **kwargs)
+        try:
+            user_id = str(self.chat.id)
+            message_data_obj = {"message_id": result.message_id if result else None}
+            if result and hasattr(result, "photo") and result.photo:
+                largest = result.photo[-1]
+                message_data_obj["photo"] = {"file_id": largest.file_id, "width": largest.width, "height": largest.height}
+            # Сохраняем исходящее фото бота асинхронно (fire-and-forget)
+            _fire_save_message(
+                user_id=user_id,
+                message_type="bot",
+                message_text=caption or "[Фото]",
+                node_id=node_id,
+                message_data=message_data_obj,
+                chat_type=self.chat.type if hasattr(self, 'chat') and self.chat else 'private',
+                chat_id=str(self.chat.id) if hasattr(self, 'chat') and self.chat and self.chat.type in ['group', 'supergroup', 'channel'] else None,
+            )
+        except Exception as e:
+            logging.warning(f"Ошибка логирования message.answer_photo: {e}")
+        # Вызываем обработчики триггеров исходящих сообщений
+        try:
+            _omt_handlers = globals().get('_outgoing_message_trigger_handlers', [])
+            if _omt_handlers:
+                _omt_user_id = int(str(self.chat.id)) if str(self.chat.id).lstrip('-').isdigit() else 0
+                if _omt_user_id > 0:
+                    for _omt_handler in _omt_handlers:
+                        try:
+                            await _omt_handler(_omt_user_id, result.message_id if result else None, caption or "[Фото]", chat_id=_omt_user_id)
+                        except Exception as _omt_e:
+                            logging.warning(f"Ошибка в outgoing_message_trigger handler: {_omt_e}")
+        except Exception as _omt_outer_e:
+            logging.warning(f"Ошибка при вызове outgoing_message_trigger handlers: {_omt_outer_e}")
+        return result
+
+    async def _patched_answer_video(self, video, *args, caption=None, node_id=None, **kwargs):
+        result = await _orig_answer_video(self, video, *args, caption=caption, **kwargs)
+        try:
+            message_data_obj = {"message_id": result.message_id if result else None}
+            if result and hasattr(result, "video") and result.video:
+                message_data_obj["video"] = {
+                    "file_id": result.video.file_id,
+                    "width": result.video.width,
+                    "height": result.video.height,
+                    "duration": result.video.duration,
+                    "mime_type": result.video.mime_type if hasattr(result.video, "mime_type") else None,
+                    "file_size": result.video.file_size if hasattr(result.video, "file_size") else None,
+                }
+            # Сохраняем исходящее видео бота асинхронно (fire-and-forget)
+            _fire_save_message(
+                user_id=str(self.chat.id),
+                message_type="bot",
+                message_text=caption or "[Видео]",
+                node_id=node_id,
+                message_data=message_data_obj,
+                chat_type=self.chat.type if hasattr(self, 'chat') and self.chat else 'private',
+                chat_id=str(self.chat.id) if hasattr(self, 'chat') and self.chat and self.chat.type in ['group', 'supergroup', 'channel'] else None,
+            )
+        except Exception as e:
+            logging.warning(f"Ошибка логирования message.answer_video: {e}")
+        # Вызываем обработчики триггеров исходящих сообщений
+        try:
+            _omt_handlers = globals().get('_outgoing_message_trigger_handlers', [])
+            if _omt_handlers:
+                _omt_user_id = int(str(self.chat.id)) if str(self.chat.id).lstrip('-').isdigit() else 0
+                if _omt_user_id > 0:
+                    for _omt_handler in _omt_handlers:
+                        try:
+                            await _omt_handler(_omt_user_id, result.message_id if result else None, caption or "[Видео]", chat_id=_omt_user_id)
+                        except Exception as _omt_e:
+                            logging.warning(f"Ошибка в outgoing_message_trigger handler: {_omt_e}")
+        except Exception as _omt_outer_e:
+            logging.warning(f"Ошибка при вызове outgoing_message_trigger handlers: {_omt_outer_e}")
+        return result
+
+    async def _patched_answer_audio(self, audio, *args, caption=None, node_id=None, **kwargs):
+        result = await _orig_answer_audio(self, audio, *args, caption=caption, **kwargs)
+        try:
+            message_data_obj = {"message_id": result.message_id if result else None}
+            if result and hasattr(result, "audio") and result.audio:
+                message_data_obj["audio"] = {
+                    "file_id": result.audio.file_id,
+                    "duration": result.audio.duration,
+                    "mime_type": result.audio.mime_type if hasattr(result.audio, "mime_type") else None,
+                    "file_size": result.audio.file_size if hasattr(result.audio, "file_size") else None,
+                    "title": result.audio.title if hasattr(result.audio, "title") else None,
+                }
+            # Сохраняем исходящее аудио бота асинхронно (fire-and-forget)
+            _fire_save_message(
+                user_id=str(self.chat.id),
+                message_type="bot",
+                message_text=caption or "[Аудио]",
+                node_id=node_id,
+                message_data=message_data_obj,
+                chat_type=self.chat.type if hasattr(self, 'chat') and self.chat else 'private',
+                chat_id=str(self.chat.id) if hasattr(self, 'chat') and self.chat and self.chat.type in ['group', 'supergroup', 'channel'] else None,
+            )
+        except Exception as e:
+            logging.warning(f"Ошибка логирования message.answer_audio: {e}")
+        # Вызываем обработчики триггеров исходящих сообщений
+        try:
+            _omt_handlers = globals().get('_outgoing_message_trigger_handlers', [])
+            if _omt_handlers:
+                _omt_user_id = int(str(self.chat.id)) if str(self.chat.id).lstrip('-').isdigit() else 0
+                if _omt_user_id > 0:
+                    for _omt_handler in _omt_handlers:
+                        try:
+                            await _omt_handler(_omt_user_id, result.message_id if result else None, caption or "[Аудио]", chat_id=_omt_user_id)
+                        except Exception as _omt_e:
+                            logging.warning(f"Ошибка в outgoing_message_trigger handler: {_omt_e}")
+        except Exception as _omt_outer_e:
+            logging.warning(f"Ошибка при вызове outgoing_message_trigger handlers: {_omt_outer_e}")
+        return result
+
+    async def _patched_answer_document(self, document, *args, caption=None, node_id=None, **kwargs):
+        result = await _orig_answer_document(self, document, *args, caption=caption, **kwargs)
+        try:
+            message_data_obj = {"message_id": result.message_id if result else None}
+            if result and hasattr(result, "document") and result.document:
+                message_data_obj["document"] = {
+                    "file_id": result.document.file_id,
+                    "file_name": result.document.file_name if hasattr(result.document, "file_name") else None,
+                    "mime_type": result.document.mime_type if hasattr(result.document, "mime_type") else None,
+                    "file_size": result.document.file_size if hasattr(result.document, "file_size") else None,
+                }
+            # Сохраняем исходящий документ бота асинхронно (fire-and-forget)
+            _fire_save_message(
+                user_id=str(self.chat.id),
+                message_type="bot",
+                message_text=caption or "[Документ]",
+                node_id=node_id,
+                message_data=message_data_obj,
+                chat_type=self.chat.type if hasattr(self, 'chat') and self.chat else 'private',
+                chat_id=str(self.chat.id) if hasattr(self, 'chat') and self.chat and self.chat.type in ['group', 'supergroup', 'channel'] else None,
+            )
+        except Exception as e:
+            logging.warning(f"Ошибка логирования message.answer_document: {e}")
+        # Вызываем обработчики триггеров исходящих сообщений
+        try:
+            _omt_handlers = globals().get('_outgoing_message_trigger_handlers', [])
+            if _omt_handlers:
+                _omt_user_id = int(str(self.chat.id)) if str(self.chat.id).lstrip('-').isdigit() else 0
+                if _omt_user_id > 0:
+                    for _omt_handler in _omt_handlers:
+                        try:
+                            await _omt_handler(_omt_user_id, result.message_id if result else None, caption or "[Документ]", chat_id=_omt_user_id)
+                        except Exception as _omt_e:
+                            logging.warning(f"Ошибка в outgoing_message_trigger handler: {_omt_e}")
+        except Exception as _omt_outer_e:
+            logging.warning(f"Ошибка при вызове outgoing_message_trigger handlers: {_omt_outer_e}")
+        return result
+
+    _Message.answer = _patched_answer
+    _Message.answer_photo = _patched_answer_photo
+    _Message.answer_video = _patched_answer_video
+    _Message.answer_audio = _patched_answer_audio
+    _Message.answer_document = _patched_answer_document
+

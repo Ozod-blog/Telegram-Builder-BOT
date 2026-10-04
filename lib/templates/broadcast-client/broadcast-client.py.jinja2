@@ -1,0 +1,225 @@
+{#
+  Шаблон обработчика рассылки — Client API (Telethon / userbot)
+
+  @param {string} nodeId          - ID узла broadcast
+  @param {string} successMessage  - Сообщение об успехе
+  @param {string} errorMessage    - Сообщение об ошибке
+  @param {array}  broadcastNodes  - [{id, text, formatMode, imageUrl, audioUrl, videoUrl, documentUrl, attachedMediaPy, autoTransitionTo}]
+#}
+{%- set safeNodeId = nodeId | safe_name %}
+{%- set successMsg = successMessage or '✅ Рассылка отправлена!' %}
+{%- set errorMsg = errorMessage or '❌ Ошибка рассылки' %}
+
+# @@NODE_START:{{ nodeId }}@@
+async def handle_broadcast_{{ safeNodeId }}(callback_query, user_id):
+    """Обработчик рассылки для узла {{ nodeId }} (Client API / Telethon)"""
+    logging.info(f"📢 Запуск рассылки из узла {{ nodeId }}")
+    _error_msg = {{ errorMsg | format_python_text }}
+    _success_msg = {{ successMsg | format_python_text }}
+
+    # ── Проверка сессии Client API ──────────────────────────────────────────
+    try:
+        if db_pool is None:
+            logging.error("❌ База данных не инициализирована. Включите 'База данных пользователей' в настройках проекта.")
+            await callback_query.message.answer("⚠️ Для рассылки через Client API требуется включенная база данных")
+            return
+        async with db_pool.acquire() as conn:
+            client_session = await conn.fetchrow(
+                "SELECT session_string, user_id, api_id, api_hash FROM user_telegram_settings WHERE is_active = 1 LIMIT 1"
+            )
+            logging.info(f"🔑 Client API сессия: user_id={client_session['user_id'] if client_session else 'None'}")
+    except Exception as e:
+        logging.error(f"❌ Ошибка получения сессии Client API: {e}")
+        await callback_query.message.answer(_error_msg)
+        return
+
+    if not client_session:
+        logging.error("❌ Client API не авторизован")
+        await callback_query.message.answer("⚠️ Требуется авторизация Client API во вкладке Telegram Client")
+        return
+
+    # ── Получение получателей ───────────────────────────────────────────────
+    recipients = []
+    try:
+        if db_pool is None:
+            await callback_query.message.answer("⚠️ Для рассылки через Client API требуется включенная база данных")
+            return
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT DISTINCT user_id FROM bot_users WHERE project_id = PROJECT_ID AND token_id = TOKEN_ID")
+            recipients.extend([str(row["user_id"]) for row in rows])
+    except Exception as e:
+        logging.error(f"❌ Ошибка получения списка пользователей: {e}")
+        await callback_query.message.answer(_error_msg)
+        return
+
+    recipients = list(set(recipients))
+    logging.info(f"📋 Найдено {len(recipients)} получателей")
+    logging.info(f"👤 Рассылка через Client API (Userbot) от {client_session['user_id']}")
+
+    # ── Список сообщений для рассылки ───────────────────────────────────────
+{%- if broadcastNodes and broadcastNodes | length > 0 %}
+    broadcast_nodes = [
+{%- for node in broadcastNodes %}
+        {
+            "id": "{{ node.id }}",
+            "text": {{ node.text | format_python_text }},
+            "formatMode": "{{ node.formatMode or 'none' }}",
+            "imageUrl": "{{ node.imageUrl or '' }}",
+            "audioUrl": "{{ node.audioUrl or '' }}",
+            "videoUrl": "{{ node.videoUrl or '' }}",
+            "documentUrl": "{{ node.documentUrl or '' }}",
+            "attachedMedia": {{ node.attachedMediaPy }},
+            "autoTransitionTo": "{{ node.autoTransitionTo or '' }}",
+        },
+{%- endfor %}
+    ]
+{%- else %}
+    broadcast_nodes = []
+{%- endif %}
+
+    if not broadcast_nodes:
+        await callback_query.message.answer("⚠️ Нет сообщений для рассылки")
+        return
+
+    # ── Инициализация Telethon ──────────────────────────────────────────────
+    api_id_val = client_session["api_id"] if client_session else None
+    api_hash_val = client_session["api_hash"] if client_session else None
+    session_string_val = client_session["session_string"] if client_session else None
+    if not api_id_val or not api_hash_val or not session_string_val:
+        logging.error("❌ Client API: отсутствуют credentials или сессия")
+        error_msg = "⚠️ Client API не настроен: "
+        if not api_id_val or not api_hash_val: error_msg += "Нет API credentials. "
+        if not session_string_val: error_msg += "Нет сессии. Авторизуйтесь во вкладке Telegram Client."
+        await callback_query.message.answer(error_msg)
+        return
+
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    import os
+    import re
+
+    def get_full_media_path(url_or_path):
+        if not url_or_path:
+            return None
+        if url_or_path.startswith('http://') or url_or_path.startswith('https://'):
+            return url_or_path
+        if os.path.exists(url_or_path):
+            return url_or_path
+        match = re.search(r'[\/](uploads[\/].+)', url_or_path)
+        if match:
+            relative_path = re.sub(r'^uploads[\/]', '', match.group(1))
+        else:
+            relative_path = url_or_path
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        while current_dir != os.path.dirname(current_dir):
+            full_path = os.path.join(current_dir, 'uploads', relative_path)
+            if os.path.exists(full_path):
+                return full_path
+            current_dir = os.path.dirname(current_dir)
+        return url_or_path
+
+    api_id = int(client_session["api_id"])
+    api_hash = client_session["api_hash"]
+    session_string = client_session["session_string"]
+    logging.info(f"🔧 Инициализация Telethon: api_id={api_id}, session={session_string[:20]}...")
+    app = TelegramClient(StringSession(session_string), api_id=api_id, api_hash=api_hash)
+
+    # ── Отправка ────────────────────────────────────────────────────────────
+    success_count = 0
+    error_count = 0
+    blocked_count = 0
+
+    await app.connect()
+    try:
+        for recipient_id in recipients:
+            try:
+                from telethon.tl.types import PeerUser
+                recipient = PeerUser(user_id=int(recipient_id))
+            except ValueError:
+                recipient = recipient_id
+
+            current_node_index = 0
+            while current_node_index < len(broadcast_nodes):
+                node_data = broadcast_nodes[current_node_index]
+                if not node_data["text"].strip():
+                    current_node_index += 1
+                    continue
+                try:
+                    message_text = replace_variables_in_text(node_data["text"], {**user_data.get(recipient_id, {}), "user_id": recipient_id})
+                    all_user_vars = {**user_data.get(recipient_id, {}), "user_id": recipient_id}
+
+                    # Отправка медиа
+                    media_sent = False
+                    attached_media = node_data.get("attachedMedia", [])
+                    image_url = node_data.get("imageUrl")
+                    audio_url = node_data.get("audioUrl")
+                    video_url = node_data.get("videoUrl")
+                    document_url = node_data.get("documentUrl")
+                    if attached_media or image_url or audio_url or video_url or document_url:
+                        try:
+                            if attached_media:
+                                for media_var in attached_media:
+                                    # Сначала ищем URL напрямую в node_data по имени переменной
+                                    media_url_to_use = None
+                                    if "imageUrl" in media_var:
+                                        media_url_to_use = node_data.get("imageUrl")
+                                    elif "videoUrl" in media_var:
+                                        media_url_to_use = node_data.get("videoUrl")
+                                    elif "audioUrl" in media_var:
+                                        media_url_to_use = node_data.get("audioUrl")
+                                    elif "documentUrl" in media_var:
+                                        media_url_to_use = node_data.get("documentUrl")
+                                    # Fallback: ищем в переменных пользователя
+                                    if not media_url_to_use:
+                                        media_value = all_user_vars.get(media_var)
+                                        if media_value:
+                                            if isinstance(media_value, dict):
+                                                media_url_to_use = media_value.get("videoUrl") or media_value.get("audioUrl") or media_value.get("documentUrl") or media_value.get("photoUrl") or media_value.get("value")
+                                            else:
+                                                media_url_to_use = media_value
+                                    if media_url_to_use:
+                                        await app.send_file(recipient, get_full_media_path(media_url_to_use), caption=message_text)
+                                        media_sent = True
+                            if not media_sent:
+                                for url in [audio_url, video_url, document_url, image_url]:
+                                    if url:
+                                        await app.send_file(recipient, get_full_media_path(url), caption=message_text)
+                                        media_sent = True
+                                        break
+                        except Exception as media_error:
+                            logging.error(f"❌ Ошибка отправки медиа: {media_error}")
+                    if not media_sent:
+                        await app.send_message(recipient, message_text)
+
+                    success_count += 1
+
+                    # Автопереход по индексу в broadcast_nodes
+                    auto_transition_to = node_data.get("autoTransitionTo", "")
+                    if auto_transition_to:
+                        logging.info(f"⚡ Автопереход от узла {node_data['id']} к узлу {auto_transition_to}")
+                        next_index = next((i for i, n in enumerate(broadcast_nodes) if n["id"] == auto_transition_to), -1)
+                        if next_index != -1:
+                            current_node_index = next_index
+                            logging.info(f"✅ Автопереход выполнен: {node_data['id']} -> {auto_transition_to}")
+                        else:
+                            logging.warning(f"⚠️ Узел для автоперехода не найден: {auto_transition_to}")
+                            current_node_index += 1
+                    else:
+                        current_node_index += 1
+
+                except Exception as send_error:
+                    error_msg_str = str(send_error)
+                    if "PEER_ID_INVALID" in error_msg_str or "bot" in str(recipient_id):
+                        blocked_count += 1
+                        logging.warning(f"⚠️ Пользователь {recipient_id} заблокировал бота")
+                    else:
+                        error_count += 1
+                        logging.error(f"❌ Ошибка отправки {recipient_id}: {send_error}")
+                    current_node_index += 1
+    finally:
+        await app.disconnect()
+
+    report = f"{_success_msg}\n👤 Метод: Client API (Userbot)\n✅ Успешно: {success_count}\n⚠️ Ошибок: {error_count}\n🚫 Заблокировано: {blocked_count}"
+    logging.info(report)
+    await callback_query.message.answer(report)
+# @@NODE_END:{{ nodeId }}@@

@@ -1,0 +1,309 @@
+/**
+ * @fileoverview Компонент содержимого холста
+ *
+ * Содержит узлы на холсте редактора и SVG-слой соединений между ними.
+ */
+
+import { CanvasNodeItem } from '@/components/editor/canvas/canvas-node/canvas-node-item';
+import { ConnectionsLayer } from '@/components/editor/canvas/canvas-node/connections-layer';
+import { DraftConnectionLayer } from '@/components/editor/canvas/canvas-node/draft-connection-layer';
+import { SheetPortalsLayer } from '@/components/editor/canvas/canvas-node/sheet-portals-layer';
+import { IncomingSheetPortalsLayer } from '@/components/editor/canvas/canvas-node/incoming-sheet-portals-layer';
+import { collectCrossSheetLinks, collectIncomingCrossSheetLinks } from './utils/collect-cross-sheet-links';
+import { Node } from '@/types/bot';
+import { BotDataWithSheets } from '@shared/schema';
+import { PortType } from '../canvas-node/port-colors';
+import { DraftConnection } from './use-connection-drag';
+import { useState, useCallback, useMemo } from 'react';
+import { collectConnections } from '../canvas-node/connections-layer';
+
+/**
+ * Свойства компонента содержимого холста
+ */
+interface CanvasContentProps {
+  /** Данные бота с поддержкой листов */
+  botData?: BotDataWithSheets;
+  /** Массив узлов на холсте */
+  nodes: Node[];
+  /** Смещение холста */
+  pan: { x: number; y: number };
+  /** Масштаб холста (в процентах) */
+  zoom: number;
+  /** Ref-зеркало масштаба — передаётся нодам, чтобы они не ре-рендерились на каждый кадр зума */
+  zoomRef: React.MutableRefObject<number>;
+  /** Ref-зеркало смещения холста (аналогично zoomRef) */
+  panRef: React.MutableRefObject<{ x: number; y: number }>;
+  /** Отключить CSS-переход трансформации (на время интерактивного зума/пана) */
+  disableTransition?: boolean;
+  /** Идентификатор выбранного узла */
+  selectedNodeId: string | null;
+  /** Множество идентификаторов узлов, выделенных рамкой (мульти-выделение) */
+  selectedNodeIds?: Set<string>;
+  /** Колбэк при выборе узла */
+  onNodeSelect: (nodeId: string) => void;
+  /** Колбэк при Shift+клике по узлу — переключение в мульти-выделении */
+  onShiftClick?: (nodeId: string) => void;
+  /** Колбэк при удалении узла */
+  onNodeDelete: (nodeId: string) => void;
+  /** Колбэк при дублировании узла */
+  onNodeDuplicate?: (nodeId: string, targetPosition?: { x: number; y: number }) => void;
+  /**
+   * Колбэк для дублирования узла через контекстное меню.
+   * Позиция вычисляется в canvas.tsx через getPastePosition() — ту же функцию,
+   * что использует Ctrl+V — поэтому дубль всегда попадает в точку последнего клика.
+   */
+  onNodeDuplicateAtPosition?: (nodeId: string) => void;
+  /** Колбэк при перемещении узла */
+  onNodeMove: (nodeId: string, position: { x: number; y: number }) => void;
+  /** Колбэк в начале перемещения узла */
+  onNodeMoveStart?: (nodeId: string) => void;
+  /** Колбэк в конце перемещения узла */
+  onNodeMoveEnd?: (nodeId: string) => void;
+  /** Установка флага перетаскивания узла */
+  setIsNodeBeingDragged?: (isDragging: boolean) => void;
+  /** Колбэк при изменении размера узла */
+  onSizeChange: (nodeId: string, size: { width: number; height: number }) => void;
+  /** Карта реальных размеров узлов (из ResizeObserver) */
+  nodeSizes: Map<string, { width: number; height: number }>;
+  /** Обработчик начала перетаскивания от порта выхода */
+  onPortMouseDown?: (e: React.MouseEvent, nodeId: string, portType: PortType, buttonId?: string, portCenter?: { x: number; y: number }) => void;
+  /** Текущее временное соединение при drag-to-connect */
+  draftConnection?: DraftConnection | null;
+  /** ID узла под курсором при drag-to-connect (для подсветки цели) */
+  hoveredTargetNodeId?: string | null;
+  /** Колбэк удаления соединения */
+  onConnectionDelete?: (fromId: string, toId: string, type: string) => void;
+  /** ID узла, который сейчас перетаскивается — для подсветки связанных линий */
+  draggingNodeId?: string | null;
+  /** ID узла для программной подсветки (имитация hover из сайдбара) */
+  highlightNodeId?: string | null;
+  /** Список листов для перемещения узла (без текущего) */
+  sheets?: Array<{ id: string; name: string }>;
+  /** Колбэк перемещения узла в другой лист */
+  onMoveNodeToSheet?: (nodeId: string, sheetId: string) => void;
+  /** ID проекта (для превью Telegram file_id через прокси) */
+  projectId?: number;
+  /** Показывать ли порталы к другим листам */
+  showPortals?: boolean;
+  /** Колбэк навигации на другой лист через портал (одиночный клик) */
+  onSheetNavigate?: (sheetId: string) => void;
+  /** Колбэк навигации к целевой ноде через портал с фокусом (двойной клик) */
+  onPortalNavigate?: (targetNodeId: string) => void;
+}
+
+/**
+ * Компонент содержимого холста
+ *
+ * @param props - Свойства компонента
+ * @returns JSX элемент содержимого холста
+ */
+export function CanvasContent({
+  botData,
+  nodes,
+  pan,
+  zoom,
+  zoomRef,
+  panRef,
+  disableTransition,
+  selectedNodeId,
+  selectedNodeIds,
+  onNodeSelect,
+  onShiftClick,
+  onNodeDelete,
+  onNodeDuplicate,
+  onNodeDuplicateAtPosition,
+  onNodeMove,
+  onNodeMoveStart,
+  onNodeMoveEnd,
+  setIsNodeBeingDragged,
+  onSizeChange,
+  nodeSizes,
+  onPortMouseDown,
+  draftConnection,
+  hoveredTargetNodeId,
+  onConnectionDelete,
+  draggingNodeId,
+  highlightNodeId,
+  sheets,
+  onMoveNodeToSheet,
+  projectId,
+  showPortals,
+  onSheetNavigate,
+  onPortalNavigate,
+}: CanvasContentProps) {
+  /**
+   * Получение всех узлов со всех листов для отображения связей.
+   * Мемоизируем, чтобы ссылка на массив не менялась на каждый кадр зума —
+   * иначе мемоизированные ноды считали бы пропс изменённым и ре-рендерились.
+   */
+  /**
+   * Для активного листа берём живые `nodes` (актуальные data),
+   * иначе порт pay / стрелка «после оплаты» смотрят в устаревший botData.sheets.
+   */
+  const allNodes = useMemo<Node[]>(() => {
+    if (!botData?.sheets) return nodes;
+    const activeId = botData.activeSheetId;
+    const collected: Node[] = [];
+    botData.sheets.forEach((sheet) => {
+      if (sheet.id === activeId) {
+        collected.push(...nodes);
+      } else if (sheet.nodes) {
+        collected.push(...sheet.nodes);
+      }
+    });
+    return collected;
+  }, [botData, nodes]);
+
+  /** Кросс-листовые порталы (вычисляются только если showPortals включён) */
+  const crossSheetPortals = useMemo(() => {
+    if (!showPortals || !botData?.sheets || !botData.activeSheetId) return [];
+    return collectCrossSheetLinks(nodes, botData.sheets, botData.activeSheetId);
+  }, [showPortals, nodes, botData]);
+
+  /** Входящие кросс-листовые порталы (ноды с других листов, ведущие на текущий) */
+  const incomingPortals = useMemo(() => {
+    if (!showPortals || !botData?.sheets || !botData.activeSheetId) return [];
+    return collectIncomingCrossSheetLinks(nodes, botData.sheets, botData.activeSheetId);
+  }, [showPortals, nodes, botData]);
+
+  /** Узлы, подсвечиваемые при наведении на линию соединения */
+  const [hoveredConnectionNodes, setHoveredConnectionNodes] = useState<{ fromId: string | null; toId: string | null }>({ fromId: null, toId: null });
+
+  const handleConnectionHover = useCallback((fromId: string | null, toId: string | null) => {
+    setHoveredConnectionNodes({ fromId, toId });
+  }, []);
+
+  /** ID узла под курсором мыши */
+  const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
+
+  /** Узлы, связанные с узлом под курсором */
+  const connectedToHovered = useMemo<Set<string>>(() => {
+    if (!hoveredNodeId) return new Set();
+    const connected = new Set<string>();
+    collectConnections(nodes).forEach(({ fromId, toId }) => {
+      if (fromId === hoveredNodeId) connected.add(toId);
+      if (toId === hoveredNodeId) connected.add(fromId);
+    });
+    return connected;
+  }, [hoveredNodeId, nodes]);
+
+  /**
+   * Вычисляем множество ID узлов, связанных с перетаскиваемым узлом.
+   * Используем collectConnections — единый источник истины для всех типов связей.
+   */
+  const connectedTodragging = useMemo<Set<string>>(() => {
+    if (!draggingNodeId) return new Set();
+    const connected = new Set<string>();
+    collectConnections(nodes).forEach(({ fromId, toId }) => {
+      if (fromId === draggingNodeId) connected.add(toId);
+      if (toId === draggingNodeId) connected.add(fromId);
+    });
+    return connected;
+  }, [draggingNodeId, nodes]);
+
+  /** Узлы, связанные с программно подсвеченным узлом (из сайдбара) */
+  const connectedToHighlighted = useMemo<Set<string>>(() => {
+    if (!highlightNodeId) return new Set();
+    const connected = new Set<string>();
+    collectConnections(nodes).forEach(({ fromId, toId }) => {
+      if (fromId === highlightNodeId) connected.add(toId);
+      if (toId === highlightNodeId) connected.add(fromId);
+    });
+    return connected;
+  }, [highlightNodeId, nodes]);
+
+  /**
+   * Карта позиций портов кнопок относительно верха/левого края узла.
+   * buttonId → { x, y } в canvas-координатах (layout, без transform)
+   */
+  const [buttonPortYOffsets, setButtonPortYOffsets] = useState<Map<string, { x: number; y: number }>>(new Map());
+
+  /**
+   * Обработчик монтирования порта кнопки.
+   * offset уже в canvas-координатах (вычислен через offsetLeft/offsetTop, без transform).
+   */
+  const handleButtonPortMount = useCallback((buttonId: string, offset: { x: number; y: number }) => {
+    setButtonPortYOffsets(prev => {
+      const next = new Map(prev);
+      next.set(buttonId, offset);
+      return next;
+    });
+  }, []);
+
+  return (
+    <div
+      className={`relative origin-top-left ${disableTransition ? '' : 'transition-transform duration-200 ease-out'}`}
+      style={{
+        transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom / 100})`,
+        transformOrigin: '0 0',
+      }}
+    >
+      {/* SVG-слой соединений — рисуется под нодами */}
+      <ConnectionsLayer nodes={nodes} nodeSizes={nodeSizes} onConnectionDelete={onConnectionDelete} buttonPortYOffsets={buttonPortYOffsets} draggingNodeId={draftConnection ? null : (draggingNodeId ?? hoveredNodeId ?? highlightNodeId)} onConnectionHover={draftConnection ? undefined : handleConnectionHover} />
+
+      {/* SVG-слой порталов к другим листам */}
+      {showPortals && crossSheetPortals.length > 0 && onSheetNavigate && (
+        <SheetPortalsLayer
+          portals={crossSheetPortals}
+          nodes={nodes}
+          nodeSizes={nodeSizes}
+          onNavigate={onSheetNavigate}
+          onNavigateNode={onPortalNavigate}
+        />
+      )}
+
+      {/* SVG-слой входящих порталов с других листов */}
+      {showPortals && incomingPortals.length > 0 && onSheetNavigate && (
+        <IncomingSheetPortalsLayer
+          portals={incomingPortals}
+          nodes={nodes}
+          nodeSizes={nodeSizes}
+          onNavigate={onSheetNavigate}
+          onNavigateNode={onPortalNavigate}
+        />
+      )}
+
+      {/* SVG-слой временного соединения при drag-to-connect */}
+      <DraftConnectionLayer draftConnection={draftConnection ?? null} />
+
+      {/* Узлы */}
+      {nodes.map((node) => (
+        <CanvasNodeItem
+          key={node.id}
+          node={node}
+          allNodes={allNodes}
+          isSelected={selectedNodeId === node.id}
+          isMultiSelected={selectedNodeIds?.has(node.id) ?? false}
+          zoomRef={zoomRef}
+          panRef={panRef}
+          sheets={sheets}
+          projectId={projectId}
+          onNodeSelect={onNodeSelect}
+          onShiftClick={onShiftClick}
+          onNodeDelete={onNodeDelete}
+          onNodeDuplicate={onNodeDuplicate}
+          onNodeDuplicateAtPosition={onNodeDuplicateAtPosition}
+          onNodeMove={onNodeMove}
+          onNodeMoveStart={onNodeMoveStart}
+          onNodeMoveEnd={onNodeMoveEnd}
+          onMoveNodeToSheet={onMoveNodeToSheet}
+          setIsNodeBeingDragged={setIsNodeBeingDragged}
+          onSizeChange={onSizeChange}
+          onPortMouseDown={onPortMouseDown}
+          onHover={draftConnection ? undefined : setHoveredNodeId}
+          onButtonPortMount={handleButtonPortMount}
+          isConnectionTarget={hoveredTargetNodeId === node.id}
+          isConnectionSource={draftConnection?.fromNodeId === node.id}
+          isConnectedToDragging={!draftConnection && connectedTodragging.has(node.id)}
+          isHoveredByConnection={!draftConnection && (
+            hoveredConnectionNodes.fromId === node.id ||
+            hoveredConnectionNodes.toId === node.id ||
+            (connectedToHovered.has(node.id) && node.id !== hoveredNodeId && !connectedTodragging.has(node.id)) ||
+            (connectedToHighlighted.has(node.id) && node.id !== highlightNodeId)
+          )}
+          forceHover={!!highlightNodeId && node.id === highlightNodeId}
+        />
+      ))}
+    </div>
+  );
+}

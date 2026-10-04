@@ -1,0 +1,498 @@
+/**
+ * @fileoverview Конфигурация пересылки сообщения через Bot API.
+ * Позволяет задать источник сообщения и список получателей,
+ * включая поддержку ID топика из переменной пользователя.
+ */
+
+import { useMemo } from 'react';
+import { Node } from '@shared/schema';
+import { Input } from '@/components/ui/input';
+import { Button } from '@/components/ui/button';
+import { Label } from '@/components/ui/label';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Switch } from '@/components/ui/switch';
+import { VariableNameInput } from '../variables/variable-name-input';
+import { VariableSelector } from '../variables/variable-selector';
+import { extractVariables } from '../../utils/variables-utils';
+import type { Variable } from '../../../inline-rich/types';
+
+/** Режим указания чата назначения */
+type TargetChatMode = 'manual' | 'variable' | 'admin_ids';
+
+/** Режим указания ID топика */
+type TargetThreadIdSource = 'manual' | 'variable';
+
+/** Один получатель пересылки сообщения */
+interface ForwardMessageTargetRecipient {
+  /** Уникальный ID получателя внутри узла */
+  id: string;
+  /** Способ указания чата назначения */
+  targetChatIdSource: TargetChatMode;
+  /** ID или username чата */
+  targetChatId?: string;
+  /** Имя переменной с ID чата */
+  targetChatVariableName?: string;
+  /** Тип получателя: "user" — пользователь, "group" — группа или канал */
+  targetChatType?: 'user' | 'group';
+  /** ID топика (message_thread_id) для форум-групп */
+  targetThreadId?: string;
+  /** Источник ID топика: "manual" — вручную, "variable" — из переменной */
+  targetThreadIdSource?: TargetThreadIdSource;
+  /** Имя переменной с ID топика */
+  targetThreadIdVariable?: string;
+}
+
+/** Пропсы компонента ForwardMessageConfiguration */
+interface ForwardMessageConfigurationProps {
+  /** Выбранный узел */
+  selectedNode: Node;
+  /** Функция обновления данных узла */
+  onNodeUpdate: (nodeId: string, updates: Partial<Node['data']>) => void;
+  /** Все узлы проекта (для поиска источника) */
+  allNodes?: Node[];
+  /** Функция форматирования отображения узла */
+  formatNodeDisplay?: (node: Node) => string;
+  /** Все узлы из всех листов (для извлечения переменных) */
+  getAllNodesFromAllSheets?: Array<{ node: Node; sheetId?: string; sheetName?: string }>;
+}
+
+/** Проверяет, является ли значение допустимым режимом чата */
+const isTargetChatMode = (value: unknown): value is TargetChatMode =>
+  value === 'manual' || value === 'variable' || value === 'admin_ids';
+
+/** Создаёт нового получателя с дефолтными значениями */
+const createTargetRecipient = (mode: TargetChatMode = 'manual'): ForwardMessageTargetRecipient => ({
+  id: `target-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+  targetChatIdSource: mode,
+  targetChatId: '',
+  targetChatVariableName: '',
+  targetChatType: 'user',
+  targetThreadId: '',
+  targetThreadIdSource: 'manual',
+  targetThreadIdVariable: '',
+});
+
+/**
+ * Нормализует данные получателя, заполняя отсутствующие поля дефолтными значениями.
+ * @param {Partial<ForwardMessageTargetRecipient>} recipient - Сырые данные получателя
+ * @param {number} index - Индекс получателя в массиве
+ * @returns {ForwardMessageTargetRecipient} Нормализованный получатель
+ */
+const normalizeTargetRecipient = (
+  recipient: Partial<ForwardMessageTargetRecipient>,
+  index: number
+): ForwardMessageTargetRecipient => ({
+  id: typeof recipient.id === 'string' && recipient.id.trim() ? recipient.id.trim() : `target-${index + 1}`,
+  targetChatIdSource: isTargetChatMode(recipient.targetChatIdSource) ? recipient.targetChatIdSource : 'manual',
+  targetChatId: typeof recipient.targetChatId === 'string' ? recipient.targetChatId : '',
+  targetChatVariableName: typeof recipient.targetChatVariableName === 'string' ? recipient.targetChatVariableName : '',
+  targetChatType: recipient.targetChatType === 'group' ? 'group' : 'user',
+  targetThreadId: typeof recipient.targetThreadId === 'string' ? recipient.targetThreadId : '',
+  targetThreadIdSource: recipient.targetThreadIdSource === 'variable' ? 'variable' : 'manual',
+  targetThreadIdVariable: typeof recipient.targetThreadIdVariable === 'string' ? recipient.targetThreadIdVariable : '',
+});
+
+/**
+ * Извлекает список получателей из данных узла, поддерживая legacy-формат.
+ * @param {any} data - Данные узла
+ * @returns {ForwardMessageTargetRecipient[]} Список нормализованных получателей
+ */
+const getTargetRecipients = (data: any): ForwardMessageTargetRecipient[] => {
+  const rawTargets = Array.isArray(data.targetChatTargets) ? data.targetChatTargets : [];
+
+  if (rawTargets.length > 0) {
+    return rawTargets.map((recipient: Partial<ForwardMessageTargetRecipient>, index: number) =>
+      normalizeTargetRecipient(recipient, index)
+    );
+  }
+
+  return [
+    normalizeTargetRecipient(
+      {
+        id: 'legacy-target',
+        targetChatIdSource: isTargetChatMode(data.targetChatIdSource) ? data.targetChatIdSource : 'manual',
+        targetChatId: data.targetChatId || '',
+        targetChatVariableName: data.targetChatVariableName || '',
+      },
+      0
+    ),
+  ];
+};
+
+/**
+ * Компонент конфигурации узла пересылки сообщения.
+ * Позволяет задать источник сообщения и список получателей.
+ * Для групп поддерживает указание ID топика вручную или из переменной.
+ */
+export function ForwardMessageConfiguration({
+  selectedNode,
+  onNodeUpdate,
+  allNodes = [],
+  formatNodeDisplay,
+  getAllNodesFromAllSheets = [],
+}: ForwardMessageConfigurationProps) {
+  const data = selectedNode.data as any;
+  const sourceMode = data.sourceMessageIdSource || 'current_message';
+  const linkedSourceNodeId = (data.sourceMessageNodeId || '').trim();
+  const linkedSourceNode = linkedSourceNodeId
+    ? allNodes.find((node) => node.id === linkedSourceNodeId) ?? null
+    : null;
+  const linkedSourceLabel = linkedSourceNode
+    ? (formatNodeDisplay ? formatNodeDisplay(linkedSourceNode) : linkedSourceNode.type)
+    : '';
+  const targetRecipients = getTargetRecipients(data);
+
+  /**
+   * Извлекаем текстовые переменные из всех узлов проекта
+   * для использования в селекторах переменных
+   */
+  const textVariables = useMemo((): Variable[] => {
+    const nodes = getAllNodesFromAllSheets.map((n) => n.node);
+    const { textVariables: vars } = extractVariables(nodes);
+    return vars as Variable[];
+  }, [getAllNodesFromAllSheets]);
+
+  /**
+   * Сохраняет обновлённый список получателей в данные узла.
+   * Также обновляет legacy-поля первого получателя для совместимости.
+   * @param {ForwardMessageTargetRecipient[]} nextRecipients - Новый список получателей
+   */
+  const updateTargetRecipients = (nextRecipients: ForwardMessageTargetRecipient[]) => {
+    const normalizedRecipients = (nextRecipients.length > 0 ? nextRecipients : [createTargetRecipient()])
+      .map((recipient, index) => normalizeTargetRecipient(recipient, index));
+    const primaryRecipient = normalizedRecipients[0];
+
+    onNodeUpdate(selectedNode.id, {
+      targetChatTargets: normalizedRecipients,
+      targetChatIdSource: primaryRecipient.targetChatIdSource,
+      targetChatId: primaryRecipient.targetChatIdSource === 'manual' ? (primaryRecipient.targetChatId || '') : '',
+      targetChatVariableName: primaryRecipient.targetChatIdSource === 'variable'
+        ? (primaryRecipient.targetChatVariableName || '')
+        : '',
+      targetThreadId: primaryRecipient.targetThreadIdSource === 'manual'
+        ? (primaryRecipient.targetThreadId || '')
+        : '',
+      targetThreadIdSource: primaryRecipient.targetThreadIdSource || 'manual',
+      targetThreadIdVariable: primaryRecipient.targetThreadIdSource === 'variable'
+        ? (primaryRecipient.targetThreadIdVariable || '')
+        : '',
+    });
+  };
+
+  /**
+   * Обновляет поля конкретного получателя по индексу.
+   * @param {number} index - Индекс получателя
+   * @param {Partial<ForwardMessageTargetRecipient>} updates - Обновляемые поля
+   */
+  const updateRecipient = (index: number, updates: Partial<ForwardMessageTargetRecipient>) => {
+    const nextRecipients = targetRecipients.map((recipient, recipientIndex) => (
+      recipientIndex === index ? { ...recipient, ...updates } : recipient
+    ));
+    updateTargetRecipients(nextRecipients);
+  };
+
+  /** Добавляет нового получателя в конец списка */
+  const addRecipient = () => {
+    updateTargetRecipients([...targetRecipients, createTargetRecipient()]);
+  };
+
+  /**
+   * Удаляет получателя по индексу.
+   * @param {number} index - Индекс удаляемого получателя
+   */
+  const removeRecipient = (index: number) => {
+    updateTargetRecipients(targetRecipients.filter((_, recipientIndex) => recipientIndex !== index));
+  };
+
+  return (
+    <div className="space-y-6">
+      {/* Секция: Источник сообщения */}
+      <div className="bg-gradient-to-br from-amber-50/50 to-orange-50/30 dark:from-amber-950/20 dark:to-orange-950/10 border border-amber-200/30 dark:border-amber-800/30 rounded-lg p-4">
+        <div className="flex items-center space-x-2 mb-3">
+          <div className="w-6 h-6 rounded-full bg-amber-100 dark:bg-amber-900/50 flex items-center justify-center">
+            <i className="fas fa-share text-amber-600 dark:text-amber-400 text-xs"></i>
+          </div>
+          <Label className="text-sm font-semibold text-amber-900 dark:text-amber-100">Источник сообщения</Label>
+        </div>
+
+        <div className="space-y-3">
+          <Select
+            value={sourceMode}
+            onValueChange={(value) => onNodeUpdate(selectedNode.id, {
+              sourceMessageIdSource: value as any,
+              ...((value === 'manual' || value === 'variable') ? {
+                sourceMessageId: '',
+                sourceMessageVariableName: '',
+                sourceMessageNodeId: '',
+              } : {}),
+            })}
+          >
+            <SelectTrigger className="bg-card/70 border border-amber-200/50 dark:border-amber-800/50">
+              <SelectValue placeholder="Выберите источник сообщения" />
+            </SelectTrigger>
+            <SelectContent>
+              {/* Текущее входящее сообщение пользователя */}
+              <SelectItem value="current_message">Текущее сообщение</SelectItem>
+              {/* Последнее входящее сообщение пользователя */}
+              <SelectItem value="last_message">Последнее сообщение пользователя</SelectItem>
+              {/** Последнее исходящее сообщение бота */}
+              <SelectItem value="last_bot_message">Последнее сообщение бота</SelectItem>
+              {/* Указать ID сообщения вручную */}
+              <SelectItem value="manual">Вручную</SelectItem>
+              {/* Взять ID сообщения из переменной */}
+              <SelectItem value="variable">Из переменной</SelectItem>
+            </SelectContent>
+          </Select>
+
+          {sourceMode === 'manual' && (
+            <div className="space-y-2">
+              <Label className="text-xs font-medium text-amber-700 dark:text-amber-300">ID сообщения</Label>
+              <Input
+                value={data.sourceMessageId || ''}
+                onChange={(e) => onNodeUpdate(selectedNode.id, { sourceMessageId: e.target.value })}
+                placeholder="123456789"
+                className="bg-white/60 dark:bg-slate-950/60 border-amber-200/50 dark:border-amber-800/50"
+              />
+              <div className="text-xs text-amber-600/70 dark:text-amber-400/70 leading-relaxed">
+                Telegram message_id сообщения в диалоге с ботом. Найти можно в логах бота — строка вида{' '}
+                <span className="font-mono bg-amber-100/60 dark:bg-amber-900/30 px-1 rounded">tg_message_id=XXXX</span>
+                . Или используй режим «Последнее сообщение бота» — тогда ID подставится автоматически из переменной {'{last_bot_message_id}'}.
+              </div>
+            </div>
+          )}
+
+          {sourceMode === 'variable' && (
+            <div className="space-y-2">
+              <Label className="text-xs font-medium text-amber-700 dark:text-amber-300">Имя переменной</Label>
+              <div className="flex gap-2">
+                <Input
+                  value={data.sourceMessageVariableName || ''}
+                  onChange={(e) => onNodeUpdate(selectedNode.id, { sourceMessageVariableName: e.target.value })}
+                  placeholder="source_message_id"
+                  className="bg-white/60 dark:bg-slate-950/60 border-amber-200/50 dark:border-amber-800/50 flex-1"
+                />
+                <VariableSelector
+                  availableVariables={textVariables}
+                  onSelect={(name) => onNodeUpdate(selectedNode.id, { sourceMessageVariableName: name })}
+                />
+              </div>
+            </div>
+          )}
+
+          {linkedSourceNodeId && (
+            <div className="text-xs text-amber-700/80 dark:text-amber-300/80 leading-relaxed">
+              Источник привязан к узлу: {linkedSourceLabel || linkedSourceNodeId}
+            </div>
+          )}
+
+          <div className="text-xs text-amber-700/80 dark:text-amber-300/80 leading-relaxed">
+            Связь на холсте с узлом сообщения задаёт источник пересылки и не запускает `forward_message` автоматически. При необходимости можно указать ID вручную или взять его из переменной.
+          </div>
+        </div>
+      </div>
+
+      {/* Секция: Чат назначения */}
+      <div className="bg-gradient-to-br from-sky-50/50 to-blue-50/30 dark:from-sky-950/20 dark:to-blue-950/10 border border-sky-200/30 dark:border-sky-800/30 rounded-lg p-4">
+        <div className="flex items-center space-x-2 mb-3">
+          <div className="w-6 h-6 rounded-full bg-sky-100 dark:bg-sky-900/50 flex items-center justify-center">
+            <i className="fas fa-inbox text-sky-600 dark:text-sky-400 text-xs"></i>
+          </div>
+          <Label className="text-sm font-semibold text-sky-900 dark:text-sky-100">Чат назначения</Label>
+        </div>
+
+        <div className="space-y-3">
+          <div className="text-xs text-sky-700/80 dark:text-sky-300/80 leading-relaxed">
+            Можно добавить несколько получателей. Первый получатель сохраняется в старые поля для совместимости.
+          </div>
+
+          <div className="space-y-3">
+            {targetRecipients.map((recipient, index) => (
+              <div
+                key={recipient.id}
+                className="space-y-3 rounded-xl border border-sky-200/40 dark:border-sky-800/40 bg-white/50 dark:bg-slate-950/30 p-3"
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <Label className="text-xs font-medium text-sky-700 dark:text-sky-300">
+                    Получатель {index + 1}
+                  </Label>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 px-2 text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30"
+                    onClick={() => removeRecipient(index)}
+                  >
+                    <i className="fas fa-trash text-xs mr-2"></i>
+                    Удалить
+                  </Button>
+                </div>
+
+                {/* Выбор способа указания чата */}
+                <Select
+                  value={recipient.targetChatIdSource}
+                  onValueChange={(value) => updateRecipient(index, { targetChatIdSource: value as TargetChatMode })}
+                >
+                  <SelectTrigger className="bg-card/70 border border-sky-200/50 dark:border-sky-800/50">
+                    <SelectValue placeholder="Выберите способ указания чата" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="manual">Вручную</SelectItem>
+                    <SelectItem value="variable">Из переменной</SelectItem>
+                    <SelectItem value="admin_ids">Admin IDs проекта</SelectItem>
+                  </SelectContent>
+                </Select>
+
+                {recipient.targetChatIdSource === 'manual' && (
+                  <div className="space-y-2">
+                    {/* Тип получателя */}
+                    <Label className="text-xs font-medium text-sky-700 dark:text-sky-300">Тип получателя</Label>
+                    <Select
+                      value={recipient.targetChatType || 'user'}
+                      onValueChange={(value) => updateRecipient(index, { targetChatType: value as 'user' | 'group' })}
+                    >
+                      <SelectTrigger className="bg-card/70 border border-sky-200/50 dark:border-sky-800/50">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="user">Пользователь</SelectItem>
+                        <SelectItem value="group">Группа или канал</SelectItem>
+                      </SelectContent>
+                    </Select>
+
+                    {/* ID или username чата */}
+                    <Label className="text-xs font-medium text-sky-700 dark:text-sky-300">
+                      {recipient.targetChatType === 'group' ? 'ID или username группы/канала' : 'ID или username пользователя'}
+                    </Label>
+                    <Input
+                      value={recipient.targetChatId || ''}
+                      onChange={(e) => updateRecipient(index, { targetChatId: e.target.value })}
+                      placeholder={recipient.targetChatType === 'group' ? '2300967595 или @channel_name' : '123456789 или @username'}
+                      className="bg-white/60 dark:bg-slate-950/60 border-sky-200/50 dark:border-sky-800/50"
+                    />
+
+                    {/* Секция ID топика — только для групп */}
+                    {recipient.targetChatType === 'group' && (
+                      <div className="space-y-2 pt-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <Label className="text-xs font-medium text-sky-700 dark:text-sky-300">
+                            ID топика (необязательно)
+                          </Label>
+                          {/* Переключатель источника ID топика */}
+                          <Select
+                            value={recipient.targetThreadIdSource || 'manual'}
+                            onValueChange={(value) =>
+                              updateRecipient(index, {
+                                targetThreadIdSource: value as TargetThreadIdSource,
+                                targetThreadId: '',
+                                targetThreadIdVariable: '',
+                              })
+                            }
+                          >
+                            <SelectTrigger className="h-7 w-36 text-xs bg-card/70 border border-sky-200/50 dark:border-sky-800/50">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="manual">Вручную</SelectItem>
+                              <SelectItem value="variable">Из переменной</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+
+                        {/* Ввод ID топика вручную */}
+                        {(recipient.targetThreadIdSource || 'manual') === 'manual' && (
+                          <>
+                            <Input
+                              value={recipient.targetThreadId || ''}
+                              onChange={(e) => updateRecipient(index, { targetThreadId: e.target.value })}
+                              placeholder="615"
+                              className="bg-white/60 dark:bg-slate-950/60 border-sky-200/50 dark:border-sky-800/50"
+                            />
+                            <div className="text-xs text-sky-600/70 dark:text-sky-400/70">
+                              Для форум-групп. Найти в ссылке: t.me/c/GROUP_ID/TOPIC_ID/MSG_ID
+                            </div>
+                          </>
+                        )}
+
+                        {/* Выбор переменной с ID топика */}
+                        {recipient.targetThreadIdSource === 'variable' && (
+                          <>
+                            <VariableNameInput
+                              value={recipient.targetThreadIdVariable || ''}
+                              availableVariables={textVariables}
+                              onChange={(value) => updateRecipient(index, { targetThreadIdVariable: value })}
+                              placeholder="forum_thread_id"
+                            />
+                            <div className="text-xs text-sky-600/70 dark:text-sky-400/70">
+                              Переменная должна содержать числовой ID топика форум-группы.
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {recipient.targetChatIdSource === 'variable' && (
+                  <div className="space-y-2">
+                    <Label className="text-xs font-medium text-sky-700 dark:text-sky-300">Имя переменной</Label>
+                    <Input
+                      value={recipient.targetChatVariableName || ''}
+                      onChange={(e) => updateRecipient(index, { targetChatVariableName: e.target.value })}
+                      placeholder="target_chat_id"
+                      className="bg-white/60 dark:bg-slate-950/60 border-sky-200/50 dark:border-sky-800/50"
+                    />
+                  </div>
+                )}
+
+                {recipient.targetChatIdSource === 'admin_ids' && (
+                  <div className="rounded-lg border border-sky-200/40 dark:border-sky-800/30 bg-sky-50/70 dark:bg-sky-950/20 px-3 py-2 text-xs text-sky-700 dark:text-sky-300 leading-relaxed">
+                    Будут использованы admin ids проекта. Это удобно для отправки сообщения сразу всем администраторам.
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+
+          <Button
+            type="button"
+            variant="outline"
+            className="w-full border-dashed border-sky-300 text-sky-700 hover:bg-sky-50 dark:border-sky-700 dark:text-sky-300 dark:hover:bg-sky-950/20"
+            onClick={addRecipient}
+          >
+            <i className="fas fa-plus mr-2"></i>
+            Добавить получателя
+          </Button>
+        </div>
+      </div>
+
+      {/* Секция: Тихая отправка и скрытие автора */}
+      <div className="bg-gradient-to-br from-slate-50/50 to-slate-100/30 dark:from-slate-950/20 dark:to-slate-900/10 border border-slate-200/30 dark:border-slate-800/30 rounded-lg p-4 space-y-4">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <Label className="text-sm font-semibold text-slate-900 dark:text-slate-100">Отправлять без уведомления</Label>
+            <div className="text-xs text-slate-600 dark:text-slate-400 mt-1">
+              Пересылать сообщение тихо, без звука и push-уведомления у получателя.
+            </div>
+          </div>
+          <Switch
+            checked={data.disableNotification ?? false}
+            onCheckedChange={(checked) => onNodeUpdate(selectedNode.id, { disableNotification: checked })}
+          />
+        </div>
+        <div className="border-t border-slate-200/40 dark:border-slate-700/40" />
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <Label className="text-sm font-semibold text-slate-900 dark:text-slate-100">Скрыть автора</Label>
+            <div className="text-xs text-slate-600 dark:text-slate-400 mt-1">
+              Использует <span className="font-mono">copy_message</span> вместо <span className="font-mono">forward_message</span> — сообщение придёт без ссылки на оригинал.
+            </div>
+          </div>
+          <Switch
+            checked={data.hideAuthor ?? false}
+            onCheckedChange={(checked) => onNodeUpdate(selectedNode.id, { hideAuthor: checked })}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,920 @@
+/**
+ * @fileoverview ������ ����� ������ ��������� � �� ������ �����.
+ */
+
+import { Node } from '@/types/bot';
+import { cn } from '@/utils/utils';
+import { useState, useRef, useEffect, useMemo } from 'react';
+import { OutputPort } from './output-port';
+import { PortType } from './port-colors';
+import { invoiceUsesPayButtonVisual } from '@/components/editor/properties/utils/invoice-pay-connection';
+import { getCanvasViewportMetrics, screenPointToCanvasPoint } from '../canvas/utils/canvas-coordinate-utils';
+import { NodeContextMenu } from './context-menu/node-context-menu';
+import { useNodeContextMenu } from './context-menu/use-node-context-menu';
+import { DicePreview } from './dice-preview';
+import { StickerPreview } from './sticker-preview';
+import { VoicePreview } from './voice-preview';
+import { ContactPreview } from './contact-preview';
+import { PollPreview } from './poll-preview';
+import { LocationPreview } from './location-preview';import { MediaAttachmentIndicator } from './media-attachment-indicator';
+import { TextInputIndicator } from './text-input-indicator';
+import { SaveAnswerIndicator } from './save-answer-indicator';
+import { MessageLinkedInputIndicator } from './message-linked-input-indicator';
+import { MessagePreview } from './message-preview';
+import { MessageRecipientsPreview } from './message-recipients-preview';
+import { ForumTopicPreview } from './forum-topic-preview';
+import { ImageAttachment } from './image-attachment';
+import { MediaAttachmentsPreview } from './media-attachments-preview';
+import { NodeActions } from './node-actions';
+import { AdminRightsPreview } from './admin-rights-preview';
+import { NodeHeader } from './node-header';
+import { ButtonsPreview } from './buttons-preview';
+import { ClientAuthCard } from './client-auth-card';
+import { CommandTriggerPreview } from './command-trigger-preview';
+import { TextTriggerPreview } from './text-trigger-preview';
+import { AnyMessageTriggerPreview } from './any-message-trigger-preview';
+import { GroupMessageTriggerPreview } from './group-message-trigger-preview';
+import { CallbackTriggerPreview } from './callback-trigger-preview';
+import { IncomingCallbackTriggerPreview } from './incoming-callback-trigger-preview';
+import { OutgoingMessageTriggerPreview } from './outgoing-message-trigger-preview';
+import { ManagedBotUpdatedTriggerPreview } from './managed-bot-updated-trigger-preview';
+import { SuccessfulPaymentTriggerPreview } from './successful-payment-trigger-preview';
+import { MemberTriggerPreview } from './member-trigger-preview';
+import { ScheduleTriggerPreview } from './schedule-trigger-preview';
+import { ApiTriggerPreview } from './api-trigger-preview';
+import { ApiResponsePreview } from './api-response-preview';
+import { ConditionNodePreview } from './condition-node-preview';
+import { ParallelSplitPreview } from './parallel-split-preview';
+import { MediaNodePreview } from './media-node-preview';
+import { HttpRequestPreview } from './http-request-preview';
+import { GetManagedBotTokenPreview } from './get-managed-bot-token-preview';
+import { AnswerCallbackQueryPreview } from './answer-callback-query-preview';
+import { EditMessagePreview } from './edit-message-preview';
+import { SetVariablePreview } from './set-variable-preview';
+import { PsqlQueryPreview } from './psql-query-preview';
+import { ConvertFilePreview } from './convert-file-preview';
+import { LoopPreview } from './loop-preview';
+import { BotTablePreview } from './bot-table-preview';
+import { DelayPreview } from './delay-preview';
+import { SendInvoicePreview } from './send-invoice-preview';
+import { CreateInvoiceLinkPreview } from './create-invoice-link-preview';
+import { RefundStarsPreview } from './refund-stars-preview';
+import { EditStarSubscriptionPreview } from './edit-star-subscription-preview';
+import { GetStarBalancePreview } from './get-star-balance-preview';
+import { StopProcessingPreview } from './stop-processing-preview';
+import { RateCounterPreview } from './rate-counter-preview';
+import { CodePreview } from './code-preview';
+import { UserbotMessagePreview } from './userbot-message-preview';
+import { UserbotClickButtonPreview } from './userbot-click-button-preview';
+import { UserbotInlineQueryPreview } from './userbot-inline-query-preview';
+import { UserbotEditTriggerPreview } from './userbot-edit-trigger-preview';
+import { CommentPreview } from './comment-preview';
+import { MoveToSheetMenu } from './context-menu/move-to-sheet-menu';
+import { getKeyboardNodeWidth } from '../utils/get-keyboard-node-width';
+
+/**
+ * Интерфейс свойств компонента CanvasNode
+ *
+ * @interface CanvasNodeProps
+ * @property {Node} node - Узел, который будет отображен
+ * @property {Node[]} [allNodes] - Все узлы на холсте (опционально)
+ * @property {boolean} [isSelected] - Выделен ли узел (опционально)
+ * @property {Function} [onClick] - Обработчик клика по узлу (опционально)
+ * @property {Function} [onDelete] - Обработчик удаления узла (опционально)
+ * @property {Function} [onDuplicate] - Обработчик дублирования узла (опционально)
+ * @property {Function} [onMove] - Обработчик перемещения узла (опционально)
+ * @property {Function} [onMoveEnd] - Обработчик завершения перемещения узла (опционально)
+ * @property {React.MutableRefObject<number>} [zoomRef] - Ref-зеркало масштаба (читается в drag-обработчиках по месту)
+ * @property {React.MutableRefObject<{x:number,y:number}>} [panRef] - Ref-зеркало смещения холста
+ * @property {Function} [setIsNodeBeingDragged] - Обработчик установки состояния перетаскивания (опционально)
+ * @property {Function} [onSizeChange] - Обработчик изменения размера узла (опционально)
+ */
+interface CanvasNodeProps {
+  node: Node;
+  allNodes?: Node[];
+  isSelected?: boolean;
+  /** Узел выделен рамкой (мульти-выделение) — отдельная индиго-подсветка */
+  isMultiSelected?: boolean;
+  onClick?: () => void;
+  /** Обработчик Shift+клика — добавляет/убирает узел из мульти-выделения */
+  onShiftClick?: () => void;
+  onDelete?: () => void;
+  /** Обработчик дублирования узла с опциональной целевой позицией */
+  onDuplicate?: ((targetPosition?: { x: number; y: number }) => void) | undefined;
+  /**
+   * Обработчик дублирования узла через контекстное меню.
+   * Позиция вычисляется в canvas.tsx через getPastePosition() — ту же функцию,
+   * что использует Ctrl+V — поэтому дубль всегда попадает в точку последнего клика.
+   * Если передан этот проп, контекстное меню использует его вместо собственной
+   * формулы конвертации координат.
+   */
+  onDuplicateAtPosition?: () => void;
+  onMove?: (position: { x: number; y: number }) => void;
+  onMoveStart?: () => void;
+  onMoveEnd?: () => void;
+  /**
+   * Ref-зеркало масштаба. Передаётся вместо меняющегося `zoom`, чтобы drag-обработчики
+   * читали актуальное значение по месту, а нода не ре-рендерилась на каждый кадр зума.
+   */
+  zoomRef?: React.MutableRefObject<number>;
+  /** Ref-зеркало смещения холста (аналогично `zoomRef`) */
+  panRef?: React.MutableRefObject<{ x: number; y: number }>;
+  setIsNodeBeingDragged?: ((isDragging: boolean) => void) | undefined;
+  onSizeChange?: (nodeId: string, size: { width: number; height: number }) => void;
+  /** Обработчик начала перетаскивания от порта выхода */
+  onPortMouseDown?: (
+    e: React.MouseEvent,
+    nodeId: string,
+    portType: PortType,
+    buttonId?: string,
+    portCenter?: { x: number; y: number }
+  ) => void;
+  /** Узел является источником активного drag-соединения (держит порты видимыми) */
+  isConnectionSource?: boolean;
+  /** ��������� ���� ��� ���������� ���� ��� drag-to-connect */
+  isConnectionTarget?: boolean;
+  /** ���� ������ � ��������������� ����� */
+  isConnectedToDragging?: boolean;
+  /** ���� ��������� ��� ��������� �� ����� ���������� */
+  isHoveredByConnection?: boolean;
+  /** �������������� ��������� ���� ��� ��� ��������� ����� (�� ��������) */
+  forceHover?: boolean;
+  /** ������ ��� ���������/����� ���� � ���� */
+  onHover?: (nodeId: string | null) => void;
+  /** ������ ������ ��� ����������� ���� (��� ��������) */
+  sheets?: Array<{ id: string; name: string }>;
+  /** ������ ����������� ���� � ������ ���� */
+  onMoveToSheet?: (sheetId: string) => void;
+  /**
+   * Колбэк, вызываемый при монтировании порта кнопки.
+   * Передаёт buttonId и позицию центра порта относительно wrapper-div узла.
+   */
+  onButtonPortMount?: (buttonId: string, offset: { x: number; y: number }) => void;
+  /** ID проекта (для превью Telegram file_id через прокси) */
+  projectId?: number;
+}
+
+/**
+ * Компонент узла на холсте
+ *
+ * @component
+ * @description Отображает узел на холсте с возможностью перемещения, выделения и взаимодействия.
+ *
+ * Структура рендера:
+ * - Внешний wrapper-div: только position/left/top/zIndex — без overflow, без backdrop-filter.
+ *   Это гарантирует, что абсолютно позиционированные дочерние элементы с отрицательными
+ *   отступами (кнопки, порты) не обрезаются при добавлении ring/box-shadow на внутренний div.
+ * - NodeActions и OutputPort рендерятся внутри wrapper, но снаружи основного div узла.
+ * - Основной div узла: только визуальное содержимое + ring/shadow при выделении.
+ *
+ * @param {CanvasNodeProps} props - Свойства компонента
+ * @returns {JSX.Element} Компонент узла на холсте
+ */
+export function CanvasNode({ node, allNodes, isSelected, isMultiSelected, onClick, onShiftClick, onDelete, onDuplicate, onDuplicateAtPosition, onMove, onMoveStart, onMoveEnd, zoomRef, panRef, setIsNodeBeingDragged, onSizeChange, onPortMouseDown, isConnectionTarget, isConnectionSource, isConnectedToDragging, isHoveredByConnection, forceHover, onHover, onButtonPortMount, sheets, onMoveToSheet, projectId }: CanvasNodeProps) {
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
+  // Ref для dragOffset — позволяет читать актуальное значение в handleMouseMove
+  // без добавления dragOffset в зависимости useEffect (иначе обработчики
+  // пересоздавались бы при каждом mousemove, вызывая пропуск событий).
+  const dragOffsetRef = useRef(dragOffset);
+  const nodeRef = useRef<HTMLDivElement>(null);
+  const { menu, open: openContextMenu, close: closeContextMenu } = useNodeContextMenu();
+
+  /** Текущий масштаб из ref-зеркала (читается по месту в drag-обработчиках) */
+  const readZoom = () => zoomRef?.current ?? 100;
+  /** Текущее смещение холста из ref-зеркала */
+  const readPan = () => panRef?.current ?? { x: 0, y: 0 };
+
+  /**
+   * Переводит экранную точку в координаты canvas с учетом scroll контейнера.
+   *
+   * @param screenX - X в экранных координатах
+   * @param screenY - Y в экранных координатах
+   * @returns Точка в координатах canvas
+   */
+  const getCanvasPoint = (screenX: number, screenY: number) => {
+    const wrapperDiv = nodeRef.current?.parentElement;
+    const transformedContainer = wrapperDiv?.parentElement;
+    const canvas = transformedContainer?.parentElement;
+    const viewport = getCanvasViewportMetrics(canvas);
+    if (!viewport) return { x: screenX, y: screenY };
+    return screenPointToCanvasPoint(screenX, screenY, viewport, readPan(), readZoom());
+  };
+  void getCanvasPoint;
+
+  /**
+   * Обработчик начала перетаскивания от порта выхода.
+   * Пробрасывает nodeId в колбэк родителя.
+   */
+  const handlePortMouseDown = (e: React.MouseEvent, portType: PortType, buttonId?: string, portCenter?: { x: number; y: number }) => {
+    onPortMouseDown?.(e, node.id, portType, buttonId, portCenter);
+  };
+
+  /**
+   * Обработчик клика по узлу.
+   * При зажатом Shift переключает узел в мульти-выделении (toggle), иначе —
+   * выполняет обычный выбор одного узла. Во время перетаскивания клик игнорируется.
+   *
+   * @param e - Событие мыши
+   */
+  const handleClick = (e: React.MouseEvent) => {
+    if (isDragging) return;
+    if (e.shiftKey && onShiftClick) {
+      e.stopPropagation();
+      onShiftClick();
+      return;
+    }
+    onClick?.();
+  };
+
+  // Touch состояние для мобильного перемещения элементов
+  const [isTouchDragging, setIsTouchDragging] = useState(false);
+  const [touchOffset, setTouchOffset] = useState({ x: 0, y: 0 });
+  const [touchStartTime, setTouchStartTime] = useState(0);
+  const [touchStartPos, setTouchStartPos] = useState({ x: 0, y: 0 });
+  const [touchMoved, setTouchMoved] = useState(false);
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    if (!onMove) return;
+
+    // Не запускать драг если кликнули по кнопке удаления
+    if ((e.target as HTMLElement).closest('button')) return;
+
+    // Находим канвас (родительский элемент трансформируемого контейнера)
+    // nodeRef указывает на внутренний div: innerDiv -> wrapper -> transformedContainer -> canvas
+    const wrapperDiv = nodeRef.current?.parentElement;
+    const transformedContainer = wrapperDiv?.parentElement;
+    const canvas = transformedContainer?.parentElement;
+
+    if (canvas) {
+      const canvasRect = canvas.getBoundingClientRect();
+      const zoom = readZoom();
+      const pan = readPan();
+      const zoomFactor = zoom / 100;
+
+      // Рассчитываем смещение в канвасных координатах
+      const screenX = e.clientX - canvasRect.left;
+      const screenY = e.clientY - canvasRect.top;
+
+      const canvasX = (screenX - pan.x) / zoomFactor;
+      const canvasY = (screenY - pan.y) / zoomFactor;
+
+      setDragOffset({
+        x: canvasX - node.position.x,
+        y: canvasY - node.position.y
+      });
+      dragOffsetRef.current = {
+        x: canvasX - node.position.x,
+        y: canvasY - node.position.y
+      };
+      setIsDragging(true);
+      // Сохраняем состояние ДО начала перемещения
+      onMoveStart?.();
+      // Уведомляем глобальное состояние о начале перетаскивания
+      if (setIsNodeBeingDragged) {
+        setIsNodeBeingDragged(true);
+      }
+    }
+
+    // Предотвращаем выделение текста при перетаскивании
+    e.preventDefault();
+  };
+
+  const handleMouseMove = (e: MouseEvent) => {
+    if (!isDragging || !onMove) return;
+
+    // Находим канвас (родительский элемент трансформируемого контейнера)
+    const wrapperDiv = nodeRef.current?.parentElement;
+    const transformedContainer = wrapperDiv?.parentElement;
+    const canvas = transformedContainer?.parentElement;
+
+    if (canvas && transformedContainer) {
+      const canvasRect = canvas.getBoundingClientRect();
+
+      // Получаем экранные координаты мыши относительно канваса
+      const screenX = e.clientX - canvasRect.left;
+      const screenY = e.clientY - canvasRect.top;
+
+      // Преобразуем экранные координаты в координаты канваса с учетом зума и панорамирования
+      const zoom = readZoom();
+      const pan = readPan();
+      const zoomFactor = zoom / 100;
+      const canvasX = (screenX - pan.x) / zoomFactor - dragOffsetRef.current.x;
+      const canvasY = (screenY - pan.y) / zoomFactor - dragOffsetRef.current.y;
+
+      // Привязка к сетке (20px grid в канвасных координатах)
+      const gridSize = 20;
+      const snappedX = Math.round(canvasX / gridSize) * gridSize;
+      const snappedY = Math.round(canvasY / gridSize) * gridSize;
+
+      onMove({ x: snappedX, y: snappedY });
+    }
+  };
+
+  const handleMouseUp = () => {
+    // Логируем перемещение только если узел реально перемещался
+    if (isDragging && onMoveEnd) {
+      onMoveEnd();
+    }
+    setIsDragging(false);
+    // Уведомляем глобальное состояние об окончании перетаскивания
+    if (setIsNodeBeingDragged) {
+      setIsNodeBeingDragged(false);
+    }
+  };
+
+  // Touch обработчики для мобильного перемещения элементов (нативные, для passive: false)
+  const handleNativeTouchStart = (e: TouchEvent) => {
+    // Не запускать события если кликнули по кнопке
+    if ((e.target as HTMLElement).closest('button')) return;
+
+    // Останавливаем всплытие, чтобы не конфликтовать с панорамированием холста
+    e.stopPropagation();
+
+    const touch = e.touches[0];
+    if (!touch) return;
+
+    // Записываем информацию о начале касания
+    setTouchStartTime(Date.now());
+    setTouchStartPos({ x: touch.clientX, y: touch.clientY });
+    setTouchMoved(false);
+
+    // Подготавливаем для потенциального перетаскивания только если onMove доступен
+    if (onMove) {
+      // Находим канвас (родительский элемент трансформируемого контейнера)
+      const wrapperDiv = nodeRef.current?.parentElement;
+      const transformedContainer = wrapperDiv?.parentElement;
+      const canvas = transformedContainer?.parentElement;
+
+      if (canvas) {
+        const canvasRect = canvas.getBoundingClientRect();
+        const zoom = readZoom();
+        const pan = readPan();
+        const zoomFactor = zoom / 100;
+
+        // Рассчитываем смещение в канвасных координатах
+        const screenX = touch.clientX - canvasRect.left;
+        const screenY = touch.clientY - canvasRect.top;
+
+        const canvasX = (screenX - pan.x) / zoomFactor;
+        const canvasY = (screenY - pan.y) / zoomFactor;
+
+        setTouchOffset({
+          x: canvasX - node.position.x,
+          y: canvasY - node.position.y
+        });
+      }
+    }
+  };
+
+  const handleNativeTouchMove = (e: TouchEvent) => {
+    const touch = e.touches[0];
+    if (!touch || !onMove) return;
+
+    if (e.cancelable) {
+      e.preventDefault();
+    }
+    e.stopPropagation();
+
+    // Вычисляем расстояние от начальной точки касания
+    const deltaX = touch.clientX - touchStartPos.x;
+    const deltaY = touch.clientY - touchStartPos.y;
+    const distance = Math.sqrt(deltaX * deltaX + deltaY * deltaY);
+
+    // Начинаем перетаскивание только если движение больше 10 пикселей
+    if (distance > 10 && !isTouchDragging) {
+      setIsTouchDragging(true);
+      setTouchMoved(true);
+      onMoveStart?.();
+      if (setIsNodeBeingDragged) {
+        setIsNodeBeingDragged(true);
+      }
+    }
+
+    if (!isTouchDragging) return;
+
+    // Быстрая перерисовка только позиции - без обновления других стилей
+    const wrapperDiv = nodeRef.current?.parentElement;
+    const transformedContainer = wrapperDiv?.parentElement;
+    const canvas = transformedContainer?.parentElement;
+
+    if (!canvas || !transformedContainer) return;
+
+    const canvasRect = canvas.getBoundingClientRect();
+    const screenX = touch.clientX - canvasRect.left;
+    const screenY = touch.clientY - canvasRect.top;
+
+    const zoom = readZoom();
+    const pan = readPan();
+    const zoomFactor = zoom / 100;
+    const canvasX = (screenX - pan.x) / zoomFactor - touchOffset.x;
+    const canvasY = (screenY - pan.y) / zoomFactor - touchOffset.y;
+
+    const gridSize = 20;
+    const snappedX = Math.round(canvasX / gridSize) * gridSize;
+    const snappedY = Math.round(canvasY / gridSize) * gridSize;
+
+    onMove({ x: snappedX, y: snappedY });
+  };
+
+  const handleNativeTouchEnd = (e: TouchEvent) => {
+    if (e.cancelable) {
+      e.preventDefault();
+    }
+    e.stopPropagation();
+
+    const touchEndTime = Date.now();
+    const touchDuration = touchEndTime - touchStartTime;
+
+    if (touchDuration < 300 && !touchMoved && onClick) {
+      onClick();
+    }
+
+    if (isTouchDragging && touchMoved && onMoveEnd) {
+      onMoveEnd();
+    }
+
+    setIsTouchDragging(false);
+    setTouchMoved(false);
+    if (setIsNodeBeingDragged) {
+      setIsNodeBeingDragged(false);
+    }
+  };
+
+  // Добавляем и удаляем обработчики событий для mouse
+  useEffect(() => {
+    if (isDragging) {
+      document.addEventListener('mousemove', handleMouseMove);
+      document.addEventListener('mouseup', handleMouseUp);
+      document.body.style.cursor = 'grabbing';
+      document.body.style.userSelect = 'none';
+
+      return () => {
+        document.removeEventListener('mousemove', handleMouseMove);
+        document.removeEventListener('mouseup', handleMouseUp);
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+      };
+    }
+    return () => {};
+  }, [isDragging, onMove]);
+
+  // Touch события уже обрабатываются в handleTouchMove, не нужно добавлять глобальные слушатели
+  useEffect(() => {
+    if (isTouchDragging) {
+      document.body.style.userSelect = 'none';
+      document.body.style.touchAction = 'none'; // Предотвращаем прокрутку при перетаскивании
+
+      return () => {
+        document.body.style.userSelect = '';
+        document.body.style.touchAction = '';
+      };
+    }
+    return () => {};
+  }, [isTouchDragging]);
+
+  /**
+   * ResizeObserver для измерения border-box размеров wrapper-div узла.
+   *
+   * Наблюдаем за wrapper-div (родитель nodeRef), а не за внутренним div,
+   * чтобы получить полную border-box высоту включая padding и border.
+   * Это позволяет вычислять центр OutputPort как node.position.y + height / 2
+   * без каких-либо дополнительных смещений.
+   */
+  useEffect(() => {
+    if (!onSizeChange || !nodeRef.current) return;
+
+    // wrapper-div — родитель внутреннего div (nodeRef)
+    const wrapperEl = nodeRef.current.parentElement;
+    if (!wrapperEl) return;
+
+    const resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        let width: number;
+        let height: number;
+        // Используем borderBoxSize если доступен (современные браузеры)
+        if (entry.borderBoxSize && entry.borderBoxSize.length > 0) {
+          width = entry.borderBoxSize[0].inlineSize;
+          height = entry.borderBoxSize[0].blockSize;
+        } else {
+          // Фолбэк через getBoundingClientRect для старых браузеров
+          const rect = (entry.target as HTMLElement).getBoundingClientRect();
+          width = rect.width;
+          height = rect.height;
+        }
+        onSizeChange(node.id, { width, height });
+      }
+    });
+
+    resizeObserver.observe(wrapperEl);
+
+    return () => {
+      resizeObserver.disconnect();
+    };
+  }, [node.id, onSizeChange]);
+
+  /**
+   * Refs для нативных touch-обработчиков — позволяют useEffect не перерегистрировать
+   * listeners при каждом рендере, но всегда вызывать актуальную версию функции
+   */
+  const touchStartRef = useRef(handleNativeTouchStart);
+  const touchMoveRef = useRef(handleNativeTouchMove);
+  const touchEndRef = useRef(handleNativeTouchEnd);
+  touchStartRef.current = handleNativeTouchStart;
+  touchMoveRef.current = handleNativeTouchMove;
+  touchEndRef.current = handleNativeTouchEnd;
+
+  /**
+   * Регистрация touch-обработчиков с { passive: false }
+   * чтобы preventDefault() работал корректно в Chrome
+   */
+  useEffect(() => {
+    const el = nodeRef.current;
+    if (!el) return;
+
+    const opts: AddEventListenerOptions = { passive: false };
+    const onStart = (e: TouchEvent) => touchStartRef.current(e);
+    const onMove = (e: TouchEvent) => touchMoveRef.current(e);
+    const onEnd = (e: TouchEvent) => touchEndRef.current(e);
+
+    el.addEventListener('touchstart', onStart, opts);
+    el.addEventListener('touchmove', onMove, opts);
+    el.addEventListener('touchend', onEnd, opts);
+
+    return () => {
+      el.removeEventListener('touchstart', onStart);
+      el.removeEventListener('touchmove', onMove);
+      el.removeEventListener('touchend', onEnd);
+    };
+  }, []);
+
+  const isDragActive = isDragging || isTouchDragging;
+  const [isHovered, setIsHovered] = useState(false);
+  /** ����������� hover: ��������� ��� �������������� �� �������� */
+  const effectiveHover = isHovered || !!forceHover;
+
+  /** Динамическая ширина узла keyboard по числу колонок и длине текста кнопок */
+  const keyboardNodeWidth = useMemo(() => {
+    if (node.type !== 'keyboard') return undefined;
+    return getKeyboardNodeWidth(node);
+  }, [node]);
+
+  return (
+    /**
+     * Внешний wrapper-div: только позиционирование.
+     * Не содержит overflow, backdrop-filter или transform с perspective —
+     * это предотвращает создание нового stacking context, который обрезал бы
+     * абсолютно позиционированные дочерние элементы с отрицательными отступами
+     * (кнопки NodeActions и кружок OutputPort).
+     */
+    <div
+      className="group"
+      style={{
+        position: 'absolute',
+        left: node.position.x,
+        top: node.position.y,
+        zIndex: isDragActive ? 1000 : isSelected || isMultiSelected ? 100 : 10,
+        overflow: 'visible',
+      }}
+      onMouseEnter={() => { setIsHovered(true); onHover?.(node.id); }}
+      onMouseLeave={() => { setIsHovered(false); onHover?.(null); }}
+    >
+      {/* Кнопки действий — снаружи основного div, позиционируются относительно wrapper */}
+      <NodeActions onDuplicate={onDuplicateAtPosition ?? onDuplicate} onDelete={onDelete} isSelected={isSelected} />
+
+      {/* Порт выхода — снаружи основного div, позиционируется относительно wrapper */}
+      {/* Узел condition имеет порты на каждой ветке — общий порт не нужен */}
+      {/* Узел loop имеет два порта (тело + далее) внутри превью */}
+      {(node.type === 'command_trigger' || node.type === 'text_trigger' || node.type === 'incoming_message_trigger' || node.type === 'group_message_trigger' || (node.type as any) === 'member_trigger' || (node.type as any) === 'callback_trigger' || (node.type as any) === 'incoming_callback_trigger' || (node.type as any) === 'outgoing_message_trigger' || (node.type as any) === 'managed_bot_updated_trigger' || (node.type as any) === 'successful_payment_trigger' || (node.type as any) === 'schedule_trigger' || (node.type as any) === 'api_trigger' || (node.type as any) === 'userbot_edit_trigger') ? (
+        <OutputPort portType="trigger-next" onPortMouseDown={handlePortMouseDown} isActive={isConnectionSource} />
+      ) : node.type !== 'condition' && node.type !== 'keyboard' && node.type !== 'loop' && (node.type as any) !== 'parallel_split' && (node.type as any) !== 'comment' && (node.type as any) !== 'refund_stars' && (node.type as any) !== 'edit_star_subscription' && (node.type as any) !== 'get_star_balance' && (node.type as any) !== 'create_invoice_link'
+        && !((node.type as string) === 'send_invoice' && allNodes && invoiceUsesPayButtonVisual(node, allNodes)) ? (
+        <OutputPort portType={node.type === 'input' ? 'input-target' : 'auto-transition'} onPortMouseDown={handlePortMouseDown} isActive={isConnectionSource} />
+      ) : null}
+
+      {/* Основной div узла — только визуальное содержимое */}
+      <div
+        ref={nodeRef}
+        data-canvas-node="true"
+        data-node-type={node.type}
+        className={cn(
+          "bg-white/90 dark:bg-slate-900/90 rounded-2xl border-2 relative select-none",
+          // Компактный размер для триггеров и утилит; счёт чуть шире под длинное имя
+          (node.type as any) === 'send_invoice' || (node.type as any) === 'create_invoice_link' || (node.type as any) === 'edit_star_subscription'
+            ? "p-3 w-64"
+            : node.type === 'command_trigger' || node.type === 'text_trigger' || node.type === 'incoming_message_trigger' || (node.type as any) === 'incoming_callback_trigger' || (node.type as any) === 'outgoing_message_trigger' || (node.type as any) === 'managed_bot_updated_trigger' || (node.type as any) === 'successful_payment_trigger' || (node.type as any) === 'schedule_trigger' || (node.type as any) === 'api_trigger' || (node.type as any) === 'userbot_edit_trigger' || (node.type as any) === 'bot_table' || (node.type as any) === 'delay' || (node.type as any) === 'refund_stars' || (node.type as any) === 'get_star_balance' || (node.type as any) === 'stop_processing' || (node.type as any) === 'rate_counter' || (node.type as any) === 'code' || (node.type as any) === 'comment'
+            ? "p-3 w-52"
+            : (node.type as any) === 'callback_trigger' || (node.type as any) === 'answer_callback_query'
+            ? "p-3 w-52"            : node.type === 'condition' || (node.type as any) === 'parallel_split'
+            ? "p-4 w-64"
+            : node.type === 'message'
+            ? "p-4 w-80"
+            : node.type === 'keyboard'
+            ? "p-4"
+            : node.type === 'input'
+            ? "p-4 w-80"
+            : "p-6 w-80",
+          isDragActive ? "shadow-lg cursor-grabbing z-50 border-blue-500" : "shadow-xl hover:shadow-2xl border-gray-200 dark:border-slate-700 hover:border-gray-300 dark:hover:border-slate-600 transition-all duration-200",
+          isSelected && !isDragActive ? "ring-4 ring-blue-500/20 shadow-2xl shadow-blue-500/10 border-blue-500" : "",
+          /* Индиго-подсветка для нод, выделенных рамкой (мульти-выделение). Синее одиночное выделение в приоритете */
+          isMultiSelected && !isSelected && !isDragActive ? "ring-4 ring-indigo-500/50 shadow-2xl shadow-indigo-500/20 border-indigo-500" : "",
+          isConnectionTarget ? "ring-4 ring-green-400/60 border-green-400 shadow-green-400/20" : "",
+          isConnectedToDragging && !isDragActive ? "ring-2 ring-violet-400 border-violet-500 scale-[1.02]" : "",
+          effectiveHover && !isDragActive && !isSelected && !isConnectionSource ? "ring-2 ring-sky-400 border-sky-400 scale-[1.02]" : "",
+          isHoveredByConnection && !effectiveHover && !isDragActive && !isConnectedToDragging ? "ring-2 ring-violet-400 border-violet-500" : "",
+          onMove ? "cursor-grab" : "cursor-pointer"
+        )}
+        onClick={handleClick}
+        onMouseDown={handleMouseDown}
+        onContextMenu={openContextMenu}
+        style={{
+          position: 'relative',
+          overflow: 'visible',
+          ...(keyboardNodeWidth != null ? { width: keyboardNodeWidth } : {}),
+          transform: isDragActive ? 'translate3d(0, 0, 0)' : isConnectedToDragging && !isDragActive ? 'scale(1.02)' : undefined,
+          backfaceVisibility: 'hidden',
+          WebkitBackfaceVisibility: 'hidden' as any,
+          boxShadow: isDragActive
+            ? undefined
+            : isConnectedToDragging
+            ? '0 0 0 2px #8b5cf6, 0 0 20px 4px rgba(139, 92, 246, 0.5), 0 0 40px 8px rgba(139, 92, 246, 0.2)'
+            : effectiveHover && !isSelected && !isConnectionSource
+            ? '0 0 0 2px #38bdf8, 0 0 16px 4px rgba(56, 189, 248, 0.45), 0 0 32px 6px rgba(56, 189, 248, 0.2)'
+            : // Яркое индиго-свечение для нод, выделенных рамкой (мульти-выделение), по интенсивности как при наведении
+            isMultiSelected && !isSelected && !isConnectionSource && !isDragActive
+            ? '0 0 0 2px #6366f1, 0 0 16px 4px rgba(99, 102, 241, 0.45), 0 0 32px 6px rgba(99, 102, 241, 0.2)'
+            : isHoveredByConnection
+            ? '0 0 0 2px #8b5cf6, 0 0 20px 4px rgba(139, 92, 246, 0.5), 0 0 40px 8px rgba(139, 92, 246, 0.2)'
+            : undefined,
+        }}
+      >
+        {/* Заголовок узла — скрыт для триггеров, узла сообщения и узла условия */}
+        {node.type !== 'command_trigger' && node.type !== 'text_trigger' && node.type !== 'incoming_message_trigger' && node.type !== 'group_message_trigger' && (node.type as any) !== 'member_trigger' && (node.type as any) !== 'callback_trigger' && (node.type as any) !== 'incoming_callback_trigger' && (node.type as any) !== 'outgoing_message_trigger' && (node.type as any) !== 'managed_bot_updated_trigger' && (node.type as any) !== 'successful_payment_trigger' && (node.type as any) !== 'schedule_trigger' && (node.type as any) !== 'api_trigger' && (node.type as any) !== 'userbot_edit_trigger' && (node.type as any) !== 'get_managed_bot_token' && (node.type as any) !== 'answer_callback_query' && (node.type as any) !== 'edit_message' && (node.type as any) !== 'set_variable' && node.type !== 'message' && node.type !== 'condition' && node.type !== 'keyboard' && node.type !== 'input' && (node.type as any) !== 'loop' && (node.type as any) !== 'delay' && (node.type as any) !== 'send_invoice' && (node.type as any) !== 'create_invoice_link' && (node.type as any) !== 'refund_stars' && (node.type as any) !== 'edit_star_subscription' && (node.type as any) !== 'get_star_balance' && (node.type as any) !== 'stop_processing' && (node.type as any) !== 'rate_counter' && (node.type as any) !== 'code' && (node.type as any) !== 'userbot_message' && (node.type as any) !== 'userbot_click_button' && (node.type as any) !== 'userbot_inline_query' && (node.type as any) !== 'parallel_split' && (node.type as any) !== 'comment' && (
+          <NodeHeader node={node} onMove={!!onMove} />
+        )}
+
+        {/* Image attachment (старый формат - одиночное изображение) */}
+        <ImageAttachment node={node} />
+
+        {/* Media attachments (новый формат - несколько файлов) */}
+        <MediaAttachmentsPreview node={node} projectId={projectId} />
+
+        {/* Message preview */}
+        <MessagePreview node={node} />
+        <MessageRecipientsPreview node={node} />
+
+        {/* Media attachment indicator for non-image files */}
+        {node.type === 'message' && !node.data.imageUrl && !node.data.attachedMedia?.length && (node.data.videoUrl || node.data.audioUrl || node.data.documentUrl) && (
+          <MediaAttachmentIndicator node={node} />
+        )}
+
+        {/* Sticker preview */}
+        {node.type === 'sticker' && <StickerPreview node={node} />}
+
+        {/* Voice message preview */}
+        {node.type === 'voice' && <VoicePreview node={node} />}
+
+        {/* Media node preview */}
+        {node.type === 'media' && <MediaNodePreview attachedMedia={node.data.attachedMedia || []} />}
+
+        {/* HTTP Request preview */}
+        {(node.type as any) === 'http_request' && <HttpRequestPreview node={node} />}
+        {(node.type as any) === 'api_response' && <ApiResponsePreview node={node} />}
+
+        {/* Get Managed Bot Token preview */}
+        {(node.type as any) === 'get_managed_bot_token' && <GetManagedBotTokenPreview node={node} />}
+
+        {/* Location preview */}
+        {node.type === 'location' && <LocationPreview node={node} />}
+
+        {/* Contact preview */}
+        {node.type === 'contact' && <ContactPreview node={node} />}
+
+        {/* Admin Rights preview */}
+        {node.type === 'admin_rights' && <AdminRightsPreview />}
+
+        {/* Forum Topic preview */}
+        {node.type === 'create_forum_topic' && <ForumTopicPreview node={node} />}
+
+        {/* Client Auth Card */}
+        {node.type === 'client_auth' && <ClientAuthCard node={node} />}
+
+        {/* Command Trigger Preview */}
+        {node.type === 'command_trigger' && <CommandTriggerPreview node={node} />}
+
+        {/* Text Trigger Preview */}
+        {node.type === 'text_trigger' && <TextTriggerPreview node={node} />}
+
+        {/* Any Message Trigger Preview */}
+        {node.type === 'incoming_message_trigger' && <AnyMessageTriggerPreview node={node} />}
+
+        {/* Group Message Trigger Preview */}
+        {node.type === 'group_message_trigger' && <GroupMessageTriggerPreview node={node} />}
+
+        {/* Member Trigger Preview */}
+        {(node.type as any) === 'member_trigger' && <MemberTriggerPreview node={node} />}
+
+        {/* Callback Trigger Preview */}
+        {(node.type as any) === 'callback_trigger' && <CallbackTriggerPreview node={node} />}
+
+        {/* Incoming Callback Trigger Preview */}
+        {(node.type as any) === 'incoming_callback_trigger' && <IncomingCallbackTriggerPreview node={node} />}
+
+        {/* Outgoing Message Trigger Preview */}
+        {(node.type as any) === 'outgoing_message_trigger' && <OutgoingMessageTriggerPreview node={node} />}
+
+        {/* Managed Bot Updated Trigger Preview */}
+        {(node.type as any) === 'managed_bot_updated_trigger' && <ManagedBotUpdatedTriggerPreview node={node} />}
+        {(node.type as any) === 'successful_payment_trigger' && <SuccessfulPaymentTriggerPreview node={node} />}
+
+        {/* Schedule Trigger Preview */}
+        {(node.type as any) === 'schedule_trigger' && <ScheduleTriggerPreview node={node} />}
+
+        {/* API Trigger Preview */}
+        {(node.type as any) === 'api_trigger' && <ApiTriggerPreview node={node} />}
+
+        {/* Answer Callback Query Preview */}
+        {(node.type as any) === 'answer_callback_query' && <AnswerCallbackQueryPreview node={node} />}
+
+        {/* Edit Message Preview */}
+        {(node.type as any) === 'edit_message' && <EditMessagePreview node={node} />}
+
+        {/* Set Variable Preview */}
+        {(node.type as any) === 'set_variable' && <SetVariablePreview node={node} />}
+
+        {/* Delay Preview */}
+        {(node.type as any) === 'delay' && <DelayPreview data={node.data} />}
+
+        {/* Send Invoice Preview */}
+        {(node.type as any) === 'send_invoice' && <SendInvoicePreview data={node.data} />}
+
+        {(node.type as any) === 'create_invoice_link' && (
+          <CreateInvoiceLinkPreview
+            data={node.data}
+            onPortMouseDown={handlePortMouseDown}
+            isConnectionSource={isConnectionSource}
+            onButtonPortMount={onButtonPortMount}
+          />
+        )}
+
+        {/* Refund Stars Preview */}
+        {(node.type as any) === 'refund_stars' && (
+          <RefundStarsPreview
+            data={node.data}
+            onPortMouseDown={handlePortMouseDown}
+            isConnectionSource={isConnectionSource}
+            onButtonPortMount={onButtonPortMount}
+          />
+        )}
+
+        {(node.type as any) === 'edit_star_subscription' && (
+          <EditStarSubscriptionPreview
+            data={node.data}
+            onPortMouseDown={handlePortMouseDown}
+            isConnectionSource={isConnectionSource}
+            onButtonPortMount={onButtonPortMount}
+          />
+        )}
+
+        {(node.type as any) === 'get_star_balance' && (
+          <GetStarBalancePreview
+            data={node.data}
+            onPortMouseDown={handlePortMouseDown}
+            isConnectionSource={isConnectionSource}
+            onButtonPortMount={onButtonPortMount}
+          />
+        )}
+
+        {/* Stop Processing Preview */}
+        {(node.type as any) === 'stop_processing' && <StopProcessingPreview />}
+
+        {/* Rate Counter Preview */}
+        {(node.type as any) === 'rate_counter' && <RateCounterPreview data={node.data as Record<string, unknown>} />}
+
+        {/* Code Preview */}
+        {(node.type as any) === 'code' && <CodePreview data={node.data} />}
+
+        {/* Comment Preview */}
+        {(node.type as any) === 'comment' && <CommentPreview data={node.data} />}
+
+        {/* Userbot Message Preview */}
+        {(node.type as any) === 'userbot_message' && <UserbotMessagePreview node={node} />}
+
+        {/* Userbot Click Button Preview */}
+        {(node.type as any) === 'userbot_click_button' && <UserbotClickButtonPreview node={node} />}
+
+        {/* Userbot Inline Query Preview */}
+        {(node.type as any) === 'userbot_inline_query' && <UserbotInlineQueryPreview node={node} />}
+
+        {/* Userbot Edit Trigger Preview */}
+        {(node.type as any) === 'userbot_edit_trigger' && <UserbotEditTriggerPreview node={node} />}
+
+        {/* SQL Query Preview */}
+        {(node.type as any) === 'psql_query' && <PsqlQueryPreview node={node} />}
+
+        {/* Bot Table Preview */}
+        {(node.type as any) === 'bot_table' && <BotTablePreview node={node} />}
+
+        {/* Convert File Preview */}
+        {(node.type as any) === 'convert_file' && <ConvertFilePreview node={node} />}
+
+        {/* Loop Preview */}
+        {(node.type as any) === 'loop' && (
+          <LoopPreview
+            node={node}
+            onPortMouseDown={handlePortMouseDown}
+            isConnectionSource={isConnectionSource}
+            onButtonPortMount={onButtonPortMount}
+          />
+        )}
+
+        {/* Condition Node Preview */}
+        {node.type === 'condition' && (
+          <ConditionNodePreview
+            node={node}
+            onPortMouseDown={handlePortMouseDown}
+            isConnectionSource={isConnectionSource}
+            onButtonPortMount={onButtonPortMount}
+          />
+        )}
+
+        {/* Parallel Split Preview */}
+        {(node.type as any) === 'parallel_split' && (
+          <ParallelSplitPreview
+            node={node}
+            onPortMouseDown={handlePortMouseDown}
+            isConnectionSource={isConnectionSource}
+            onButtonPortMount={onButtonPortMount}
+          />
+        )}
+
+        {/* Poll preview */}
+        {(node.type as any) === 'poll' && <PollPreview node={node} />}
+
+        {/* Dice preview */}
+        {(node.type as any) === 'dice' && <DicePreview node={node} />}
+
+        {/* Text Input Indicator — показываем если включён текстовый ввод, независимо от клавиатуры */}
+        {(node.data as any).enableTextInput && (
+          <TextInputIndicator node={node} />
+        )}
+
+        {/* Save Answer Indicator — отдельный preview для новой input-ноды */}
+        {/**
+         * Индикатор связанного узла сохранения ответа для сообщения.
+         * Нужен только как компактная подсказка, источник истины остаётся в `input`.
+         */}
+        {node.type === 'message' && (
+          <MessageLinkedInputIndicator node={node} allNodes={allNodes} />
+        )}
+
+        {node.type === 'input' && (
+          <SaveAnswerIndicator node={node} />
+        )}
+
+        {/* Buttons preview */}
+        {node.type !== 'input' && (
+          <ButtonsPreview node={node} allNodes={allNodes} onPortMouseDown={handlePortMouseDown} isConnectionSource={isConnectionSource} onButtonPortMount={onButtonPortMount} />
+        )}
+
+        {menu.visible && (
+          <NodeContextMenu
+            position={menu.position}
+            onClose={closeContextMenu}
+            items={[
+              {
+                id: 'duplicate',
+                label: 'Дублировать',
+                icon: 'fas fa-copy',
+                onClick: () => {
+                  /**
+                   * Используем onDuplicateAtPosition если он передан — позиция
+                   * вычисляется в canvas.tsx через getPastePosition(), ту же функцию
+                   * что использует Ctrl+V. Это гарантирует идентичное поведение.
+                   * Fallback на onDuplicate без позиции (дубль появится на месте оригинала).
+                   */
+                  if (onDuplicateAtPosition) {
+                    onDuplicateAtPosition();
+                  } else {
+                    onDuplicate?.();
+                  }
+                }
+              }
+            ]}
+            extraContent={sheets && sheets.length > 0 && onMoveToSheet ? (
+              <MoveToSheetMenu
+                sheets={sheets}
+                onSelect={(sheetId) => {
+                  onMoveToSheet(sheetId);
+                  closeContextMenu();
+                }}
+              />
+            ) : undefined}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+

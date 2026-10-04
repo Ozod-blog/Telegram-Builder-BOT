@@ -1,0 +1,54 @@
+# 🏗 Scaffolding Module
+
+> Модуль для генерации файлов проекта Telegram ботов
+
+## 📋 Содержание
+
+- [Описание](#-описание)
+- [Файлы модуля](#-файлы-модуля)
+- [Функциональность](#-функциональность)
+- [Примеры использования](#-примеры-использования)
+
+## 💡 Описание
+
+Модуль Scaffolding предоставляет инструменты для генерации основных файлов проекта Telegram ботов, таких как Dockerfile, requirements.txt, README.md и другие конфигурационные файлы.
+
+## 📁 Файлы модуля
+
+| Файл | Назначение |
+|------|------------|
+| `generateConfigYaml.ts` | Генерация YAML конфигурации |
+| `generateDockerfile.ts` | Генерация Dockerfile |
+| `generateReadme.ts` | Генерация README.md |
+| `generateRequirementsTxt.ts` | Генерация requirements.txt |
+| `index.ts` | Экспорт всех функций модуля |
+
+## 🚀 Функциональность
+
+### 📌 generateRequirementsTxt
+
+Генерирует файл зависимостей Python для проекта бота.
+
+### 📌 generateDockerfile
+
+Генерирует Dockerfile для контейнеризации бота.
+
+### 📌 generateReadme
+
+Генерирует README.md файл с описанием проекта.
+
+## 📚 Примеры использования
+
+При создании нового бота, модуль используется для генерации каркаса проекта:
+
+```typescript
+const requirements = generateRequirementsTxt();
+const dockerfile = generateDockerfile();
+const readme = generateReadme(projectName, description);
+```
+
+---
+
+<p align="center">
+  Made with ❤️ for Telegram Bot Developers
+</p>

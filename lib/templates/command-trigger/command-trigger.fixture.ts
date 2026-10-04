@@ -1,0 +1,211 @@
+/**
+ * @fileoverview Тестовые данные для шаблона обработчиков командных триггеров
+ * @module templates/command-trigger/command-trigger.fixture
+ */
+
+import type { CommandTriggerTemplateParams } from './command-trigger.params';
+import type { Node } from '@shared/schema';
+
+// ─── Вспомогательная функция ─────────────────────────────────────────────────
+
+function makeNode(id: string, type: string, data: Record<string, any>): Node {
+  return { id, type, data, position: { x: 0, y: 0 } } as unknown as Node;
+}
+
+// ─── Низкоуровневые фикстуры (CommandTriggerTemplateParams) ──────────────────
+
+/** Пустой массив триггеров */
+export const validParamsEmpty: CommandTriggerTemplateParams = {
+  entries: [],
+};
+
+/**
+ * Один обычный командный триггер (/help).
+ * Используется для проверки ОБЩЕЙ логики генерации командных обработчиков
+ * (MockCallback, имя функции, удаление слэша). Команда /start обрабатывается
+ * особым образом (CommandStart), поэтому здесь используется не-/start команда.
+ */
+export const validParamsSingle: CommandTriggerTemplateParams = {
+  entries: [
+    {
+      nodeId: 'trigger_start',
+      command: '/help',
+      description: 'Помощь',
+      showInMenu: true,
+      targetNodeId: 'msg_welcome',
+      targetNodeType: 'message',
+    },
+  ],
+};
+
+/** Несколько триггеров (включая /start, который генерируется особым образом) */
+export const validParamsMultiple: CommandTriggerTemplateParams = {
+  entries: [
+    {
+      nodeId: 'trigger_start',
+      command: '/start',
+      description: 'Запустить бота',
+      showInMenu: true,
+      targetNodeId: 'msg_welcome',
+      targetNodeType: 'message',
+    },
+    {
+      nodeId: 'trigger_help',
+      command: '/help',
+      description: 'Помощь',
+      showInMenu: true,
+      targetNodeId: 'msg_help',
+      targetNodeType: 'message',
+    },
+    {
+      nodeId: 'trigger_settings',
+      command: '/settings',
+      targetNodeId: 'msg_settings',
+      targetNodeType: 'message',
+    },
+  ],
+};
+
+/** Невалидные параметры — пустая команда */
+export const invalidParamsMissingCommand = {
+  entries: [
+    {
+      nodeId: 'trigger_bad',
+      command: '',
+      targetNodeId: 'msg_1',
+      targetNodeType: 'message',
+    },
+  ],
+};
+
+// ─── Высокоуровневые фикстуры (Node[]) для collectCommandTriggerEntries ───────
+
+/** Один command_trigger узел */
+export const nodesWithCommandTrigger: Node[] = [
+  makeNode('trigger_start', 'command_trigger', {
+    command: '/start',
+    description: 'Запустить бота',
+    showInMenu: true,
+    autoTransitionTo: 'msg_welcome',
+  }),
+  makeNode('msg_welcome', 'message', { messageText: 'Добро пожаловать!' }),
+];
+
+/** Несколько command_trigger узлов */
+export const nodesWithMultipleCommandTriggers: Node[] = [
+  makeNode('trigger_start', 'command_trigger', {
+    command: '/start',
+    description: 'Запустить бота',
+    autoTransitionTo: 'msg_welcome',
+  }),
+  makeNode('trigger_help', 'command_trigger', {
+    command: '/help',
+    description: 'Помощь',
+    autoTransitionTo: 'msg_help',
+  }),
+  makeNode('msg_welcome', 'message', {}),
+  makeNode('msg_help', 'message', {}),
+];
+
+/** command_trigger без autoTransitionTo — должен быть пропущен */
+export const nodesWithMissingTarget: Node[] = [
+  makeNode('trigger_bad', 'command_trigger', {
+    command: '/start',
+    autoTransitionTo: '',
+  }),
+];
+
+/** command_trigger с пустой командой — должен быть пропущен */
+export const nodesWithEmptyCommand: Node[] = [
+  makeNode('trigger_empty', 'command_trigger', {
+    command: '',
+    autoTransitionTo: 'msg_1',
+  }),
+];
+
+/** Узлы без command_trigger — должны быть пропущены */
+export const nodesWithoutCommandTriggers: Node[] = [
+  makeNode('start_1', 'start', {}),
+  makeNode('msg_1', 'message', { messageText: 'Привет' }),
+];
+
+/** null-узлы и смешанный массив */
+export const nodesWithNullAndMixed: Node[] = [
+  null as unknown as Node,
+  makeNode('trigger_start', 'command_trigger', {
+    command: '/start',
+    autoTransitionTo: 'msg_1',
+  }),
+  makeNode('msg_1', 'message', {}),
+];
+
+// ─── Фикстуры для adminOnly и requiresAuth ────────────────────────────────────
+
+/** Триггер с adminOnly */
+export const validParamsAdminOnly: CommandTriggerTemplateParams = {
+  entries: [
+    {
+      nodeId: 'trigger_admin',
+      command: '/admin',
+      targetNodeId: 'msg_admin',
+      targetNodeType: 'message',
+      adminOnly: true,
+    },
+  ],
+};
+
+/** Триггер с requiresAuth */
+export const validParamsRequiresAuth: CommandTriggerTemplateParams = {
+  entries: [
+    {
+      nodeId: 'trigger_profile',
+      command: '/profile',
+      targetNodeId: 'msg_profile',
+      targetNodeType: 'message',
+      requiresAuth: true,
+    },
+  ],
+};
+
+/** Узлы с adminOnly */
+export const nodesWithAdminOnly: Node[] = [
+  makeNode('trigger_admin', 'command_trigger', {
+    command: '/admin',
+    autoTransitionTo: 'msg_admin',
+    adminOnly: true,
+  }),
+  makeNode('msg_admin', 'message', {}),
+];
+
+/** Узлы с requiresAuth */
+export const nodesWithRequiresAuth: Node[] = [
+  makeNode('trigger_profile', 'command_trigger', {
+    command: '/profile',
+    autoTransitionTo: 'msg_profile',
+    requiresAuth: true,
+  }),
+  makeNode('msg_profile', 'message', {}),
+];
+
+/** Триггер с сохранением аргументов команды */
+export const validParamsSaveCommandArgs: CommandTriggerTemplateParams = {
+  entries: [
+    {
+      nodeId: 'trigger_donate',
+      command: '/donate',
+      targetNodeId: 'msg_donate',
+      targetNodeType: 'message',
+      saveCommandArgsTo: 'donate_amount',
+    },
+  ],
+};
+
+/** Узлы с saveCommandArgsTo */
+export const nodesWithSaveCommandArgs: Node[] = [
+  makeNode('trigger_donate', 'command_trigger', {
+    command: '/donate',
+    autoTransitionTo: 'msg_donate',
+    saveCommandArgsTo: 'donate_amount',
+  }),
+  makeNode('msg_donate', 'message', {}),
+];

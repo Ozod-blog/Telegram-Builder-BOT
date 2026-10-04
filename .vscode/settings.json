@@ -1,0 +1,15 @@
+{
+  "python.analysis.extraPaths": [
+    "C:\\Users\\1\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\site-packages"
+  ],
+  "python.autoComplete.extraPaths": [
+    "C:\\Users\\1\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\site-packages"
+  ],
+  "json.schemaDownload.enable": false,
+  "files.associations": {
+    "package.json": "json"
+  },
+  "typescript.autoClosingTags": false,
+  "kiro.model": "auto",
+  "terminal.integrated.scrollback": 10000
+}

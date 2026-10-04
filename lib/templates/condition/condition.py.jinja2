@@ -1,0 +1,181 @@
+{#
+  Шаблон обработчиков узлов условия (condition)
+
+  @fileoverview Генерирует Python-код для ветвления потока по значению переменной пользователя
+  @param {array} conditionEntries - Массив объектов ConditionEntry
+
+  Поддерживает dot-notation в имени переменной (например "projects.count"):
+  - "projects.count" → _dot_obj = _all_vars.get("projects", {}); val = _dot_obj.get("count", "")
+  - Обычная переменная → val = _all_vars.get("variable", "")
+
+  Порядок веток в сгенерированном коде:
+  0. Системные операторы (is_private, is_group, is_channel, is_admin, is_premium, is_bot, is_subscribed, is_not_subscribed)
+  1. Числовые операторы (greater_than, less_than, between, is_even, is_odd, divisible_by) — всегда первыми среди переменных
+  2. Строковые операторы (equals, not_equals, contains, not_contains, starts_with, ends_with, matches_regex, filled, empty)
+  3. else — всегда последней
+
+  Для keyboard-узлов вызов генерируется без state=state (keyboard-нода не принимает state).
+  Для всех остальных типов узлов вызов генерируется с state=state.
+#}
+
+{#- Макрос: генерирует вызов handle_callback для ветки.
+    Для keyboard и input узлов — без state=state, для остальных — с state=state. #}
+{%- macro branch_call(branch) -%}
+{%- if branch.target -%}
+{%- set sanitized_target = branch.target | safe_name -%}
+{%- if branch.targetNodeType == 'keyboard' or branch.targetNodeType == 'input' -%}
+await handle_callback_{{ sanitized_target }}(callback_query)
+{%- else -%}
+await handle_callback_{{ sanitized_target }}(callback_query, state=state)
+{%- endif -%}
+{%- else -%}
+pass
+{%- endif -%}
+{%- endmacro -%}
+
+# Обработчики узлов условия
+{% for entry in conditionEntries %}
+{%- set sanitized_node_id = entry.nodeId | safe_name %}
+@dp.callback_query(lambda c: c.data == "{{ entry.nodeId }}")
+async def handle_callback_{{ sanitized_node_id }}(callback_query: types.CallbackQuery, state: FSMContext = None):
+    # Узел условия {{ entry.nodeId }}{% if entry.variable %}, переменная: {{ entry.variable }}{% endif %}
+
+    user_id = callback_query.from_user.id
+{%- if not entry.skipVarLookup %}
+    _all_vars = await init_all_user_vars(user_id)
+{%- if '.' in entry.variable %}
+{%- set var_parts = entry.variable.split('.') %}
+{%- if var_parts | length == 2 %}
+    _dot_obj = _all_vars.get("{{ var_parts[0] }}", {})
+    val = _dot_obj.get("{{ var_parts[1] }}", "") if isinstance(_dot_obj, dict) else ""
+    if not val:
+        val = str(_all_vars.get("{{ entry.variable }}", "") or "")
+{%- else %}
+    val = str(_all_vars.get("{{ entry.variable }}", "") or "")
+{%- endif %}
+{%- else %}
+    val = _all_vars.get("{{ entry.variable }}", "")
+{%- endif %}
+    logging.info(f"Узел условия {{ entry.nodeId }}: переменная '{{ entry.variable }}' = {val}")
+{%- else %}
+    logging.info(f"Узел условия {{ entry.nodeId }}: проверка системного условия или pass-through переход")
+{%- endif %}
+{%- if entry.hasSubscriptionBranch %}
+    def _normalize_subscription_chat_ref(raw_ref):
+        _raw = str(raw_ref or "").strip()
+        if not _raw:
+            return ""
+
+        _lower = _raw.lower()
+        if _lower.startswith("https://") or _lower.startswith("http://") or _lower.startswith("t.me/") or _lower.startswith("telegram.me/") or _lower.startswith("www.t.me/") or _lower.startswith("www.telegram.me/"):
+            _clean = _raw
+            for _prefix in ("https://", "http://"):
+                if _clean.lower().startswith(_prefix):
+                    _clean = _clean[len(_prefix):]
+                    break
+            if _clean.lower().startswith("www."):
+                _clean = _clean[4:]
+            if _clean.lower().startswith("t.me/"):
+                _clean = _clean[5:]
+            elif _clean.lower().startswith("telegram.me/"):
+                _clean = _clean[12:]
+            _clean = _clean.split("?", 1)[0].split("#", 1)[0].strip("/")
+
+            if not _clean:
+                return ""
+            if _clean.startswith("+") or _clean.lower().startswith("joinchat/"):
+                return _raw
+
+            _slug = _clean.split("/")[-1].strip()
+            if _slug and _slug.replace("_", "").isalnum():
+                return f"@{_slug}"
+            return _raw
+
+        if _raw.startswith("@"):
+            _username = _raw[1:].strip()
+            return f"@{_username}" if _username and _username.replace("_", "").isalnum() else _raw
+
+        return f"@{_raw}" if _raw.replace("_", "").isalnum() else _raw
+
+    async def _is_user_subscribed(raw_ref):
+        _chat_ref = _normalize_subscription_chat_ref(raw_ref)
+        if not _chat_ref:
+            return False
+
+        try:
+            _member = await bot.get_chat_member(chat_id=_chat_ref, user_id=user_id)
+            _status = getattr(_member, "status", None)
+            return _status not in ("left", "kicked")
+        except Exception as e:
+            logging.warning(f"Узел условия {{ entry.nodeId }}: не удалось проверить подписку на {_chat_ref}: {e}")
+            return False
+{%- endif %}
+{%- if entry.hasNumericBranch %}
+    try:
+        _num_val = float(val)
+    except (ValueError, TypeError):
+        _num_val = None
+{%- endif %}
+{%- if not entry.hasConditionalBranch %}
+{%- for branch in entry.branches %}
+{%- if branch.operator == 'else' %}
+    if True:
+        # Ветка по умолчанию
+        {{ branch_call(branch) }}
+{%- endif %}
+{%- endfor %}
+{% endif %}
+{#- Проход 0: системные операторы #}
+{%- for branch in entry.branches %}
+{%- if branch.operator == 'is_private' or branch.operator == 'is_group' or branch.operator == 'is_channel' or branch.operator == 'is_admin' or branch.operator == 'is_premium' or branch.operator == 'is_bot' or branch.operator == 'is_subscribed' or branch.operator == 'is_not_subscribed' %}
+{%- if branch.isFirstSystem %}
+    if {% if branch.operator == 'is_private' %}callback_query.message.chat.type == 'private'{% elif branch.operator == 'is_group' %}callback_query.message.chat.type in ('group', 'supergroup'){% elif branch.operator == 'is_channel' %}callback_query.message.chat.type == 'channel'{% elif branch.operator == 'is_admin' %}callback_query.from_user.id in ADMIN_IDS{% elif branch.operator == 'is_premium' %}getattr(callback_query.from_user, 'is_premium', False){% elif branch.operator == 'is_bot' %}getattr(callback_query.from_user, 'is_bot', False){% elif branch.operator == 'is_subscribed' %}{%- if branch.hasMultipleChannels -%}{%- if branch.subscriptionMode == 'any' -%}({% for ch in branch.channels %}await _is_user_subscribed("{{ ch }}"){% if not loop.last %} or {% endif %}{% endfor %}){%- else -%}({% for ch in branch.channels %}await _is_user_subscribed("{{ ch }}"){% if not loop.last %} and {% endif %}{% endfor %}){%- endif -%}{%- else -%}await _is_user_subscribed("{{ branch.value }}"){%- endif -%}{% elif branch.operator == 'is_not_subscribed' %}{%- if branch.hasMultipleChannels -%}{%- if branch.subscriptionMode == 'any' -%}({% for ch in branch.channels %}not await _is_user_subscribed("{{ ch }}"){% if not loop.last %} or {% endif %}{% endfor %}){%- else -%}({% for ch in branch.channels %}not await _is_user_subscribed("{{ ch }}"){% if not loop.last %} and {% endif %}{% endfor %}){%- endif -%}{%- else -%}not await _is_user_subscribed("{{ branch.value }}"){%- endif -%}{% endif %}:
+        # Ветка: {{ branch.operator }}
+        {{ branch_call(branch) }}
+{%- else %}
+    elif {% if branch.operator == 'is_private' %}callback_query.message.chat.type == 'private'{% elif branch.operator == 'is_group' %}callback_query.message.chat.type in ('group', 'supergroup'){% elif branch.operator == 'is_channel' %}callback_query.message.chat.type == 'channel'{% elif branch.operator == 'is_admin' %}callback_query.from_user.id in ADMIN_IDS{% elif branch.operator == 'is_premium' %}getattr(callback_query.from_user, 'is_premium', False){% elif branch.operator == 'is_bot' %}getattr(callback_query.from_user, 'is_bot', False){% elif branch.operator == 'is_subscribed' %}{%- if branch.hasMultipleChannels -%}{%- if branch.subscriptionMode == 'any' -%}({% for ch in branch.channels %}await _is_user_subscribed("{{ ch }}"){% if not loop.last %} or {% endif %}{% endfor %}){%- else -%}({% for ch in branch.channels %}await _is_user_subscribed("{{ ch }}"){% if not loop.last %} and {% endif %}{% endfor %}){%- endif -%}{%- else -%}await _is_user_subscribed("{{ branch.value }}"){%- endif -%}{% elif branch.operator == 'is_not_subscribed' %}{%- if branch.hasMultipleChannels -%}{%- if branch.subscriptionMode == 'any' -%}({% for ch in branch.channels %}not await _is_user_subscribed("{{ ch }}"){% if not loop.last %} or {% endif %}{% endfor %}){%- else -%}({% for ch in branch.channels %}not await _is_user_subscribed("{{ ch }}"){% if not loop.last %} and {% endif %}{% endfor %}){%- endif -%}{%- else -%}not await _is_user_subscribed("{{ branch.value }}"){%- endif -%}{% endif %}:
+        # Ветка: {{ branch.operator }}
+        {{ branch_call(branch) }}
+{%- endif %}
+{%- endif %}
+{%- endfor %}
+{#- Проход 1: числовые операторы (greater_than, less_than, between, is_even, is_odd, divisible_by) #}
+{%- for branch in entry.branches %}
+{%- if branch.operator == 'greater_than' or branch.operator == 'less_than' or branch.operator == 'between' or branch.operator == 'is_even' or branch.operator == 'is_odd' or branch.operator == 'divisible_by' %}
+{%- if branch.isFirstNumeric %}
+    if {% if branch.operator == 'greater_than' %}_num_val is not None and _num_val > float(replace_variables_in_text("{{ branch.value if branch.value else '0' }}", _all_vars) or '0'){% elif branch.operator == 'less_than' %}_num_val is not None and _num_val < float(replace_variables_in_text("{{ branch.value if branch.value else '0' }}", _all_vars) or '0'){% elif branch.operator == 'between' %}_num_val is not None and float(replace_variables_in_text("{{ branch.value if branch.value else '0' }}", _all_vars) or '0') <= _num_val <= float(replace_variables_in_text("{{ branch.value2 if branch.value2 else '0' }}", _all_vars) or '0'){% elif branch.operator == 'is_even' %}_num_val is not None and int(_num_val) % 2 == 0{% elif branch.operator == 'is_odd' %}_num_val is not None and int(_num_val) % 2 != 0{% elif branch.operator == 'divisible_by' %}_num_val is not None and int(replace_variables_in_text("{{ branch.value if branch.value else '1' }}", _all_vars) or '1') != 0 and int(_num_val) % int(replace_variables_in_text("{{ branch.value if branch.value else '1' }}", _all_vars) or '1') == 0{% endif %}:
+        # Ветка: {{ branch.operator }}{% if branch.value %} {{ branch.value }}{% endif %}{% if branch.value2 %} {{ branch.value2 }}{% endif %}
+        {{ branch_call(branch) }}
+{%- else %}
+    elif {% if branch.operator == 'greater_than' %}_num_val is not None and _num_val > float(replace_variables_in_text("{{ branch.value if branch.value else '0' }}", _all_vars) or '0'){% elif branch.operator == 'less_than' %}_num_val is not None and _num_val < float(replace_variables_in_text("{{ branch.value if branch.value else '0' }}", _all_vars) or '0'){% elif branch.operator == 'between' %}_num_val is not None and float(replace_variables_in_text("{{ branch.value if branch.value else '0' }}", _all_vars) or '0') <= _num_val <= float(replace_variables_in_text("{{ branch.value2 if branch.value2 else '0' }}", _all_vars) or '0'){% elif branch.operator == 'is_even' %}_num_val is not None and int(_num_val) % 2 == 0{% elif branch.operator == 'is_odd' %}_num_val is not None and int(_num_val) % 2 != 0{% elif branch.operator == 'divisible_by' %}_num_val is not None and int(replace_variables_in_text("{{ branch.value if branch.value else '1' }}", _all_vars) or '1') != 0 and int(_num_val) % int(replace_variables_in_text("{{ branch.value if branch.value else '1' }}", _all_vars) or '1') == 0{% endif %}:
+        # Ветка: {{ branch.operator }}{% if branch.value %} {{ branch.value }}{% endif %}{% if branch.value2 %} {{ branch.value2 }}{% endif %}
+        {{ branch_call(branch) }}
+{%- endif %}
+{%- endif %}
+{%- endfor %}
+{#- Проход 2: строковые операторы (filled, empty, equals, not_equals, contains, not_contains, starts_with, ends_with, matches_regex) #}
+{%- for branch in entry.branches %}
+{%- if branch.operator == 'filled' or branch.operator == 'empty' or branch.operator == 'equals' or branch.operator == 'not_equals' or branch.operator == 'contains' or branch.operator == 'not_contains' or branch.operator == 'starts_with' or branch.operator == 'ends_with' or branch.operator == 'matches_regex' %}
+{%- if branch.isFirstString and not entry.hasNumericBranch and not entry.hasSystemBranch %}
+    if {% if branch.operator == 'filled' %}val{% elif branch.operator == 'empty' %}not val{% elif branch.operator == 'equals' %}str(val) == str(replace_variables_in_text("{{ branch.value }}", _all_vars)){% elif branch.operator == 'not_equals' %}str(val) != str(replace_variables_in_text("{{ branch.value }}", _all_vars)){% elif branch.operator == 'contains' %}str(replace_variables_in_text("{{ branch.value }}", _all_vars)) in str(val){% elif branch.operator == 'not_contains' %}str(replace_variables_in_text("{{ branch.value }}", _all_vars)) not in str(val){% elif branch.operator == 'starts_with' %}str(val).startswith(str(replace_variables_in_text("{{ branch.value }}", _all_vars))){% elif branch.operator == 'ends_with' %}str(val).endswith(str(replace_variables_in_text("{{ branch.value }}", _all_vars))){% elif branch.operator == 'matches_regex' %}re.search(r"{{ branch.valueRegex }}", str(val)) is not None{% endif %}:
+        # Ветка: {{ branch.operator }}{% if branch.value %} == "{{ branch.value }}"{% endif %}
+        {{ branch_call(branch) }}
+{%- else %}
+    elif {% if branch.operator == 'filled' %}val{% elif branch.operator == 'empty' %}not val{% elif branch.operator == 'equals' %}str(val) == str(replace_variables_in_text("{{ branch.value }}", _all_vars)){% elif branch.operator == 'not_equals' %}str(val) != str(replace_variables_in_text("{{ branch.value }}", _all_vars)){% elif branch.operator == 'contains' %}str(replace_variables_in_text("{{ branch.value }}", _all_vars)) in str(val){% elif branch.operator == 'not_contains' %}str(replace_variables_in_text("{{ branch.value }}", _all_vars)) not in str(val){% elif branch.operator == 'starts_with' %}str(val).startswith(str(replace_variables_in_text("{{ branch.value }}", _all_vars))){% elif branch.operator == 'ends_with' %}str(val).endswith(str(replace_variables_in_text("{{ branch.value }}", _all_vars))){% elif branch.operator == 'matches_regex' %}re.search(r"{{ branch.valueRegex }}", str(val)) is not None{% endif %}:
+        # Ветка: {{ branch.operator }}{% if branch.value %} == "{{ branch.value }}"{% endif %}
+        {{ branch_call(branch) }}
+{%- endif %}
+{%- endif %}
+{%- endfor %}
+{#- Проход 3: else #}
+{%- if entry.hasConditionalBranch %}
+{%- for branch in entry.branches %}
+{%- if branch.operator == 'else' %}
+    else:
+        # Ветка по умолчанию
+        {{ branch_call(branch) }}
+{%- endif %}
+{%- endfor %}
+{%- endif %}
+
+{% endfor %}

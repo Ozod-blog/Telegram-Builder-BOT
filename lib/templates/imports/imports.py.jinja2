@@ -1,0 +1,105 @@
+{#
+  Шаблон импортов для Python бота
+
+  @fileoverview Генерирует все необходимые импорты для aiogram бота
+  @param {boolean} userDatabaseEnabled - Включена ли база данных пользователей (asyncpg, json)
+  @param {boolean} hasInlineButtons - Есть ли inline кнопки (нужен TelegramBadRequest)
+  @param {boolean} hasAutoTransitions - Есть ли автопереходы (нужен TelegramBadRequest)
+  @param {boolean} hasMediaNodes - Есть ли узлы с медиа (нужен aiohttp)
+  @param {boolean} hasUploadImages - Есть ли ссылки на /uploads/ (нужен aiohttp)
+  @param {boolean} hasParseModeNodes - Есть ли узлы с HTML/Markdown форматированием (нужен ParseMode)
+  @param {boolean} hasMediaGroups - Есть ли узлы с группами медиа (нужны InputMedia*)
+  @param {boolean} hasUrlImages - Есть ли узлы с URL изображениями (нужен URLInputFile)
+  @param {boolean} hasDatetimeNodes - Есть ли узлы требующие datetime
+  @param {boolean} hasTimezoneNodes - Есть ли узлы требующие timezone
+  @param {boolean} hasReplyKeyboard - Есть ли reply клавиатуры (нужен ReplyKeyboardBuilder, KeyboardButton)
+  @param {boolean} hasLocalMediaFiles - Есть ли локальные медиа файлы (нужен FSInputFile)
+  @param {boolean} hasBotCommands - Есть ли команды для BotCommand (нужен BotCommand)
+  @param {boolean} hasHttpRequestNodes - Есть ли узлы HTTP запросов (нужен aiohttp)
+  @param {boolean} hasDeepLinkTriggers - Есть ли deep link триггеры (нужен CommandObject)
+  @param {boolean} hasSendInvoiceNodes - Есть ли счета в звёздах (нужен LabeledPrice)
+#}
+
+import asyncio
+import logging
+import signal
+
+from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    KeyboardButtonRequestManagedBot,
+    BotCommand,
+    ReplyKeyboardRemove,
+    FSInputFile,
+    CopyTextButton,
+    WebAppInfo
+)
+from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
+from typing import Optional, Callable, Awaitable, Any
+
+from dotenv import load_dotenv
+from aiogram.filters import CommandStart, Command, CommandObject
+
+{%- if userDatabaseEnabled %}
+
+import asyncpg
+import json
+{%- endif %}
+
+{%- if hasInlineButtons or hasAutoTransitions %}
+from aiogram.exceptions import TelegramBadRequest
+{%- endif %}
+
+{%- if hasMediaNodes or hasUploadImages %}
+import aiohttp
+from aiohttp import TCPConnector
+{%- endif %}
+
+{%- if hasHttpRequestNodes and not hasMediaNodes and not hasUploadImages %}
+import aiohttp
+from aiohttp import TCPConnector
+{%- endif %}
+
+{%- if hasParseModeNodes %}
+from aiogram.enums import ParseMode
+{%- endif %}
+
+{%- if hasMediaGroups %}
+from aiogram.types import InputMediaPhoto, InputMediaVideo, InputMediaAudio, InputMediaDocument
+{%- endif %}
+
+{%- if hasUrlImages %}
+from aiogram.types import URLInputFile
+{%- endif %}
+
+{%- if hasDatetimeNodes or userDatabaseEnabled %}
+from datetime import datetime{%- if hasTimezoneNodes %}, timezone{%- endif %}
+{%- endif %}
+
+from aiogram.fsm.storage.base import BaseStorage, StorageKey, StateType
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+
+import re
+from types import SimpleNamespace
+
+{%- if hasUserbotNodes %}
+from telethon import TelegramClient
+from telethon import events
+from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError as TelethonFloodWaitError
+
+# Подавляем verbose-логи Telethon
+logging.getLogger('telethon').setLevel(logging.WARNING)
+{%- endif %}
+
+{%- if hasRateCounterNodes %}
+from collections import deque
+import time
+{%- endif %}
+
+{%- if hasSendInvoiceNodes %}
+from aiogram.types import LabeledPrice
+{%- endif %}

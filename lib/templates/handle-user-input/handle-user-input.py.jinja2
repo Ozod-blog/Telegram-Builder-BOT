@@ -1,0 +1,381 @@
+{#
+  Шаблон универсального обработчика пользовательского ввода
+
+  @fileoverview Генерирует Python-код обработки текстового ввода пользователя.
+  При навигации к следующему узлу (next_node_id) всегда вызывает handle_callback_*,
+  что позволяет message-узлам с enableAutoTransition выполнять автопереход к input-узлам.
+
+  @param {string}  indentLevel  - базовый отступ (по умолчанию '    ')
+  @param {array}   nodes        - все узлы [{id, safeName, type, data}]
+  @param {array}   allNodeIds   - все ID узлов
+  @param {boolean} hasUrlButtons - есть ли URL кнопки в проекте
+  @param {array}   commandNodes - узлы с командами (start/command)
+  @param {boolean} hasInputTimeoutNodes - нужны ли вызовы таймаута/form_session
+#}
+
+{% set ind = indentLevel or '    ' %}
+{% set ind2 = ind ~ '    ' %}
+{% set ind3 = ind2 ~ '    ' %}
+{% set ind4 = ind3 ~ '    ' %}
+{% set ind5 = ind4 ~ '    ' %}
+{% set ind6 = ind5 ~ '    ' %}
+{% set ind7 = ind6 ~ '    ' %}
+
+{# ═══════════════════════════════════════════════════════════════
+   Проверяем button_response_config (reply клавиатура)
+   ═══════════════════════════════════════════════════════════════ #}
+{{ ind }}# Проверяем, ожидаем ли мы кнопочный ответ через reply клавиатуру
+{% if hasSkipDataCollectionButtons %}
+{{ ind }}async def call_skip_target_handler(fake_callback, target_node_id):
+{{ ind2 }}"""Переходит к целевому узлу по skipDataCollection без отсутствующих хелперов."""
+{{ ind2 }}_skip_handled = False
+{% for node in nodes %}
+{{ ind2 }}{% if loop.first %}if{% else %}elif{% endif %} target_node_id == "{{ node.id }}":
+{{ ind3 }}_skip_handled = True
+{{ ind3 }}await handle_callback_{{ node.safeName }}(fake_callback, state=None)
+{% endfor %}
+{{ ind2 }}if not _skip_handled:
+{{ ind3 }}logging.warning(f"Неизвестный целевой узел skipDataCollection: {target_node_id}")
+
+{% endif %}
+{{ ind }}if user_id in user_data and "button_response_config" in user_data[user_id]:
+{{ ind2 }}config = user_data[user_id]["button_response_config"]
+{{ ind2 }}user_text = message.text
+{{ ind2 }}
+{{ ind2 }}# Ищем выбранный вариант среди доступных опций
+{{ ind2 }}selected_option = None
+{{ ind2 }}for option in config.get("options", []):
+{{ ind3 }}if option["text"] == user_text:
+{{ ind4 }}selected_option = option
+{{ ind4 }}break
+{{ ind2 }}
+{{ ind2 }}if selected_option:
+{{ ind3 }}selected_value = selected_option["value"]
+{{ ind3 }}selected_text = selected_option["text"]
+{{ ind3 }}
+{{ ind3 }}# Сохраняем ответ пользователя
+{{ ind3 }}variable_name = config.get("variable", "button_response")
+{{ ind3 }}timestamp = get_moscow_time()
+{{ ind3 }}node_id = config.get("node_id", "unknown")
+{{ ind3 }}
+{{ ind3 }}response_data = {
+{{ ind4 }}"value": selected_value,
+{{ ind4 }}"text": selected_text,
+{{ ind4 }}"type": "button_response",
+{{ ind4 }}"timestamp": timestamp,
+{{ ind4 }}"nodeId": node_id,
+{{ ind4 }}"variable": variable_name
+{{ ind3 }}}
+{{ ind3 }}
+{{ ind3 }}# Сохраняем в пользовательские данные
+{{ ind3 }}user_data[user_id][variable_name] = response_data
+{{ ind3 }}
+{{ ind3 }}# Сохраняем в базу данных если включено
+{{ ind3 }}if config.get("save_to_database"):
+{{ ind4 }}await update_user_data_in_db(user_id, variable_name, response_data)
+{{ ind4 }}logging.info(f"✅ Кнопочный ответ сохранен в БД: {variable_name} = {selected_text} (пользователь {user_id})")
+{{ ind3 }}
+{{ ind3 }}# Отправляем сообщение об успехе
+{{ ind3 }}success_message = config.get("success_message", "Спасибо за ваш выбор!")
+{{ ind3 }}await message.answer(f"{success_message}\n\n✅ Ваш выбор: {selected_text}", reply_markup=ReplyKeyboardRemove())
+{{ ind3 }}
+{{ ind3 }}# Очищаем состояние
+{{ ind3 }}del user_data[user_id]["button_response_config"]
+{{ ind3 }}
+{{ ind3 }}logging.info(f"Получен кнопочный ответ через reply клавиатуру: {variable_name} = {selected_text}")
+{{ ind3 }}
+{{ ind3 }}# Навигация на основе действия кнопки
+{{ ind3 }}option_action = selected_option.get("action", "goto")
+{{ ind3 }}option_target = selected_option.get("target", "")
+{{ ind3 }}option_url = selected_option.get("url", "")
+{{ ind3 }}
+{% if hasUrlButtons %}
+{{ ind3 }}if option_action == "url" and option_url:
+{{ ind4 }}# Открытие ссылки
+{{ ind4 }}url = option_url
+{{ ind4 }}keyboard = InlineKeyboardMarkup(inline_keyboard=[
+{{ ind5 }}[InlineKeyboardButton(text="🔗 Открыть ссылку", url=url)]
+{{ ind4 }}])
+{{ ind4 }}await message.answer("Нажмите кнопку ниже, чтобы открыть ссылку:", reply_markup=keyboard)
+{{ ind3 }}elif option_action == "command" and option_target:
+{% else %}
+{{ ind3 }}if option_action == "command" and option_target:
+{% endif %}
+{{ ind4 }}# Выполнение команды
+{{ ind4 }}command = option_target
+{{ ind4 }}# Создаем фиктивное сообщение для выполнения команды
+{{ ind4 }}fake_message = SimpleNamespace(
+{{ ind5 }}from_user=message.from_user,
+{{ ind5 }}chat=message.chat,
+{{ ind5 }}text=command,
+{{ ind5 }}message_id=message.message_id
+{{ ind4 }})
+{{ ind4 }}
+{% for cmdNode in commandNodes %}
+{{ ind4 }}{% if loop.first %}if{% else %}elif{% endif %} command == "{{ cmdNode.data.command }}":
+{{ ind5 }}try:
+{{ ind6 }}await {% if cmdNode.type == 'start' %}start_handler{% elif cmdNode.type == 'command_trigger' %}command_trigger_{{ cmdNode.safeName }}_handler{% else %}{{ cmdNode.data.command | replace('/', '') | replace('-', '_') }}_handler{% endif %}(fake_message)
+{{ ind5 }}except Exception as e:
+{{ ind6 }}logging.error(f"Ошибка при выполнении команды {{ cmdNode.data.command }}: {e}")
+{% endfor %}
+{{ ind3 }}elif option_action == "goto" and option_target:
+{{ ind4 }}# Переход к узлу
+{{ ind4 }}target_node_id = option_target
+{{ ind4 }}try:
+{{ ind5 }}# Вызываем обработчик для целевого узла
+{{ ind5 }}_goto_handled = False
+{% for node in nodes %}
+{{ ind5 }}{% if loop.first %}if{% else %}elif{% endif %} target_node_id == "{{ node.id }}":
+{{ ind6 }}_goto_handled = True
+{{ ind6 }}await handle_callback_{{ node.safeName }}(types.CallbackQuery(id="reply_nav", from_user=message.from_user, chat_instance="", data=target_node_id, message=message), state=None)
+{% endfor %}
+{{ ind5 }}if not _goto_handled:
+{{ ind6 }}logging.warning(f"Неизвестный целевой узел: {target_node_id}")
+{{ ind4 }}except Exception as e:
+{{ ind5 }}logging.error(f"Ошибка при переходе к узлу {target_node_id}: {e}")
+{{ ind3 }}elif option_action not in ["command", "goto"]:
+{{ ind4 }}# Fallback к старой системе next_node_id если нет action
+{{ ind4 }}next_node_id = config.get("next_node_id")
+{{ ind4 }}if next_node_id:
+{{ ind5 }}try:
+{{ ind6 }}# Вызываем обработчик для следующего узла
+{{ ind6 }}_next_handled = False
+{% for node in nodes %}
+{{ ind6 }}{% if loop.first %}if{% else %}elif{% endif %} next_node_id == "{{ node.id }}":
+{{ ind6 }}    _next_handled = True
+{{ ind6 }}    await handle_callback_{{ node.safeName }}(types.CallbackQuery(id="reply_nav", from_user=message.from_user, chat_instance="", data=next_node_id, message=message), state=None)
+{% endfor %}
+{{ ind6 }}if not _next_handled:
+{{ ind6 }}    logging.warning(f"Неизвестный следующий узел: {next_node_id}")
+{{ ind5 }}except Exception as e:
+{{ ind6 }}logging.error(f"Ошибка при переходе к следующему узлу {next_node_id}: {e}")
+{{ ind3 }}return
+{{ ind2 }}if not selected_option:
+{{ ind3 }}# Неверный выбор - показываем доступные варианты
+{{ ind3 }}available_options = [option["text"] for option in config.get("options", [])]
+{{ ind3 }}options_text = "\n".join([f"• {opt}" for opt in available_options])
+{{ ind3 }}await message.answer(f"❌ Неверный выбор. Пожалуйста, выберите один из предложенных вариантов:\n\n{options_text}")
+{{ ind3 }}return
+{{ ind }}
+{# ═══════════════════════════════════════════════════════════════
+   Проверяем pending_skip_buttons для медиа-узлов
+   ═══════════════════════════════════════════════════════════════ #}
+{{ ind }}# ИСПРАВЛЕНИЕ: Проверяем pending_skip_buttons для медиа-узлов (фото/видео/аудио)
+{{ ind }}# Эта проверка нужна когда узел ожидает медиа, но пользователь нажал reply-кнопку с skipDataCollection
+{% if hasSkipDataCollectionButtons %}
+{{ ind }}if user_id in user_data and "pending_skip_buttons" in user_data[user_id]:
+{{ ind2 }}pending_buttons = user_data[user_id]["pending_skip_buttons"]
+{{ ind2 }}user_text = message.text
+{{ ind2 }}for skip_btn in pending_buttons:
+{{ ind3 }}if skip_btn.get("text") == user_text:
+{{ ind4 }}skip_target = skip_btn.get("target")
+{{ ind4 }}logging.info(f"⏭️ Нажата кнопка skipDataCollection для медиа-узла: {user_text} -> {skip_target}")
+{{ ind4 }}# Очищаем pending_skip_buttons и любые медиа-ожидания
+{{ ind4 }}if "pending_skip_buttons" in user_data[user_id]:
+{{ ind5 }}del user_data[user_id]["pending_skip_buttons"]
+{{ ind4 }}# Проверяем и очищаем waiting_for_input если тип соответствует медиа
+{{ ind4 }}if "waiting_for_input" in user_data[user_id]:
+{{ ind5 }}waiting_config = user_data[user_id]["waiting_for_input"]
+{{ ind5 }}if isinstance(waiting_config, dict) and waiting_config.get("type") in ["photo", "video", "audio", "document", "location", "contact"]:
+{{ ind6 }}del user_data[user_id]["waiting_for_input"]
+{{ ind4 }}# Переходим к целевому узлу
+{{ ind4 }}if skip_target:
+{{ ind5 }}try:
+{{ ind6 }}logging.info(f"🚀 Переходим к узлу skipDataCollection медиа: {skip_target}")
+{{ ind6 }}fake_callback = SimpleNamespace(
+{{ ind6 }}    id="skip_media_nav",
+{{ ind6 }}    from_user=message.from_user,
+{{ ind6 }}    chat_instance="",
+{{ ind6 }}    data=skip_target,
+{{ ind6 }}    message=message,
+{{ ind6 }}    answer=lambda *_args, **_kwargs: asyncio.sleep(0)
+{{ ind6 }})
+{{ ind6 }}_skip_media_handled = False
+{% for node in nodes %}
+{{ ind6 }}{% if loop.first %}if{% else %}elif{% endif %} skip_target == "{{ node.id }}":
+{{ ind6 }}    _skip_media_handled = True
+{{ ind6 }}    await handle_callback_{{ node.safeName }}(fake_callback, state=None)
+{% endfor %}
+{{ ind6 }}if not _skip_media_handled:
+{{ ind6 }}    logging.warning(f"Неизвестный целевой узел skipDataCollection медиа: {skip_target}")
+{{ ind5 }}except Exception as e:
+{{ ind6 }}logging.error(f"Ошибка при переходе к узлу skipDataCollection медиа {skip_target}: {e}")
+{{ ind4 }}return
+{% endif %}
+{{ ind }}
+{# ═══════════════════════════════════════════════════════════════
+   Проверяем waiting_for_input (универсальная система)
+   ═══════════════════════════════════════════════════════════════ #}
+{{ ind }}# Проверяем, ожидаем ли мы текстовый ввод от пользователя (универсальная система)
+{{ ind }}has_waiting_state = user_id in user_data and "waiting_for_input" in user_data[user_id]
+{{ ind }}logging.info(f"DEBUG: Получен текст {message.text}, состояние ожидания: {has_waiting_state}")
+{{ ind }}if user_id in user_data and "waiting_for_input" in user_data[user_id]:
+{{ ind2 }}# Обрабатываем ввод через универсальную систему
+{{ ind2 }}waiting_config = user_data[user_id]["waiting_for_input"]
+{{ ind2 }}logging.info(f"DEBUG: waiting_config = {waiting_config}")
+{{ ind2 }}logging.info(f"DEBUG: waiting_node_id = {waiting_config.get('node_id') if isinstance(waiting_config, dict) else waiting_config}")
+{{ ind2 }}
+{{ ind2 }}# Проверяем, что пользователь все еще находится в состоянии ожидания ввода
+{{ ind2 }}if not waiting_config:
+{{ ind3 }}logging.error(f"❌ waiting_config пустой! user_data[user_id] = {user_data.get(user_id)}")
+{{ ind3 }}return  # Состояние ожидания пустое, игнорируем
+{{ ind2 }}
+{{ ind2 }}# Извлекаем конфигурацию из waiting_config (dict)
+{{ ind2 }}waiting_node_id = waiting_config.get("node_id")
+{{ ind2 }}input_type = waiting_config.get("type", "text")
+{{ ind2 }}variable_name = waiting_config.get("variable", "user_response")
+{{ ind2 }}save_to_database = waiting_config.get("save_to_database", False)
+{{ ind2 }}min_length = waiting_config.get("min_length", 0)
+{{ ind2 }}max_length = waiting_config.get("max_length", 0)
+{{ ind2 }}next_node_id = waiting_config.get("next_node_id")
+{{ ind2 }}appendVariable = waiting_config.get("appendVariable", False)
+{{ ind2 }}user_text = message.text
+{{ ind2 }}logging.info(f"DEBUG: input_type = {input_type}, variable_name = {variable_name}, next_node_id = {next_node_id}, appendVariable = {appendVariable}")
+{{ ind2 }}# Проверяем, является ли тип ввода не-текстовым и должен обрабатываться отдельным runtime-хендлером
+{{ ind2 }}if input_type in ["photo", "video", "audio", "document", "location", "contact"]:
+{{ ind3 }}logging.info(f"Текстовый ввод от пользователя {user_id} проигнорирован - ожидается медиа ({input_type})")
+{{ ind3 }}return
+{{ ind2 }}if input_type == "callback":
+{{ ind3 }}logging.info(f"Текстовый ввод от пользователя {user_id} проигнорирован - ожидается нажатие кнопки (callback)")
+{{ ind3 }}return
+{{ ind2 }}# Валидация длины
+{{ ind2 }}if min_length > 0 and len(user_text) < min_length:
+{{ ind3 }}retry_message = waiting_config.get("retry_message", "Пожалуйста, попробуйте еще раз.")
+{{ ind3 }}await message.answer(f"❌ Слишком короткий ответ (минимум {min_length} символов). {retry_message}")
+{{ ind3 }}return
+{{ ind2 }}if max_length > 0 and len(user_text) > max_length:
+{{ ind3 }}retry_message = waiting_config.get("retry_message", "Пожалуйста, попробуйте еще раз.")
+{{ ind3 }}await message.answer(f"❌ Слишком длинный ответ (максимум {max_length} символов). {retry_message}")
+{{ ind3 }}return
+{{ ind2 }}# КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Очищаем старое состояние ожидания перед навигацией
+{{ ind2 }}if "waiting_for_input" in user_data[user_id]:
+{{ ind3 }}del user_data[user_id]["waiting_for_input"]
+{{ ind2 }}
+{{ ind2 }}logging.info(f"✅ Переход к следующему узлу выполнен успешно")
+{{ ind2 }}logging.info(f"Получен пользовательский ввод: {variable_name} = {user_text}")
+{{ ind2 }}
+{{ ind2 }}# ИСПРАВЛЕНИЕ: Проверяем, является ли текст кнопкой с skipDataCollection=true
+{% if hasSkipDataCollectionButtons %}
+{{ ind2 }}skip_buttons = waiting_config.get("skip_buttons", [])
+{{ ind2 }}logging.info(f"DEBUG: skip_buttons = {skip_buttons}")
+{{ ind2 }}skip_target = None
+{{ ind2 }}for skip_btn in skip_buttons:
+{{ ind3 }}if skip_btn.get("text") == user_text:
+{{ ind4 }}skip_target = skip_btn.get("target")
+{{ ind4 }}logging.info(f"⏭️ Нажата кнопка skipDataCollection в waiting_for_input: {user_text} -> {skip_target}")
+{{ ind4 }}# Очищаем состояние ожидания
+{{ ind4 }}if "waiting_for_input" in user_data[user_id]:
+{{ ind5 }}del user_data[user_id]["waiting_for_input"]
+{{ ind4 }}break
+{{ ind2 }}
+{{ ind2 }}# Переходим к целевому узлу если skip_target найден
+{{ ind2 }}if skip_target:
+{{ ind3 }}try:
+{{ ind4 }}logging.info(f"🚀 Переходим к узлу skipDataCollection: {skip_target}")
+{{ ind4 }}fake_callback = SimpleNamespace(
+{{ ind5 }}id="skip_button_nav",
+{{ ind5 }}from_user=message.from_user,
+{{ ind5 }}chat_instance="",
+{{ ind5 }}data=skip_target,
+{{ ind5 }}message=message,
+{{ ind5 }}answer=lambda *_args, **_kwargs: asyncio.sleep(0)
+{{ ind4 }})
+{% if nodes | length > 0 %}
+{{ ind4 }}# Вызываем обработчик целевого узла
+{{ ind4 }}await call_skip_target_handler(fake_callback, skip_target)
+{{ ind4 }}logging.info(f"✅ Переход skipDataCollection выполнен: {skip_target}")
+{% else %}
+{{ ind4 }}logging.warning(f"Нет узлов для перехода skipDataCollection: {skip_target}")
+{% endif %}
+{{ ind3 }}except Exception as e:
+{{ ind4 }}logging.error(f"Ошибка при переходе skipDataCollection к узлу {skip_target}: {e}")
+{{ ind2 }}
+{{ ind2 }}# Подготовка данных для сохранения
+{% endif %}
+{{ ind2 }}timestamp = get_moscow_time()
+{{ ind2 }}response_data = user_text
+{{ ind2 }}
+{{ ind2 }}# Всегда сохраняем в локальное хранилище (для condition и других узлов)
+{{ ind2 }}if user_id not in user_data:
+{{ ind3 }}user_data[user_id] = {}
+{{ ind2 }}user_data[user_id][variable_name] = response_data
+{{ ind2 }}logging.info(f"✅ Сохранено в user_data: {variable_name} = {response_data}")
+{% if hasInputTimeoutNodes %}
+{{ ind2 }}await _cancel_input_timeout_task(user_id)
+{{ ind2 }}_track_form_variable(user_id, variable_name)
+{% endif %}
+{{ ind2 }}
+{{ ind2 }}# Дополнительно сохраняем в БД если доступна
+{{ ind2 }}if db_pool:
+{{ ind3 }}try:
+{{ ind4 }}async with db_pool.acquire() as conn:
+{{ ind5 }}row = await conn.fetchrow(
+{{ ind6 }}"SELECT user_data FROM bot_users WHERE user_id = $1 AND project_id = $2 AND token_id = $3",
+{{ ind6 }}user_id, PROJECT_ID, TOKEN_ID
+{{ ind5 }})
+{{ ind5 }}if row and row["user_data"]:
+{{ ind6 }}db_user_data = row["user_data"]
+{{ ind6 }}if isinstance(db_user_data, str):
+{{ ind6 }}    try:
+{{ ind6 }}        db_user_data = json.loads(db_user_data)
+{{ ind6 }}    except:
+{{ ind6 }}        db_user_data = {}
+{{ ind6 }}elif not isinstance(db_user_data, dict):
+{{ ind6 }}    db_user_data = {}
+{{ ind5 }}if not (row and row["user_data"]):
+{{ ind6 }}db_user_data = {}
+{{ ind5 }}db_user_data[variable_name] = response_data
+{{ ind5 }}await conn.execute(
+{{ ind6 }}"UPDATE bot_users SET user_data = $1 WHERE user_id = $2 AND project_id = $3 AND token_id = $4",
+{{ ind6 }}json.dumps(db_user_data, ensure_ascii=False), user_id, PROJECT_ID, TOKEN_ID
+{{ ind5 }})
+{{ ind5 }}logging.info(f"✅ Сохранено в bot_users: {variable_name} = {response_data}")
+{{ ind3 }}except Exception as e:
+{{ ind4 }}logging.error(f"❌ Ошибка сохранения в bot_users: {e}")
+{{ ind2 }}
+{{ ind2 }}# Навигация к следующему узлу
+{{ ind2 }}if next_node_id:
+{{ ind3 }}try:
+{{ ind4 }}# Цикл для поддержки автопереходов
+{{ ind4 }}while next_node_id:
+{{ ind5 }}logging.info(f"🚀 Переходим к узлу: {next_node_id}")
+{{ ind5 }}current_node_id = next_node_id
+{{ ind5 }}next_node_id = None  # Сбрасываем, будет установлен при автопереходе
+{{ ind5 }}# Проверяем навигацию к узлам
+{{ ind5 }}_node_handled = False
+{% if commandNodes and commandNodes | length > 0 %}
+{{ ind5 }}# Командные узлы обрабатываются через их message-handler, а не через handle_callback_*
+{{ ind5 }}_command_message = SimpleNamespace(
+{{ ind5 }}    from_user=message.from_user,
+{{ ind5 }}    chat=message.chat,
+{{ ind5 }}    text=current_node_id,
+{{ ind5 }}    message_id=message.message_id
+{{ ind5 }})
+{% for cmdNode in commandNodes %}
+{{ ind5 }}{% if loop.first %}if{% else %}elif{% endif %} current_node_id == "{{ cmdNode.id }}":
+{{ ind6 }}_node_handled = True
+{{ ind6 }}await {% if cmdNode.type == 'start' %}start_handler{% elif cmdNode.type == 'command_trigger' %}command_trigger_{{ cmdNode.safeName }}_handler{% else %}{{ cmdNode.data.command | replace('/', '') | replace('-', '_') }}_handler{% endif %}(_command_message)
+{{ ind6 }}break
+{% endfor %}
+{% endif %}
+{{ ind5 }}if not _node_handled:
+{% for node in nodes %}
+{{ ind6 }}{% if loop.first %}if{% else %}elif{% endif %} current_node_id == "{{ node.id }}":
+{{ ind7 }}_node_handled = True
+{{ ind7 }}# Переход к узлу {{ node.id }} через handle_callback_ (поддерживает автопереход)
+{{ ind7 }}fake_callback = SimpleNamespace(
+{{ ind7 }}    id="text_nav",
+{{ ind7 }}    from_user=message.from_user,
+{{ ind7 }}    chat_instance="",
+{{ ind7 }}    data=current_node_id,
+{{ ind7 }}    message=message,
+{{ ind7 }}    answer=lambda *_args, **_kwargs: asyncio.sleep(0)
+{{ ind7 }})
+{{ ind7 }}await handle_callback_{{ node.safeName }}(fake_callback)  # state=None
+{{ ind7 }}break
+{% endfor %}
+{{ ind6 }}if not _node_handled:
+{{ ind7 }}logging.warning(f"Неизвестный узел для навигации: {current_node_id}")
+{{ ind7 }}break
+{{ ind3 }}except Exception as e:
+{{ ind4 }}logging.error(f"Ошибка при переходе к узлу: {e}")

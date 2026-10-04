@@ -1,0 +1,53 @@
+/**
+ * @fileoverview Опции действий для кнопки
+ *
+ * Переиспользуемый компонент с иконками и подписями действий.
+ */
+
+/** Тип действия кнопки */
+export type ButtonActionType = 'goto' | 'url' | 'selection' | 'complete' | 'default' | 'contact' | 'location' | 'command' | 'copy_text' | 'web_app' | 'request_managed_bot' | 'pay';
+
+/** Пропсы для рендеринга опции действия */
+interface ButtonActionOptionProps {
+  /** Тип действия */
+  action: ButtonActionType;
+}
+
+/**
+ * Конфигурация иконок и стилей для каждого типа действия
+ */
+export const ACTION_CONFIG: Record<ButtonActionType, { icon: string; color: string; label: string }> = {
+  goto: { icon: 'fa-right-long', color: 'text-teal-600 dark:text-teal-400', label: 'Перейти к экрану' },
+  url: { icon: 'fa-link', color: 'text-blue-600 dark:text-blue-400', label: 'Открыть ссылку' },
+  selection: { icon: 'fa-check-square', color: 'text-green-600 dark:text-green-400', label: 'Выбор опции' },
+  complete: { icon: 'fa-flag-checkered', color: 'text-purple-600 dark:text-purple-400', label: 'Кнопка завершения' },
+  default: { icon: 'fa-circle-dot', color: 'text-slate-500 dark:text-slate-400', label: 'Обычная кнопка' },
+  contact: { icon: 'fa-phone', color: 'text-green-600 dark:text-green-400', label: 'Запрос контакта' },
+  location: { icon: 'fa-location-dot', color: 'text-blue-600 dark:text-blue-400', label: 'Запрос геолокации' },
+  command: { icon: 'fa-terminal', color: 'text-orange-600 dark:text-orange-400', label: 'Команда' },
+  /** Копировать текст в буфер обмена (Bot API 7.11, только inline) */
+  copy_text: { icon: 'fa-clipboard', color: 'text-yellow-600 dark:text-yellow-400', label: 'Копировать текст' },
+  /** Открыть Telegram Mini App по URL (только inline, требует HTTPS) */
+  web_app: { icon: 'fa-globe', color: 'text-cyan-600 dark:text-cyan-400', label: 'Открыть Web App' },
+  /** Запросить создание управляемого бота (Bot API 9.6, только reply) */
+  request_managed_bot: { icon: 'fa-robot', color: 'text-indigo-600 dark:text-indigo-400', label: 'Запросить управляемого бота' },
+  /** Оплата счёта (только первая кнопка у клавиатуры счёта) */
+  pay: { icon: 'fa-star', color: 'text-yellow-600 dark:text-yellow-400', label: 'Оплатить' },
+};
+
+/**
+ * Компонент опции действия кнопки
+ *
+ * @param {ButtonActionOptionProps} props - Пропсы компонента
+ * @returns {JSX.Element} Опция действия с иконкой
+ */
+export function ButtonActionOption({ action }: ButtonActionOptionProps) {
+  const config = ACTION_CONFIG[action];
+
+  return (
+    <div className="flex items-center gap-2">
+      <i className={`fas ${config.icon} ${config.color} text-xs`}></i>
+      <span>{config.label}</span>
+    </div>
+  );
+}

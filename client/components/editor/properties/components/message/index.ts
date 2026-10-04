@@ -1,0 +1,10 @@
+/**
+ * @fileoverview Экспорты компонентов секции текста сообщения
+ * @module components/editor/properties/components/message
+ */
+
+export * from './message-text-section-header';
+export * from './message-text-section-content';
+export * from './message-text-section';
+export * from './message-recipient-section';
+export * from './save-message-id-section';

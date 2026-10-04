@@ -1,0 +1,146 @@
+/**
+ * @fileoverview Таблица групп бота
+ * @module shared/schema/tables/bot-groups
+ */
+
+import { pgTable, text, serial, integer, jsonb, timestamp, uniqueIndex, index } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { z } from "zod";
+
+import { botProjects } from "./bot-projects";
+import { botTokens } from "./bot-tokens";
+
+/**
+ * Таблица групп бота
+ */
+export const botGroups = pgTable("bot_groups", {
+  /** Уникальный идентификатор группы */
+  id: serial("id").primaryKey(),
+  /** Идентификатор проекта (ссылка на bot_projects.id) */
+  projectId: integer("project_id").references(() => botProjects.id, { onDelete: "cascade" }).notNull(),
+  /** ID токена бота, который состоит в этой группе */
+  tokenId: integer("token_id").references(() => botTokens.id, { onDelete: "cascade" }),
+  /** Идентификатор группы в Telegram */
+  groupId: text("group_id"),
+  /** Отображаемое название группы */
+  name: text("name").notNull(),
+  /** Ссылка на группу */
+  url: text("url").notNull(),
+  /** Флаг администратора (0 = участник, 1 = администратор) */
+  isAdmin: integer("is_admin").default(0),
+  /** Количество участников */
+  memberCount: integer("member_count"),
+  /** Флаг активности (0 = неактивная, 1 = активная) */
+  isActive: integer("is_active").default(1),
+  /** Описание группы */
+  description: text("description"),
+  /** Настройки группы */
+  settings: jsonb("settings").default({}),
+  /** URL аватарки группы */
+  avatarUrl: text("avatar_url"),
+  /** Тип чата ("group", "supergroup", "channel") */
+  chatType: text("chat_type").default("group"),
+  /** Пригласительная ссылка */
+  inviteLink: text("invite_link"),
+  /** Права администратора бота в группе */
+  adminRights: jsonb("admin_rights").default({
+    can_manage_chat: false,
+    can_change_info: false,
+    can_delete_messages: false,
+    can_invite_users: false,
+    can_restrict_members: false,
+    can_pin_messages: false,
+    can_promote_members: false,
+    can_manage_video_chats: false
+  }),
+  /** Количество сообщений в группе */
+  messagesCount: integer("messages_count").default(0),
+  /** Количество активных пользователей */
+  activeUsers: integer("active_users").default(0),
+  /** Дата последней активности */
+  lastActivity: timestamp("last_activity"),
+  /** Флаг публичности (0 = частная, 1 = публичная) */
+  isPublic: integer("is_public").default(0),
+  /** Основной язык группы */
+  language: text("language").default("ru"),
+  /** Часовой пояс группы */
+  timezone: text("timezone"),
+  /** Теги для категоризации */
+  tags: text("tags").array().default([]),
+  /** Заметки администратора */
+  notes: text("notes"),
+  /** Дата создания группы */
+  createdAt: timestamp("created_at").defaultNow(),
+  /** Дата последнего обновления группы */
+  updatedAt: timestamp("updated_at").defaultNow(),
+}, (table) => [
+  /** Уникальность группы в рамках бота проекта */
+  uniqueIndex("bot_groups_project_token_group_uniq")
+    .on(table.projectId, table.tokenId, table.groupId)
+    .where(sql`group_id IS NOT NULL AND token_id IS NOT NULL`),
+  /** Быстрый список групп токена */
+  index("bot_groups_project_token_idx").on(table.projectId, table.tokenId),
+]);
+
+/** Схема для вставки данных группы бота */
+export const insertBotGroupSchema = z.object({
+  /** Идентификатор проекта */
+  projectId: z.number().int(),
+  /** ID токена бота (кто состоит в группе) */
+  tokenId: z.number().int().positive().nullable().optional(),
+  /** Идентификатор группы в Telegram */
+  groupId: z.string().nullable().optional(),
+  /** Название группы (обязательное поле) */
+  name: z.string().min(1, "Название группы обязательно"),
+  /** Ссылка на группу (может быть пустой для числовых ID групп) */
+  url: z.string().optional().default(""),
+  /** Флаг администратора (0 = участник, 1 = администратор) */
+  isAdmin: z.number().min(0).max(1).default(0),
+  /** Количество участников */
+  memberCount: z.number().nullable().optional(),
+  /** Флаг активности (0 = неактивная, 1 = активная) */
+  isActive: z.number().min(0).max(1).default(1),
+  /** Флаг публичности (0 = частная, 1 = публичная) */
+  isPublic: z.number().min(0).max(1).default(0),
+  /** Описание группы */
+  description: z.string().nullable().optional(),
+  /** Настройки группы */
+  settings: z.record(z.any()).default({}),
+  /** URL аватарки группы */
+  avatarUrl: z.string().nullable().optional(),
+  /** Права администратора */
+  adminRights: z.record(z.any()).default({
+    can_manage_chat: false,
+    can_change_info: false,
+    can_delete_messages: false,
+    can_invite_users: false,
+    can_restrict_members: false,
+    can_pin_messages: false,
+    can_promote_members: false,
+    can_manage_video_chats: false
+  }),
+  /** Язык группы */
+  language: z.enum(["ru", "en", "es", "fr", "de", "it", "pt", "zh", "ja", "ko"]).default("ru"),
+  /** Тип чата ("group", "supergroup", "channel") */
+  chatType: z.enum(["group", "supergroup", "channel"]).default("group"),
+  /** Пригласительная ссылка */
+  inviteLink: z.string().nullable().optional(),
+  /** Часовой пояс группы */
+  timezone: z.string().nullable().optional(),
+  /** Теги группы */
+  tags: z.array(z.string()).default([]),
+  /** Заметки администратора */
+  notes: z.string().nullable().optional(),
+  /** Количество сообщений в группе */
+  messagesCount: z.number().min(0).default(0),
+  /** Количество активных пользователей */
+  activeUsers: z.number().min(0).default(0),
+  /** Дата последней активности */
+  lastActivity: z.date().nullable().optional(),
+});
+
+/** Тип записи группы бота */
+export type BotGroup = typeof botGroups.$inferSelect;
+
+/** Тип для вставки группы бота */
+export type InsertBotGroup = typeof botGroups.$inferInsert;

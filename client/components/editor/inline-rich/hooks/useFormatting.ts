@@ -1,0 +1,318 @@
+/**
+ * @fileoverview Хук для применения форматирования к тексту
+ * @description Обрабатывает применение стилей с поддержкой toggle:
+ * повторное нажатие на активный формат снимает его.
+ * Сохраняет Range при потере фокуса редактором, чтобы клик по кнопке
+ * тулбара не терял выделение.
+ * Поддерживает раскрывающуюся цитату Telegram: <blockquote expandable>.
+ */
+
+import { useCallback, useRef } from 'react';
+import type { FormatOption } from '../format-options';
+import type { ToastFn } from '../utils/toast-types';
+
+/**
+ * Параметры хука useFormatting
+ */
+export interface UseFormattingOptions {
+  /** Ref на DOM элемент редактора */
+  editorRef: React.RefObject<HTMLDivElement>;
+  /** Функция сохранения в стек отмены */
+  saveToUndoStack: () => void;
+  /** Функция обработки ввода */
+  handleInput: () => void;
+  /** Функция для показа уведомлений */
+  toast: ToastFn;
+  /** Callback при изменении режима форматирования */
+  onFormatModeChange?: (formatMode: 'html' | 'markdown' | 'none') => void;
+  /** Флаг установки форматирования */
+  setIsFormatting: (value: boolean) => void;
+  /** Callback для открытия попапа вставки ссылки */
+  onLinkCommand?: () => void;
+}
+
+/**
+ * Маппинг команд форматирования на HTML-теги для оборачивания.
+ * Команды expandable-quote и quote обрабатываются отдельной логикой.
+ */
+const FORMAT_TAG_MAP: Record<string, string> = {
+  bold: 'strong',
+  italic: 'em',
+  underline: 'u',
+  strikethrough: 's',
+  code: 'code',
+  codeblock: 'pre',
+  quote: 'blockquote',
+  spoiler: 'tg-spoiler',
+};
+
+/**
+ * Маппинг команд на теги для поиска существующего форматирования (включая алиасы).
+ * Используется при toggle — нужно найти любой вариант тега.
+ * expandable-quote ищет тот же blockquote, различие — по атрибуту expandable.
+ */
+const COMMAND_TO_TAGS: Record<string, string[]> = {
+  bold: ['strong', 'b'],
+  italic: ['em', 'i'],
+  underline: ['u'],
+  strikethrough: ['s', 'strike', 'del'],
+  code: ['code'],
+  codeblock: ['pre'],
+  quote: ['blockquote'],
+  'expandable-quote': ['blockquote'],
+  spoiler: ['tg-spoiler'],
+};
+
+/**
+ * Ищет ближайший родительский элемент с одним из указанных тегов
+ * @param node - Начальный узел
+ * @param tagNames - Список имён тегов (в нижнем регистре)
+ * @param editor - Корневой элемент редактора (граница поиска)
+ * @returns Найденный элемент или null
+ */
+function findAncestorByTags(
+  node: Node | null,
+  tagNames: string[],
+  editor: HTMLElement
+): Element | null {
+  let current = node?.nodeType === Node.TEXT_NODE
+    ? node.parentElement
+    : node as Element | null;
+
+  while (current && current !== editor) {
+    if (tagNames.includes(current.tagName.toLowerCase())) return current;
+    current = current.parentElement;
+  }
+  return null;
+}
+
+/**
+ * Снимает форматирование: заменяет элемент его текстовым содержимым
+ * и восстанавливает выделение на этом тексте.
+ * Использует setStart/setEnd вместо selectNode, чтобы Range был
+ * text-selection (не collapsed), корректно сохраняемый в savedRangeRef.
+ * @param el - Элемент для удаления
+ * @param selection - Текущее выделение
+ */
+function unwrapElement(el: Element, selection: Selection): void {
+  const text = el.textContent ?? '';
+  const textNode = document.createTextNode(text);
+  el.parentNode?.replaceChild(textNode, el);
+  const newRange = document.createRange();
+  newRange.setStart(textNode, 0);
+  newRange.setEnd(textNode, textNode.length);
+  selection.removeAllRanges();
+  selection.addRange(newRange);
+}
+
+/**
+ * Оборачивает выделенный текст в новый элемент с указанным тегом.
+ * Использует surroundContents чтобы не удалять и не пересоздавать текстовые узлы —
+ * это сохраняет валидность Range-ов хранящихся в savedRangeRef.
+ * Если surroundContents бросает исключение (выделение пересекает границы элементов),
+ * падаем обратно на extractContents + appendChild.
+ * @param tagName - Имя тега
+ * @param range - Текущий Range с выделенным текстом
+ * @param selection - Текущее выделение
+ */
+function wrapWithTag(
+  tagName: string,
+  range: Range,
+  selection: Selection
+): void {
+  const el = document.createElement(tagName);
+  try {
+    range.surroundContents(el);
+  } catch {
+    // Выделение пересекает границы элементов — используем extractContents
+    el.appendChild(range.extractContents());
+    range.insertNode(el);
+  }
+  range.selectNodeContents(el);
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
+/**
+ * Хук для применения форматирования к выделенному тексту с поддержкой toggle
+ * @param options - Параметры хука
+ * @returns Функция applyFormatting и обработчик onBlur для сохранения выделения
+ */
+export function useFormatting({
+  editorRef,
+  saveToUndoStack,
+  handleInput,
+  toast,
+  onFormatModeChange,
+  setIsFormatting,
+  onLinkCommand
+}: UseFormattingOptions) {
+  /** Сохранённый Range — восстанавливается при клике по кнопке тулбара */
+  const savedRangeRef = useRef<Range | null>(null);
+
+  /**
+   * Сохраняет текущее выделение при потере фокуса редактором.
+   * Сохраняет только не-collapsed Range (есть реальное выделение текста),
+   * чтобы не перезаписывать корректный Range collapsed-ом от клика по кнопке.
+   * Вызывается из onBlur contenteditable div.
+   */
+  const saveSelectionOnBlur = useCallback(() => {
+    const selection = window.getSelection();
+    if (selection && selection.rangeCount > 0 && !selection.isCollapsed) {
+      savedRangeRef.current = selection.getRangeAt(0).cloneRange();
+    }
+  }, []);
+
+  /**
+   * Восстанавливает сохранённое выделение в редакторе.
+   * @returns Range или null если нет сохранённого выделения
+   */
+  const restoreSavedRange = useCallback((): Range | null => {
+    const saved = savedRangeRef.current;
+    if (!saved) return null;
+    const selection = window.getSelection();
+    if (selection) {
+      selection.removeAllRanges();
+      selection.addRange(saved);
+    }
+    return saved;
+  }, []);
+
+  const applyFormatting = useCallback((format: FormatOption) => {
+    if (!editorRef.current) return;
+
+    // Команда ссылки делегируется внешнему попапу
+    if (format.command === 'link') {
+      onLinkCommand?.();
+      return;
+    }
+
+    saveToUndoStack();
+    setIsFormatting(true);
+
+    if (onFormatModeChange) {
+      onFormatModeChange('html');
+    }
+
+    // Пробуем получить текущее выделение, если нет — восстанавливаем сохранённое
+    let selection = window.getSelection();
+    let range: Range | null = null;
+
+    if (selection && selection.rangeCount > 0 && selection.toString().length > 0) {
+      range = selection.getRangeAt(0);
+    } else {
+      // Фокус ушёл на кнопку — восстанавливаем сохранённый Range
+      range = restoreSavedRange();
+      selection = window.getSelection();
+    }
+
+    if (!range || !selection) {
+      toast({
+        title: "Нет выделения",
+        description: "Выделите текст для форматирования или поставьте курсор в нужное место",
+        variant: "default"
+      });
+      setIsFormatting(false);
+      return;
+    }
+
+    try {
+      const selectedText = range.toString();
+      const editor = editorRef.current;
+
+      const tagName = FORMAT_TAG_MAP[format.command];
+      const searchTags = COMMAND_TO_TAGS[format.command];
+
+      if (format.command === 'expandable-quote') {
+        // Специальная логика для раскрывающейся цитаты
+        const existing = findAncestorByTags(
+          range.commonAncestorContainer,
+          ['blockquote'],
+          editor
+        );
+        if (existing) {
+          if (existing.hasAttribute('expandable')) {
+            // Уже expandable → снимаем форматирование полностью
+            unwrapElement(existing, selection);
+          } else {
+            // Обычная цитата → добавляем атрибут expandable
+            existing.setAttribute('expandable', '');
+          }
+        } else if (selectedText) {
+          // Нет цитаты → создаём <blockquote expandable>
+          const el = document.createElement('blockquote');
+          el.setAttribute('expandable', '');
+          try {
+            range.surroundContents(el);
+          } catch {
+            el.appendChild(range.extractContents());
+            range.insertNode(el);
+          }
+          range.selectNodeContents(el);
+          selection.removeAllRanges();
+          selection.addRange(range);
+        }
+      } else if (format.command === 'quote') {
+        // Специальная логика для обычной цитаты
+        const existing = findAncestorByTags(
+          range.commonAncestorContainer,
+          ['blockquote'],
+          editor
+        );
+        if (existing) {
+          if (existing.hasAttribute('expandable')) {
+            // Раскрывающаяся цитата → убираем атрибут expandable
+            existing.removeAttribute('expandable');
+          } else {
+            // Обычная цитата → снимаем форматирование
+            unwrapElement(existing, selection);
+          }
+        } else if (selectedText) {
+          // Нет цитаты → создаём обычный <blockquote>
+          wrapWithTag('blockquote', range, selection);
+        }
+      } else if (tagName && searchTags) {
+        // Стандартная логика для остальных команд
+        const existing = findAncestorByTags(
+          range.commonAncestorContainer,
+          searchTags,
+          editor
+        );
+
+        if (existing) {
+          // Toggle OFF — снимаем форматирование
+          unwrapElement(existing, selection);
+        } else if (selectedText) {
+          // Toggle ON — оборачиваем выделенный текст
+          wrapWithTag(tagName, range, selection);
+        }
+      }
+
+      // isFormattingRef уже true — handleInput вызовет onChange,
+      // useEditorSync увидит флаг и не перезапишет DOM.
+      // После handleInput сохраняем актуальный Range — DOM уже стабилен.
+      setTimeout(() => {
+        handleInput();
+        // Сохраняем Range после того как handleInput завершил работу с DOM
+        requestAnimationFrame(() => {
+          const sel = window.getSelection();
+          if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
+            savedRangeRef.current = sel.getRangeAt(0).cloneRange();
+          }
+        });
+      }, 0);
+    } catch (e) {
+      toast({
+        title: "Ошибка форматирования",
+        description: "Не удалось применить форматирование",
+        variant: "destructive"
+      });
+    }
+
+    // Держим флаг форматирования дольше чтобы useEditorSync не перезаписал DOM
+    // пока React не обработает новый value
+    setTimeout(() => setIsFormatting(false), 200);
+  }, [editorRef, saveToUndoStack, handleInput, toast, onFormatModeChange, setIsFormatting, onLinkCommand, restoreSavedRange]);
+
+  return { applyFormatting, saveSelectionOnBlur };
+}

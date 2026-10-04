@@ -1,0 +1,2441 @@
+/**
+ * @fileoverview Базовая реализация storage поверх Drizzle для серверной части конструктора
+ */
+
+import { type BotGroup, botGroups, type BotInstance, botInstances, type BotMessage, type BotMessageMedia, botMessageMedia, botMessages, type BotProject, botProjects, type BotTemplate, botTemplates, type BotToken, botTokens, type BotUser, botUsers, type GroupMember, groupMembers, type MediaFile, mediaFiles, type TelegramUserDB, telegramUsers, botLogs, type BotLog, botLaunchHistory, type BotLaunchHistory, projectCollaborators, type ProjectCollaborator, userProjectArchives, broadcasts, broadcastResults, broadcastCampaigns, type Broadcast, type BroadcastResult, type BroadcastFilters, type BroadcastCampaign, botEnvVariables, type BotEnvVariable, botTables, botTableColumns, botTableRows, type BotTable, type BotTableColumn, type BotTableRow, workerProcesses, type WorkerProcess, projectVersions, type ProjectVersion, agentTokens, type AgentToken } from "@shared/schema";
+import { and, asc, desc, eq, ilike, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { IStorage } from "../storages/storage";
+import type { StorageBotGroupInput, StorageBotGroupUpdate, StorageBotInstanceInput, StorageBotInstanceUpdate, StorageBotLaunchHistoryInput, StorageBotLaunchHistoryUpdate, StorageBotLogInput, StorageBotMessageInput, StorageBotMessageMediaInput, StorageBotProjectInput, StorageBotProjectUpdate, StorageBotTemplateInput, StorageBotTemplateUpdate, StorageBotTokenInput, StorageBotTokenUpdate, StorageGroupMemberInput, StorageGroupMemberUpdate, StorageMediaFileInput, StorageMediaFileUpdate, StorageTelegramUserInput, StorageBroadcastInput, StorageBroadcastUpdate, StorageBroadcastResultInput, StorageBroadcastCampaignInput, StorageBroadcastCampaignUpdate, StorageBotEnvVariableInput, StorageBotEnvVariableUpdate, StorageBotTableInput, StorageBotTableColumnInput, StorageBotTableRowInput, StorageWorkerProcessInput } from "../storages/storageTypes";
+import { db } from "./db";
+import { generateAgentToken, hashAgentToken } from "../utils/agent-token-crypto";
+import { incrementMessageActivityDaily } from "./incrementMessageActivityDaily";
+import { markUserActivityDaily } from "../routes/users/mark-user-activity-daily";
+import { resolveLaunchIdsForLogs, mergeLogsByTimestampAsc } from "../bots/selectLatestLaunchLogs";
+
+/**
+ * Реализация хранилища данных с использованием базы данных
+ * Предоставляет методы для работы с проектами, шаблонами, токенами и другими данными в базе данных
+ */
+
+export class DatabaseStorage implements IStorage {
+  protected db = db;
+
+  // Bot Projects
+  /**
+   * Получить проект бота по ID из базы данных
+   * @param id - ID проекта
+   * @returns Проект бота или undefined, если не найден
+   */
+  async getBotProject(id: number): Promise<BotProject | undefined> {
+    const [project] = await this.db.select().from(botProjects).where(eq(botProjects.id, id));
+    return project || undefined;
+  }
+
+  /**
+   * Получить все проекты ботов из базы данных
+   * @returns Массив проектов ботов
+   */
+  async getAllBotProjects(): Promise<BotProject[]> {
+    return await this.db.select().from(botProjects).orderBy(asc(botProjects.sortOrder), desc(botProjects.updatedAt));
+  }
+
+  /**
+   * Создать новый проект бота в базе данных
+   * @param insertProject - Данные для создания проекта
+   * @returns Созданный проект бота
+   */
+  async createBotProject(insertProject: StorageBotProjectInput): Promise<BotProject> {
+    const [project] = await this.db
+      .insert(botProjects)
+      .values({
+        ...insertProject,
+        data: insertProject.data ?? {} // Убедимся, что поле data всегда присутствует
+      })
+      .returning();
+    return project;
+  }
+
+  /**
+   * Обновить проект бота в базе данных
+   * @param id - ID проекта
+   * @param updateData - Данные для обновления
+   * @returns Обновленный проект бота или undefined, если не найден
+   */
+  async updateBotProject(id: number, updateData: StorageBotProjectUpdate): Promise<BotProject | undefined> {
+    const { restartOnUpdate: _restartOnUpdate, ...projectUpdate } = updateData;
+    const [project] = await this.db
+      .update(botProjects)
+      .set({ ...projectUpdate, updatedAt: new Date() })
+      .where(eq(botProjects.id, id))
+      .returning();
+    return project || undefined;
+  }
+  /**
+   * Переупорядочивает проекты: sortOrder = индекс в массиве ID.
+   * Вызывающий обязан заранее проверить доступ ко всем ID (см. reorderProjectsHandler).
+   * @param projectIds - ID проектов в желаемом порядке
+   */
+  async reorderBotProjects(projectIds: number[]): Promise<void> {
+    await Promise.all(
+      projectIds.map((id, index) =>
+        this.db.update(botProjects).set({ sortOrder: index }).where(eq(botProjects.id, id))
+      )
+    );
+  }
+
+  /**
+   * Удалить проект бота из базы данных
+   * @param id - ID проекта
+   * @returns true, если проект был удален, иначе false
+   */
+  async deleteBotProject(id: number): Promise<boolean> {
+    const result = await this.db.delete(botProjects).where(eq(botProjects.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  // Bot Instances
+  /**
+   * Получить экземпляр бота по ID проекта из базы данных
+   * @param projectId - ID проекта
+   * @returns Экземпляр бота или undefined, если не найден
+   */
+  async getBotInstance(projectId: number): Promise<BotInstance | undefined> {
+    const [instance] = await this.db.select().from(botInstances).where(eq(botInstances.projectId, projectId));
+    return instance || undefined;
+  }
+
+  /**
+   * Получить экземпляр бота по ID токена из базы данных
+   * @param tokenId - ID токена
+   * @returns Экземпляр бота или undefined, если не найден
+   */
+  async getBotInstanceByToken(tokenId: number): Promise<BotInstance | undefined> {
+    const [instance] = await this.db.select().from(botInstances).where(eq(botInstances.tokenId, tokenId));
+    return instance || undefined;
+  }
+
+  /**
+   * Получить все экземпляры ботов по ID проекта из базы данных
+   * @param projectId - ID проекта
+   * @returns Массив экземпляров ботов
+   */
+  async getBotInstancesByProject(projectId: number): Promise<BotInstance[]> {
+    return await this.db.select().from(botInstances).where(eq(botInstances.projectId, projectId));
+  }
+
+  /**
+   * Получить все экземпляры ботов из базы данных
+   * @returns Массив всех экземпляров ботов
+   */
+  async getAllBotInstances(): Promise<BotInstance[]> {
+    return await this.db.select().from(botInstances).orderBy(desc(botInstances.startedAt));
+  }
+
+  /**
+   * Создать новый экземпляр бота в базе данных
+   * @param insertInstance - Данные для создания экземпляра
+   * @returns Созданный экземпляр бота
+   */
+  async createBotInstance(insertInstance: StorageBotInstanceInput): Promise<BotInstance> {
+    const [instance] = await this.db
+      .insert(botInstances)
+      .values(insertInstance)
+      .returning();
+    return instance;
+  }
+
+  /**
+   * Обновить экземпляр бота в базе данных
+   * @param id - ID экземпляра
+   * @param updateData - Данные для обновления
+   * @returns Обновленный экземпляр бота или undefined, если не найден
+   */
+  async updateBotInstance(id: number, updateData: StorageBotInstanceUpdate): Promise<BotInstance | undefined> {
+    const [instance] = await this.db
+      .update(botInstances)
+      .set(updateData)
+      .where(eq(botInstances.id, id))
+      .returning();
+    return instance || undefined;
+  }
+
+  /**
+   * Удалить экземпляр бота из базы данных
+   * @param id - ID экземпляра
+   * @returns true, если экземпляр был удален, иначе false
+   */
+  async deleteBotInstance(id: number): Promise<boolean> {
+    const result = await this.db.delete(botInstances).where(eq(botInstances.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Остановить экземпляр бота по ID проекта в базе данных
+   * @param projectId - ID проекта
+   * @returns true, если экземпляр был остановлен, иначе false
+   */
+  async stopBotInstance(projectId: number): Promise<boolean> {
+    const result = await this.db
+      .update(botInstances)
+      .set({ status: 'stopped', stoppedAt: new Date() })
+      .where(eq(botInstances.projectId, projectId));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Остановить экземпляр бота по ID токена в базе данных
+   * @param tokenId - ID токена
+   * @returns true, если экземпляр был остановлен, иначе false
+   */
+  async stopBotInstanceByToken(tokenId: number): Promise<boolean> {
+    const result = await this.db
+      .update(botInstances)
+      .set({ status: 'stopped', stoppedAt: new Date(), errorMessage: null })
+      .where(eq(botInstances.tokenId, tokenId));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  // Bot Templates
+  /**
+   * Получить сценарий бота по ID из базы данных
+   * @param id - ID сценария
+   * @returns Сценарий бота или undefined, если не найден
+   */
+  async getBotTemplate(id: number): Promise<BotTemplate | undefined> {
+    const [template] = await this.db.select().from(botTemplates).where(eq(botTemplates.id, id));
+    return template || undefined;
+  }
+
+  /**
+   * Получить все сценарии ботов из базы данных
+   * @returns Массив сценариев ботов
+   */
+  async getAllBotTemplates(): Promise<BotTemplate[]> {
+    return await this.db.select().from(botTemplates).orderBy(desc(botTemplates.createdAt));
+  }
+
+  /**
+   * Создать новый сценарий бота в базе данных
+   * @param insertTemplate - Данные для создания сценария
+   * @returns Созданный сценарий бота
+   */
+  async createBotTemplate(insertTemplate: StorageBotTemplateInput): Promise<BotTemplate> {
+    const [template] = await this.db
+      .insert(botTemplates)
+      .values(insertTemplate)
+      .returning();
+    return template;
+  }
+
+  /**
+   * Обновить сценарий бота в базе данных
+   * @param id - ID сценария
+   * @param updateData - Данные для обновления
+   * @returns Обновленный сценарий бота или undefined, если не найден
+   */
+  async updateBotTemplate(id: number, updateData: StorageBotTemplateUpdate): Promise<BotTemplate | undefined> {
+    const [template] = await this.db
+      .update(botTemplates)
+      .set({ ...updateData, updatedAt: new Date() })
+      .where(eq(botTemplates.id, id))
+      .returning();
+    return template || undefined;
+  }
+
+  /**
+   * Удалить сценарий бота из базы данных
+   * @param id - ID сценария
+   * @returns true, если сценарий был удален, иначе false
+   */
+  async deleteBotTemplate(id: number): Promise<boolean> {
+    const result = await this.db.delete(botTemplates).where(eq(botTemplates.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Увеличить счетчик использования сценария в базе данных
+   * @param id - ID сценария
+   * @returns true, если счетчик был увеличен, иначе false
+   */
+  async incrementTemplateUseCount(id: number): Promise<boolean> {
+    const [template] = await this.db.select().from(botTemplates).where(eq(botTemplates.id, id));
+    if (!template) return false;
+
+    const result = await this.db
+      .update(botTemplates)
+      .set({
+        useCount: (template.useCount || 0) + 1,
+        lastUsedAt: new Date()
+      })
+      .where(eq(botTemplates.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Увеличить счетчик просмотров сценария в базе данных
+   * @param id - ID сценария
+   * @returns true, если счетчик был увеличен, иначе false
+   */
+  async incrementTemplateViewCount(id: number): Promise<boolean> {
+    const [template] = await this.db.select().from(botTemplates).where(eq(botTemplates.id, id));
+    if (!template) return false;
+
+    const result = await this.db
+      .update(botTemplates)
+      .set({
+        viewCount: (template.viewCount || 0) + 1
+      })
+      .where(eq(botTemplates.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Увеличить счетчик загрузок сценария в базе данных
+   * @param id - ID сценария
+   * @returns true, если счетчик был увеличен, иначе false
+   */
+  async incrementTemplateDownloadCount(id: number): Promise<boolean> {
+    const [template] = await this.db.select().from(botTemplates).where(eq(botTemplates.id, id));
+    if (!template) return false;
+
+    const result = await this.db
+      .update(botTemplates)
+      .set({
+        downloadCount: (template.downloadCount || 0) + 1
+      })
+      .where(eq(botTemplates.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Переключить лайк сценария в базе данных
+   * @param id - ID сценария
+   * @param liked - true для лайка, false для анлайка
+   * @returns true, если статус лайка был изменен, иначе false
+   */
+  async toggleTemplateLike(id: number, liked: boolean): Promise<boolean> {
+    const [template] = await this.db.select().from(botTemplates).where(eq(botTemplates.id, id));
+    if (!template) return false;
+
+    const current = template.likeCount || 0;
+    const newCount = liked ? current + 1 : Math.max(0, current - 1);
+
+    const result = await this.db
+      .update(botTemplates)
+      .set({
+        likeCount: newCount
+      })
+      .where(eq(botTemplates.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Переключить закладку сценария в базе данных
+   * @param id - ID сценария
+   * @param bookmarked - true для добавления в закладки, false для удаления
+   * @returns true, если статус закладки был изменен, иначе false
+   */
+  async toggleTemplateBookmark(id: number, bookmarked: boolean): Promise<boolean> {
+    const [template] = await this.db.select().from(botTemplates).where(eq(botTemplates.id, id));
+    if (!template) return false;
+
+    const current = template.bookmarkCount || 0;
+    const newCount = bookmarked ? current + 1 : Math.max(0, current - 1);
+
+    const result = await this.db
+      .update(botTemplates)
+      .set({
+        bookmarkCount: newCount
+      })
+      .where(eq(botTemplates.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Оценить сценарий в базе данных
+   * @param id - ID сценария
+   * @param rating - Оценка (обычно от 1 до 5)
+   * @returns true, если оценка была сохранена, иначе false
+   */
+  async rateTemplate(id: number, rating: number): Promise<boolean> {
+    const [template] = await this.db.select().from(botTemplates).where(eq(botTemplates.id, id));
+    if (!template) return false;
+
+    const currentRating = template.rating || 0;
+    const currentRatingCount = template.ratingCount || 0;
+    const newRatingCount = currentRatingCount + 1;
+    const newRating = Math.round(((currentRating * currentRatingCount) + rating) / newRatingCount);
+
+    const result = await this.db
+      .update(botTemplates)
+      .set({
+        rating: newRating,
+        ratingCount: newRatingCount,
+        updatedAt: new Date()
+      })
+      .where(eq(botTemplates.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Получить рекомендуемые сценарии из базы данных
+   * @returns Массив рекомендованных сценариев
+   */
+  async getFeaturedTemplates(): Promise<BotTemplate[]> {
+    return await this.db.select().from(botTemplates).where(eq(botTemplates.featured, 1)).orderBy(desc(botTemplates.rating));
+  }
+
+  /**
+   * Получить сценарии по категории из базы данных
+   * @param category - Категория сценариев
+   * @returns Массив сценариев указанной категории
+   */
+  async getTemplatesByCategory(category: string): Promise<BotTemplate[]> {
+    return await this.db.select().from(botTemplates).where(eq(botTemplates.category, category)).orderBy(desc(botTemplates.createdAt));
+  }
+
+  /**
+   * Поиск сценариев по запросу в базе данных
+   * @param query - Поисковый запрос
+   * @returns Массив найденных сценариев
+   */
+  async searchTemplates(query: string): Promise<BotTemplate[]> {
+    const searchTerm = `%${query.toLowerCase()}%`;
+    return await this.db.select().from(botTemplates).where(
+      or(
+        ilike(botTemplates.name, searchTerm),
+        ilike(botTemplates.description, searchTerm)
+      )
+    ).orderBy(desc(botTemplates.rating));
+  }
+
+  // Bot Tokens
+  /**
+   * Получить токен бота по ID из базы данных
+   * @param id - ID токена
+   * @returns Токен бота или undefined, если не найден
+   */
+  async getBotToken(id: number): Promise<BotToken | undefined> {
+    const [token] = await this.db.select().from(botTokens).where(eq(botTokens.id, id));
+    return token || undefined;
+  }
+
+  /**
+   * Получить токены ботов по ID проекта из базы данных
+   * @param projectId - ID проекта
+   * @returns Массив токенов ботов
+   */
+  async getBotTokensByProject(projectId: number): Promise<BotToken[]> {
+    return await this.db.select().from(botTokens)
+      .where(eq(botTokens.projectId, projectId))
+      .orderBy(desc(botTokens.isDefault), desc(botTokens.createdAt));
+  }
+
+  /**
+   * Получить токен бота по умолчанию для проекта из базы данных
+   * @param projectId - ID проекта
+   * @returns Токен бота по умолчанию или undefined, если не найден
+   */
+  async getDefaultBotToken(projectId: number): Promise<BotToken | undefined> {
+    const [token] = await this.db.select().from(botTokens)
+      .where(and(eq(botTokens.projectId, projectId), eq(botTokens.isDefault, 1)))
+      .orderBy(desc(botTokens.createdAt));
+    if (token) return token;
+    // Fallback: берём любой токен проекта если нет дефолтного
+    const [anyToken] = await this.db.select().from(botTokens)
+      .where(eq(botTokens.projectId, projectId))
+      .orderBy(desc(botTokens.createdAt));
+    return anyToken || undefined;
+  }
+
+  /**
+   * Создать новый токен бота в базе данных
+   * @param insertToken - Данные для создания токена
+   * @returns Созданный токен бота
+   */
+  async createBotToken(insertToken: StorageBotTokenInput): Promise<BotToken> {
+    if (insertToken.isDefault === 1) {
+      await this.db.update(botTokens)
+        .set({ isDefault: 0 })
+        .where(eq(botTokens.projectId, insertToken.projectId));
+    }
+
+    const [token] = await this.db
+      .insert(botTokens)
+      .values(insertToken)
+      .returning();
+    return token;
+  }
+
+  /**
+   * Обновить токен бота в базе данных
+   * @param id - ID токена
+   * @param updateData - Данные для обновления
+   * @returns Обновленный токен бота или undefined, если не найден
+   */
+  async updateBotToken(id: number, updateData: StorageBotTokenUpdate): Promise<BotToken | undefined> {
+    if (updateData.isDefault === 1) {
+      const [currentToken] = await this.db.select().from(botTokens).where(eq(botTokens.id, id));
+      if (currentToken) {
+        await this.db.update(botTokens)
+          .set({ isDefault: 0 })
+          .where(eq(botTokens.projectId, currentToken.projectId));
+      }
+    }
+
+    const [token] = await this.db
+      .update(botTokens)
+      .set({ ...updateData, updatedAt: new Date() })
+      .where(eq(botTokens.id, id))
+      .returning();
+    return token || undefined;
+  }
+
+  /**
+   * Удалить токен бота из базы данных
+   * @param id - ID токена
+   * @returns true, если токен был удален, иначе false
+   */
+  async deleteBotToken(id: number): Promise<boolean> {
+    const result = await this.db.delete(botTokens).where(eq(botTokens.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Установить токен бота по умолчанию для проекта в базе данных
+   * @param projectId - ID проекта
+   * @param tokenId - ID токена
+   * @returns true, если токен был установлен по умолчанию, иначе false
+   */
+  async setDefaultBotToken(projectId: number, tokenId: number): Promise<boolean> {
+    await this.db.update(botTokens)
+      .set({ isDefault: 0 })
+      .where(eq(botTokens.projectId, projectId));
+
+    const result = await this.db.update(botTokens)
+      .set({ isDefault: 1 })
+      .where(eq(botTokens.id, tokenId));
+
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Отметить токен как использованный в базе данных
+   * @param id - ID токена
+   * @returns true, если токен был отмечен как использованный, иначе false
+   */
+  async markTokenAsUsed(id: number): Promise<boolean> {
+    const result = await this.db.update(botTokens)
+      .set({ lastUsedAt: new Date() })
+      .where(eq(botTokens.id, id));
+
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  // User-specific methods (DbStorage)
+  /**
+   * Получить проекты ботов пользователя: где он владелец или коллаборатор
+   * @param ownerId - ID пользователя
+   * @param options - Фильтр личного архива (по умолчанию — только активные)
+   * @returns Массив проектов ботов пользователя (владелец + коллаборатор)
+   */
+  async getUserBotProjects(
+    ownerId: number,
+    options?: { archived?: boolean; ignoreArchive?: boolean },
+  ): Promise<BotProject[]> {
+    const collaboratorProjects = this.db
+      .select({ projectId: projectCollaborators.projectId })
+      .from(projectCollaborators)
+      .where(eq(projectCollaborators.userId, ownerId));
+
+    const accessCondition = or(
+      eq(botProjects.ownerId, ownerId),
+      inArray(botProjects.id, collaboratorProjects),
+    );
+
+    if (options?.ignoreArchive) {
+      return await this.db.select().from(botProjects)
+        .where(accessCondition)
+        .orderBy(desc(botProjects.createdAt));
+    }
+
+    const showArchived = options?.archived ?? false;
+
+    if (showArchived) {
+      const rows = await this.db
+        .select({ project: botProjects })
+        .from(botProjects)
+        .innerJoin(
+          userProjectArchives,
+          and(
+            eq(userProjectArchives.projectId, botProjects.id),
+            eq(userProjectArchives.userId, ownerId),
+          ),
+        )
+        .where(accessCondition)
+        .orderBy(desc(botProjects.createdAt));
+      return rows.map((row) => row.project);
+    }
+
+    const rows = await this.db
+      .select({ project: botProjects })
+      .from(botProjects)
+      .leftJoin(
+        userProjectArchives,
+        and(
+          eq(userProjectArchives.projectId, botProjects.id),
+          eq(userProjectArchives.userId, ownerId),
+        ),
+      )
+      .where(and(accessCondition, isNull(userProjectArchives.userId)))
+      .orderBy(desc(botProjects.createdAt));
+    return rows.map((row) => row.project);
+  }
+
+  /**
+   * Помещает проект в личный архив пользователя
+   * @param userId - ID пользователя Telegram
+   * @param projectId - ID проекта
+   */
+  async archiveProjectForUser(userId: number, projectId: number): Promise<void> {
+    await this.db
+      .insert(userProjectArchives)
+      .values({ userId, projectId })
+      .onConflictDoUpdate({
+        target: [userProjectArchives.userId, userProjectArchives.projectId],
+        set: { archivedAt: sql`now()` },
+      });
+  }
+
+  /**
+   * Убирает проект из личного архива пользователя
+   * @param userId - ID пользователя Telegram
+   * @param projectId - ID проекта
+   */
+  async unarchiveProjectForUser(userId: number, projectId: number): Promise<void> {
+    await this.db
+      .delete(userProjectArchives)
+      .where(
+        and(
+          eq(userProjectArchives.userId, userId),
+          eq(userProjectArchives.projectId, projectId),
+        ),
+      );
+  }
+
+  /**
+   * Проверяет, находится ли проект в личном архиве пользователя
+   * @param userId - ID пользователя Telegram
+   * @param projectId - ID проекта
+   * @returns true, если проект заархивирован для пользователя
+   */
+  async isProjectArchivedForUser(userId: number, projectId: number): Promise<boolean> {
+    const [row] = await this.db
+      .select({ userId: userProjectArchives.userId })
+      .from(userProjectArchives)
+      .where(
+        and(
+          eq(userProjectArchives.userId, userId),
+          eq(userProjectArchives.projectId, projectId),
+        ),
+      )
+      .limit(1);
+    return Boolean(row);
+  }
+
+  /**
+   * Получить гостевые проекты ботов (без владельца) из базы данных
+   * @returns Массив гостевых проектов ботов (только с sessionId = NULL)
+   */
+  async getGuestBotProjects(): Promise<BotProject[]> {
+    return await this.db.select().from(botProjects)
+      .where(and(isNull(botProjects.ownerId), isNull(botProjects.sessionId)))
+      .orderBy(desc(botProjects.createdAt));
+  }
+
+  /**
+   * Получить все гостевые проекты (owner_id IS NULL) независимо от sessionId.
+   * Используется для публичного доступа — например из Telegram-бота.
+   * @returns Массив всех гостевых проектов
+   */
+  async getAllGuestBotProjects(): Promise<BotProject[]> {
+    return await this.db.select().from(botProjects)
+      .where(isNull(botProjects.ownerId))
+      .orderBy(desc(botProjects.createdAt));
+  }
+
+  /**
+   * Получить гостевые проекты по ID сессии
+   * Возвращает проекты конкретной сессии + старые общие (sessionId = NULL)
+   * @param sessionId - ID сессии гостевого пользователя
+   * @returns Массив гостевых проектов доступных для данной сессии
+   */
+  async getGuestBotProjectsBySession(sessionId: string): Promise<BotProject[]> {
+    return await this.db.select().from(botProjects)
+      .where(and(
+        isNull(botProjects.ownerId),
+        or(eq(botProjects.sessionId, sessionId), isNull(botProjects.sessionId))
+      ))
+      .orderBy(desc(botProjects.createdAt));
+  }
+
+  /**
+   * Переносит гостевые проекты сессии к авторизованному пользователю
+   * @param sessionId - ID сессии гостя
+   * @param ownerId - ID нового владельца
+   */
+  async migrateGuestProjects(sessionId: string, ownerId: number): Promise<void> {
+    await this.db.update(botProjects)
+      .set({ ownerId, sessionId: null })
+      .where(and(eq(botProjects.sessionId, sessionId), isNull(botProjects.ownerId)));
+  }
+
+  /**
+   * Переносит ВСЕ гостевые проекты (owner_id IS NULL) к пользователю.
+   * Используется в dev-режиме для восстановления проектов после перезапуска сервера.
+   * @param ownerId - ID нового владельца
+   */
+  async migrateAllGuestProjects(ownerId: number): Promise<void> {
+    await this.db.update(botProjects)
+      .set({ ownerId, sessionId: null })
+      .where(isNull(botProjects.ownerId));
+  }
+
+  // Agent Tokens (персональные токены агента, PAT)
+  /**
+   * Создать персональный токен агента для владельца.
+   * Генерирует секрет, сохраняет только его хеш/префикс и возвращает полный токен один раз.
+   * @param ownerId - ID владельца токена
+   * @param label - Пользовательское имя токена
+   * @param scopes - Права токена через запятую (по умолчанию read,write)
+   * @param expiresAt - Дата истечения токена (null — бессрочный)
+   * @returns Полный токен и сохранённая запись
+   */
+  async createAgentToken(ownerId: number, label: string, scopes: string = "read,write", expiresAt: Date | null = null): Promise<{ token: string; record: AgentToken }> {
+    const { token, prefix, tokenHash } = generateAgentToken();
+    const [record] = await this.db.insert(agentTokens).values({
+      ownerId,
+      label,
+      tokenHash,
+      prefix,
+      scopes,
+      expiresAt: expiresAt ?? null,
+    }).returning();
+    return { token, record };
+  }
+
+  /**
+   * Получить список токенов агента владельца (метаданные, без секрета).
+   * @param ownerId - ID владельца токенов
+   * @returns Массив записей токенов, новые сверху
+   */
+  async getAgentTokensByOwner(ownerId: number): Promise<AgentToken[]> {
+    return await this.db.select().from(agentTokens)
+      .where(eq(agentTokens.ownerId, ownerId))
+      .orderBy(desc(agentTokens.createdAt));
+  }
+
+  /**
+   * Отозвать токен агента (проставить revokedAt) по id и владельцу.
+   * @param id - ID токена
+   * @param ownerId - ID владельца (защита от отзыва чужого токена)
+   * @returns true, если токен был отозван, иначе false
+   */
+  async revokeAgentToken(id: number, ownerId: number): Promise<boolean> {
+    const result = await this.db.update(agentTokens)
+      .set({ revokedAt: new Date() })
+      .where(and(eq(agentTokens.id, id), eq(agentTokens.ownerId, ownerId), isNull(agentTokens.revokedAt)));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Резолвит сырой токен агента в личность владельца.
+   * Хеширует токен, ищет активную (не отозванную) запись, проверяет срок действия,
+   * обновляет lastUsedAt и возвращает владельца.
+   * @param rawToken - Сырой секрет токена из заголовка Authorization
+   * @returns Владелец токена или undefined, если токен невалиден
+   */
+  async resolveAgentToken(rawToken: string): Promise<TelegramUserDB | undefined> {
+    const resolved = await this.resolveAgentTokenAuth(rawToken);
+    return resolved?.user;
+  }
+
+  /**
+   * Резолвит PAT в владельца и scopes (для bot_manager и т.п.).
+   * @param rawToken - Сырой секрет из Authorization
+   * @returns user + scopes или undefined
+   */
+  async resolveAgentTokenAuth(
+    rawToken: string,
+  ): Promise<{ user: TelegramUserDB; scopes: string } | undefined> {
+    const tokenHash = hashAgentToken(rawToken);
+    const [record] = await this.db.select().from(agentTokens)
+      .where(and(eq(agentTokens.tokenHash, tokenHash), isNull(agentTokens.revokedAt)));
+    if (!record) return undefined;
+
+    if (record.expiresAt && record.expiresAt.getTime() < Date.now()) {
+      return undefined;
+    }
+
+    await this.db.update(agentTokens)
+      .set({ lastUsedAt: new Date() })
+      .where(eq(agentTokens.id, record.id));
+
+    const user = await this.getTelegramUser(record.ownerId);
+    if (!user) return undefined;
+    return { user, scopes: record.scopes };
+  }
+
+  /**
+   * Получить токены ботов пользователя из базы данных
+   * @param ownerId - ID владельца
+   * @param projectId - Опциональный ID проекта для фильтрации
+   * @returns Массив токенов ботов пользователя
+   */
+  async getUserBotTokens(ownerId: number, projectId?: number): Promise<BotToken[]> {
+    let query = this.db.select().from(botTokens)
+      .innerJoin(botProjects, eq(botTokens.projectId, botProjects.id))
+      .where(eq(botProjects.ownerId, ownerId)) as any;
+
+    if (projectId) {
+      query = query.where(eq(botTokens.projectId, projectId));
+    }
+
+    const results = await query.orderBy(desc(botTokens.createdAt));
+    return results.map((r: any) => r.bot_tokens);
+  }
+
+  /**
+   * Получить сценарии ботов пользователя из базы данных
+   * @param ownerId - ID владельца
+   * @returns Массив сценариев ботов пользователя
+   */
+  async getUserBotTemplates(ownerId: number): Promise<BotTemplate[]> {
+    return await this.db.select().from(botTemplates)
+      .where(eq(botTemplates.ownerId, ownerId))
+      .orderBy(desc(botTemplates.createdAt));
+  }
+
+  // Telegram Users
+  /**
+   * Получить пользователя Telegram по ID из базы данных
+   * @param id - ID пользователя
+   * @returns Пользователь Telegram или undefined, если не найден
+   */
+  async getTelegramUser(id: number): Promise<TelegramUserDB | undefined> {
+    const [user] = await this.db.select().from(telegramUsers).where(eq(telegramUsers.id, id));
+    return user || undefined;
+  }
+
+  /**
+   * Получить пользователя Telegram или создать нового в базе данных
+   * @param userData - Данные пользователя для создания
+   * @returns Пользователь Telegram
+   */
+  async getTelegramUserOrCreate(userData: StorageTelegramUserInput): Promise<TelegramUserDB> {
+    // Попробуем найти существующего пользователя
+    const existingUser = await this.getTelegramUser(userData.id);
+
+    if (existingUser) {
+      // Обновляем информацию о пользователе
+      const [updated] = await this.db.update(telegramUsers)
+        .set({
+          firstName: userData.firstName,
+          lastName: userData.lastName ?? null,
+          username: userData.username ?? null,
+          photoUrl: userData.photoUrl ?? null,
+          authDate: userData.authDate ?? null,
+          updatedAt: new Date(),
+        })
+        .where(eq(telegramUsers.id, userData.id))
+        .returning();
+      return updated;
+    }
+
+    // Создаём нового пользователя
+    const [newUser] = await this.db.insert(telegramUsers)
+      .values({
+        id: userData.id,
+        firstName: userData.firstName,
+        lastName: userData.lastName ?? null,
+        username: userData.username ?? null,
+        photoUrl: userData.photoUrl ?? null,
+        authDate: userData.authDate ?? null,
+      })
+      .returning();
+    return newUser;
+  }
+
+  /**
+   * Удалить пользователя Telegram из базы данных
+   * @param id - ID пользователя
+   * @returns true, если пользователь был удален, иначе false
+   */
+  async deleteTelegramUser(id: number): Promise<boolean> {
+    const result = await this.db.delete(telegramUsers).where(eq(telegramUsers.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  // Media Files
+  /**
+   * Получить медиафайл по ID из базы данных
+   * @param id - ID файла
+   * @returns Медиафайл или undefined, если не найден
+   */
+  async getMediaFile(id: number): Promise<MediaFile | undefined> {
+    const [file] = await this.db.select().from(mediaFiles).where(eq(mediaFiles.id, id));
+    return file || undefined;
+  }
+
+  /**
+   * Получить медиафайлы по ID проекта из базы данных
+   * @param projectId - ID проекта
+   * @returns Массив медиафайлов проекта
+   */
+  async getMediaFilesByProject(projectId: number): Promise<MediaFile[]> {
+    return await this.db.select().from(mediaFiles)
+      .where(eq(mediaFiles.projectId, projectId))
+      .orderBy(desc(mediaFiles.createdAt));
+  }
+
+  /**
+   * Получить медиафайлы по ID проекта и типу файла из базы данных
+   * @param projectId - ID проекта
+   * @param fileType - Тип файла
+   * @returns Массив медиафайлов указанного типа
+   */
+  async getMediaFilesByType(projectId: number, fileType: string): Promise<MediaFile[]> {
+    return await this.db.select().from(mediaFiles)
+      .where(and(eq(mediaFiles.projectId, projectId), eq(mediaFiles.fileType, fileType)))
+      .orderBy(desc(mediaFiles.createdAt));
+  }
+
+  /**
+   * Получить медиафайлы по массиву URL и ID проекта из базы данных
+   * @param urls - Массив URL медиафайлов для поиска
+   * @param projectId - ID проекта
+   * @returns Массив найденных медиафайлов с заполненным telegramFileId
+   */
+  async getMediaFilesByUrls(urls: string[], projectId: number): Promise<MediaFile[]> {
+    if (!urls.length) return [];
+    return await this.db.select().from(mediaFiles)
+      .where(and(
+        eq(mediaFiles.projectId, projectId),
+        inArray(mediaFiles.url, urls)
+      ));
+  }
+
+  /**
+   * Создать новый медиафайл в базе данных
+   * @param insertFile - Данные для создания файла
+   * @returns Созданный медиафайл
+   */
+  async createMediaFile(insertFile: StorageMediaFileInput): Promise<MediaFile> {
+    const [file] = await this.db
+      .insert(mediaFiles)
+      .values(insertFile)
+      .returning();
+    return file;
+  }
+
+  /**
+   * Обновить медиафайл в базе данных
+   * @param id - ID файла
+   * @param updateData - Данные для обновления
+   * @returns Обновленный медиафайл или undefined, если не найден
+   */
+  async updateMediaFile(id: number, updateData: StorageMediaFileUpdate): Promise<MediaFile | undefined> {
+    const [file] = await this.db
+      .update(mediaFiles)
+      .set({ ...updateData, updatedAt: new Date() })
+      .where(eq(mediaFiles.id, id))
+      .returning();
+    return file || undefined;
+  }
+
+  /**
+   * Удалить медиафайл из базы данных
+   * @param id - ID файла
+   * @returns true, если файл был удален, иначе false
+   */
+  async deleteMediaFile(id: number): Promise<boolean> {
+    const result = await this.db.delete(mediaFiles).where(eq(mediaFiles.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Увеличить счетчик использования медиафайла в базе данных
+   * @param id - ID файла
+   * @returns true, если счетчик был увеличен, иначе false
+   */
+  async incrementMediaFileUsage(id: number): Promise<boolean> {
+    const [file] = await this.db.select().from(mediaFiles).where(eq(mediaFiles.id, id));
+    if (!file) return false;
+
+    const result = await this.db
+      .update(mediaFiles)
+      .set({
+        usageCount: (file.usageCount || 0) + 1,
+        updatedAt: new Date()
+      })
+      .where(eq(mediaFiles.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Поиск медиафайлов по проекту и запросу в базе данных
+   * @param projectId - ID проекта
+   * @param query - Поисковый запрос
+   * @returns Массив найденных медиафайлов
+   */
+  async searchMediaFiles(projectId: number, query: string): Promise<MediaFile[]> {
+    const searchTerm = `%${query.toLowerCase()}%`;
+    return await this.db.select().from(mediaFiles)
+      .where(
+        and(
+          eq(mediaFiles.projectId, projectId),
+          or(
+            ilike(mediaFiles.fileName, searchTerm),
+            ilike(mediaFiles.description, searchTerm)
+          )
+        )
+      )
+      .orderBy(desc(mediaFiles.usageCount), desc(mediaFiles.createdAt));
+  }
+
+  // Bot Groups
+  /**
+   * Получить группу бота по ID из базы данных
+   * @param id - ID группы
+   * @returns Группа бота или undefined, если не найдена
+   */
+  async getBotGroup(id: number): Promise<BotGroup | undefined> {
+    const [group] = await this.db.select().from(botGroups).where(eq(botGroups.id, id));
+    return group || undefined;
+  }
+
+  /**
+   * Получить группы проекта, опционально только для токена
+   * @param projectId - ID проекта
+   * @param tokenId - ID токена (если задан — только группы этого бота)
+   * @returns Массив групп бота
+   */
+  async getBotGroupsByProject(projectId: number, tokenId?: number | null): Promise<BotGroup[]> {
+    const conditions = [eq(botGroups.projectId, projectId)];
+    if (tokenId != null) {
+      conditions.push(eq(botGroups.tokenId, tokenId));
+    }
+    return await this.db.select().from(botGroups)
+      .where(and(...conditions))
+      .orderBy(desc(botGroups.createdAt));
+  }
+
+  /**
+   * Получить группу по проекту, Telegram group_id и опционально токену
+   * @param projectId - ID проекта
+   * @param groupId - Telegram chat_id
+   * @param tokenId - ID токена
+   * @returns Группа или undefined
+   */
+  async getBotGroupByProjectAndGroupId(
+    projectId: number,
+    groupId: string,
+    tokenId?: number | null,
+  ): Promise<BotGroup | undefined> {
+    const conditions = [eq(botGroups.projectId, projectId), eq(botGroups.groupId, groupId)];
+    if (tokenId != null) {
+      conditions.push(eq(botGroups.tokenId, tokenId));
+    }
+    const [group] = await this.db.select().from(botGroups)
+      .where(and(...conditions))
+      .limit(1);
+    return group || undefined;
+  }
+
+  /**
+   * Chat_id групповых чатов из bot_messages для токена
+   * @param projectId - ID проекта
+   * @param tokenId - ID токена
+   * @returns Список чатов
+   */
+  async listGroupChatsFromMessages(
+    projectId: number,
+    tokenId: number,
+  ): Promise<Array<{ groupId: string; chatType: string; nameHint: string }>> {
+    const rows = await this.db.execute(sql`
+      SELECT DISTINCT ON (chat_id)
+        chat_id AS "groupId",
+        COALESCE(chat_type, 'group') AS "chatType",
+        COALESCE(chat_id, 'Группа') AS "nameHint"
+      FROM bot_messages
+      WHERE project_id = ${projectId}
+        AND token_id = ${tokenId}
+        AND chat_type IN ('group', 'supergroup', 'channel')
+        AND chat_id IS NOT NULL
+      ORDER BY chat_id, created_at DESC
+    `);
+    return (rows.rows as Array<{ groupId: string; chatType: string; nameHint: string }>).map((r) => ({
+      groupId: String(r.groupId),
+      chatType: String(r.chatType || 'group'),
+      nameHint: String(r.nameHint || r.groupId),
+    }));
+  }
+
+  /**
+   * Создать новую группу бота в базе данных
+   * @param insertGroup - Данные для создания группы
+   * @returns Созданная группа бота
+   */
+  async createBotGroup(insertGroup: StorageBotGroupInput): Promise<BotGroup> {
+    const [group] = await this.db
+      .insert(botGroups)
+      .values(insertGroup)
+      .returning();
+    return group;
+  }
+
+  /**
+   * Обновить группу бота в базе данных
+   * @param id - ID группы
+   * @param updateData - Данные для обновления
+   * @returns Обновленная группа бота или undefined, если не найдена
+   */
+  async updateBotGroup(id: number, updateData: StorageBotGroupUpdate): Promise<BotGroup | undefined> {
+    const [group] = await this.db
+      .update(botGroups)
+      .set({ ...updateData, updatedAt: new Date() })
+      .where(eq(botGroups.id, id))
+      .returning();
+    return group || undefined;
+  }
+
+  /**
+   * Удалить группу бота из базы данных
+   * @param id - ID группы
+   * @returns true, если группа была удалена, иначе false
+   */
+  async deleteBotGroup(id: number): Promise<boolean> {
+    const result = await this.db.delete(botGroups).where(eq(botGroups.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  // Group members
+  /**
+   * Получить участников группы из базы данных
+   * @param groupId - ID группы
+   * @returns Массив участников группы
+   */
+  async getGroupMembers(groupId: number): Promise<GroupMember[]> {
+    return await this.db.select().from(groupMembers)
+      .where(eq(groupMembers.groupId, groupId))
+      .orderBy(desc(groupMembers.joinedAt));
+  }
+
+  /**
+   * Создать нового участника группы в базе данных
+   * @param insertMember - Данные для создания участника
+   * @returns Созданный участник группы
+   */
+  async createGroupMember(insertMember: StorageGroupMemberInput): Promise<GroupMember> {
+    const [member] = await this.db
+      .insert(groupMembers)
+      .values(insertMember)
+      .returning();
+    return member;
+  }
+
+  /**
+   * Обновить участника группы в базе данных
+   * @param id - ID участника
+   * @param updateData - Данные для обновления
+   * @returns Обновленный участник группы или undefined, если не найден
+   */
+  async updateGroupMember(id: number, updateData: StorageGroupMemberUpdate): Promise<GroupMember | undefined> {
+    const [member] = await this.db
+      .update(groupMembers)
+      .set({ ...updateData, updatedAt: new Date() })
+      .where(eq(groupMembers.id, id))
+      .returning();
+    return member || undefined;
+  }
+
+  /**
+   * Удалить участника группы из базы данных
+   * @param id - ID участника
+   * @returns true, если участник был удален, иначе false
+   */
+  async deleteGroupMember(id: number): Promise<boolean> {
+    const result = await this.db.delete(groupMembers).where(eq(groupMembers.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  // Bot messages
+  /**
+   * Создать новое сообщение бота в базе данных
+   * @param insertMessage - Данные для создания сообщения
+   * @returns Созданное сообщение бота
+   */
+  async createBotMessage(insertMessage: StorageBotMessageInput): Promise<BotMessage> {
+    const [message] = await this.db
+      .insert(botMessages)
+      .values(insertMessage)
+      .returning();
+
+    // Обновляем interaction_count и last_interaction в bot_users при каждом сохранении сообщения.
+    // Это необходимо чтобы /users/stats корректно считал totalInteractions через SUM(interaction_count).
+    // Обновляем только если запись пользователя существует (игнорируем ошибки — не блокируем сохранение).
+    try {
+      await this.db
+        .update(botUsers)
+        .set({
+          interactionCount: sql`${botUsers.interactionCount} + 1`,
+          lastInteraction: new Date(),
+        })
+        .where(
+          and(
+            eq(botUsers.projectId, insertMessage.projectId),
+            eq(botUsers.userId, Number(insertMessage.userId)),
+            ...(insertMessage.tokenId ? [eq(botUsers.tokenId, insertMessage.tokenId)] : []),
+          ),
+        );
+    } catch (err) {
+      console.warn('[createBotMessage] не удалось обновить interaction_count:', err);
+    }
+
+    // Дневной агрегат активности: +1, удаление сообщения его не уменьшает
+    try {
+      await incrementMessageActivityDaily({
+        projectId: insertMessage.projectId,
+        tokenId: insertMessage.tokenId,
+        messageType: insertMessage.messageType,
+      });
+    } catch (err) {
+      console.warn('[createBotMessage] не удалось обновить message_activity_daily:', err);
+    }
+
+    // Отметка «человек был активен сегодня» — только для входящих от пользователя
+    if (insertMessage.messageType === "user") {
+      try {
+        await markUserActivityDaily({
+          projectId: insertMessage.projectId,
+          tokenId: insertMessage.tokenId,
+          userId: insertMessage.userId,
+        });
+      } catch (err) {
+        console.warn('[createBotMessage] не удалось обновить user_activity_daily:', err);
+      }
+    }
+
+    return message;
+  }
+
+  /**
+   * Получить сообщения бота по проекту и пользователю из базы данных
+   * @param projectId - ID проекта
+   * @param userId - ID пользователя
+   * @param limit - Ограничение количества сообщений (по умолчанию 100)
+   * @returns Массив сообщений бота
+   */
+  async getBotMessages(
+    projectId: number,
+    userId: string,
+    limit: number = 100,
+    tokenId?: number | null
+  ): Promise<BotMessage[]> {
+    const conditions = [
+      eq(botMessages.projectId, projectId),
+      eq(botMessages.userId, userId),
+    ];
+
+    if (tokenId !== null && tokenId !== undefined) {
+      conditions.push(eq(botMessages.tokenId, tokenId));
+    }
+
+    return await this.db
+      .select()
+      .from(botMessages)
+      .where(and(...conditions))
+      .orderBy(asc(botMessages.createdAt))
+      .limit(limit);
+  }
+
+  /**
+   * Удалить сообщения бота по проекту и пользователю из базы данных
+   * @param projectId - ID проекта
+   * @param userId - ID пользователя
+   * @returns true, если сообщения были удалены, иначе false
+   */
+  async deleteBotMessages(projectId: number, userId: string, tokenId?: number | null): Promise<boolean> {
+    const conditions = [
+      eq(botMessages.projectId, projectId),
+      eq(botMessages.userId, userId),
+    ];
+
+    if (tokenId !== null && tokenId !== undefined) {
+      conditions.push(eq(botMessages.tokenId, tokenId));
+    }
+
+    const result = await this.db
+      .delete(botMessages)
+      .where(and(...conditions));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Удалить все сообщения бота по проекту из базы данных
+   * @param projectId - ID проекта
+   * @returns true, если сообщения были удалены, иначе false
+   */
+  async deleteAllBotMessages(projectId: number, tokenId?: number | null): Promise<boolean> {
+    const conditions = [eq(botMessages.projectId, projectId)];
+
+    if (tokenId !== null && tokenId !== undefined) {
+      conditions.push(eq(botMessages.tokenId, tokenId));
+    }
+
+    const result = await this.db
+      .delete(botMessages)
+      .where(and(...conditions));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  // Bot message media
+  /**
+   * Создать запись о медиафайле в сообщении бота в базе данных
+   * @param data - Данные для создания записи
+   * @returns Созданная запись о медиафайле
+   */
+  async createBotMessageMedia(data: StorageBotMessageMediaInput): Promise<BotMessageMedia> {
+    const [media] = await this.db
+      .insert(botMessageMedia)
+      .values(data)
+      .returning();
+    return media;
+  }
+
+  /**
+   * Получить медиафайлы сообщения из базы данных
+   * @param messageId - ID сообщения
+   * @returns Массив медиафайлов сообщения
+   */
+  async getMessageMedia(messageId: number): Promise<Array<MediaFile & { mediaKind: string; orderIndex: number; }>> {
+    const result = await this.db
+      .select({
+        id: mediaFiles.id,
+        projectId: mediaFiles.projectId,
+        fileName: mediaFiles.fileName,
+        fileType: mediaFiles.fileType,
+        filePath: mediaFiles.filePath,
+        fileSize: mediaFiles.fileSize,
+        mimeType: mediaFiles.mimeType,
+        url: mediaFiles.url,
+        description: mediaFiles.description,
+        tags: mediaFiles.tags,
+        isPublic: mediaFiles.isPublic,
+        usageCount: mediaFiles.usageCount,
+        createdAt: mediaFiles.createdAt,
+        updatedAt: mediaFiles.updatedAt,
+        mediaKind: botMessageMedia.mediaKind,
+        orderIndex: sql<number> `COALESCE(${botMessageMedia.orderIndex}, 0)`.as('orderIndex'),
+      })
+      .from(botMessageMedia)
+      .innerJoin(mediaFiles, eq(botMessageMedia.mediaFileId, mediaFiles.id))
+      .where(eq(botMessageMedia.messageId, messageId))
+      .orderBy(asc(botMessageMedia.orderIndex));
+
+    return result;
+  }
+
+  /**
+   * Получить сообщения бота с медиа по проекту и пользователю из базы данных
+   * @param projectId - ID проекта
+   * @param userId - ID пользователя
+   * @param limit - Ограничение количества сообщений (по умолчанию 100)
+   * @param order - Порядок сортировки: 'asc' или 'desc' (по умолчанию 'asc')
+   * @param messageType - Тип сообщения: 'user' или 'bot' (опционально)
+   * @returns Массив сообщений бота с медиафайлами
+   */
+  async getBotMessagesWithMedia(
+    projectId: number,
+    userId: string,
+    limit: number = 100,
+    order: 'asc' | 'desc' = 'asc',
+    messageType?: 'user' | 'bot',
+    tokenId?: number | null
+  ): Promise<(BotMessage & { media?: Array<MediaFile & { mediaKind: string; orderIndex: number; }> | undefined; })[]> {
+    const whereConditions = [
+      eq(botMessages.projectId, projectId),
+      eq(botMessages.userId, userId),
+      // Личный диалог — только сообщения из приватного чата, без групповых
+      eq(botMessages.chatType, 'private'),
+    ];
+
+    if (tokenId !== null && tokenId !== undefined) {
+      whereConditions.push(eq(botMessages.tokenId, tokenId));
+    }
+    
+    if (messageType) {
+      whereConditions.push(eq(botMessages.messageType, messageType));
+    }
+    
+    const messages = await this.db
+      .select()
+      .from(botMessages)
+      .where(and(...whereConditions))
+      .orderBy(order === 'desc' ? desc(botMessages.createdAt) : asc(botMessages.createdAt))
+      .limit(limit);
+
+    const messagesWithMedia = await Promise.all(
+      messages.map(async (message) => {
+        const media = await this.getMessageMedia(message.id);
+        return {
+          ...message,
+          media: media.length > 0 ? media : undefined,
+        };
+      })
+    );
+
+    return messagesWithMedia;
+  }
+
+  /**
+   * Получить сообщения группового чата по project_id и chat_id
+   * @param projectId - ID проекта
+   * @param chatId - Telegram chat_id группы
+   * @param limit - Ограничение количества сообщений (по умолчанию 100)
+   * @param tokenId - Опциональный ID токена для фильтрации
+   * @returns Массив сообщений с медиа, отсортированных по убыванию даты
+   */
+  async getGroupChatMessages(
+    projectId: number,
+    chatId: string,
+    limit: number = 100,
+    tokenId?: number | null
+  ): Promise<(BotMessage & { media?: Array<MediaFile & { mediaKind: string; orderIndex: number }> })[]> {
+    const whereConditions = [
+      eq(botMessages.projectId, projectId),
+      eq(botMessages.chatId, chatId),
+    ];
+
+    if (tokenId !== null && tokenId !== undefined) {
+      whereConditions.push(eq(botMessages.tokenId, tokenId));
+    }
+
+    const messages = await this.db
+      .select()
+      .from(botMessages)
+      .where(and(...whereConditions))
+      .orderBy(desc(botMessages.createdAt))
+      .limit(limit);
+
+    const messagesWithMedia = await Promise.all(
+      messages.map(async (message) => {
+        const media = await this.getMessageMedia(message.id);
+        return {
+          ...message,
+          media: media.length > 0 ? media : undefined,
+        };
+      })
+    );
+
+    return messagesWithMedia;
+  }
+
+  /**
+   * Сохранить батч записей логов бота в базу данных
+   * @param logs - Массив записей для вставки
+   * @returns Promise<void>
+   */
+  async saveBotLogs(logs: StorageBotLogInput[]): Promise<void> {
+    if (logs.length === 0) return;
+    await this.db.insert(botLogs).values(logs);
+  }
+
+  /**
+   * Получить одну запись лога по ID
+   * @param id - ID записи в bot_logs
+   * @returns Запись лога или undefined
+   */
+  async getBotLogById(id: number): Promise<BotLog | undefined> {
+    const [row] = await this.db
+      .select()
+      .from(botLogs)
+      .where(eq(botLogs.id, id))
+      .limit(1);
+    return row;
+  }
+
+  /**
+   * Получить последние N строк логов бота из базы данных
+   * @param projectId - Идентификатор проекта
+   * @param tokenId - Идентификатор токена
+   * @param limit - Максимальное количество строк (по умолчанию 500)
+   * @returns Массив записей логов, отсортированных по времени ASC
+   */
+  async getBotLogs(projectId: number, tokenId: number, limit = 500): Promise<BotLog[]> {
+    const rows = await this.db
+      .select()
+      .from(botLogs)
+      .where(and(eq(botLogs.projectId, projectId), eq(botLogs.tokenId, tokenId)))
+      .orderBy(desc(botLogs.timestamp))
+      .limit(limit);
+    return rows.reverse();
+  }
+
+  /**
+   * Получить логи только последнего запуска бота
+   * @param projectId - Идентификатор проекта
+   * @param tokenId - Идентификатор токена
+   * @param limit - Максимальное количество строк
+   * @returns Массив записей логов последнего запуска
+   */
+  async getLatestLaunchLogs(projectId: number, tokenId: number, limit = 500): Promise<BotLog[]> {
+    // Последний launch из истории (не из bot_logs) — устойчивее к mis-routed строкам
+    const [lastLaunch] = await this.db
+      .select({ id: botLaunchHistory.id, status: botLaunchHistory.status })
+      .from(botLaunchHistory)
+      .where(eq(botLaunchHistory.tokenId, tokenId))
+      .orderBy(desc(botLaunchHistory.startedAt))
+      .limit(1);
+
+    const launchIds = resolveLaunchIdsForLogs(
+      lastLaunch ? { id: lastLaunch.id, status: lastLaunch.status } : null,
+    );
+
+    const fetchForLaunch = async (lid: number | null): Promise<BotLog[]> => {
+      const rows = await this.db
+        .select()
+        .from(botLogs)
+        .where(
+          lid === null
+            ? and(
+              eq(botLogs.projectId, projectId),
+              eq(botLogs.tokenId, tokenId),
+              sql`${botLogs.launchId} IS NULL`,
+            )
+            : and(
+              eq(botLogs.projectId, projectId),
+              eq(botLogs.tokenId, tokenId),
+              eq(botLogs.launchId, lid),
+            ),
+        )
+        .orderBy(desc(botLogs.timestamp))
+        .limit(limit);
+      return rows.reverse();
+    };
+
+    if (launchIds.length === 1) {
+      return fetchForLaunch(launchIds[0]);
+    }
+
+    const [a, b] = await Promise.all([
+      fetchForLaunch(launchIds[0]),
+      fetchForLaunch(launchIds[1]),
+    ]);
+    return mergeLogsByTimestampAsc(a, b, limit);
+  }
+
+  /** Максимальное количество записей истории запусков на один токен */
+  private static readonly LAUNCH_HISTORY_LIMIT = 20;
+
+  /**
+   * Создать запись о запуске бота.
+   * После вставки удаляет старые записи, если их больше лимита для данного токена.
+   * @param data - Данные для создания записи
+   * @returns Созданная запись истории запуска
+   */
+  async createLaunchHistory(data: StorageBotLaunchHistoryInput): Promise<BotLaunchHistory> {
+    const [record] = await this.db.insert(botLaunchHistory).values(data).returning();
+
+    // Удаляем старые записи, оставляя только 20 самых новых по startedAt
+    await this.db.delete(botLaunchHistory).where(
+      and(
+        eq(botLaunchHistory.tokenId, data.tokenId),
+        notInArray(
+          botLaunchHistory.id,
+          this.db
+            .select({ id: botLaunchHistory.id })
+            .from(botLaunchHistory)
+            .where(eq(botLaunchHistory.tokenId, data.tokenId))
+            .orderBy(desc(botLaunchHistory.startedAt))
+            .limit(DatabaseStorage.LAUNCH_HISTORY_LIMIT)
+        )
+      )
+    );
+
+    return record;
+  }
+
+  /**
+   * Обновить запись истории запуска (при остановке или ошибке)
+   * @param id - ID записи
+   * @param data - Данные для обновления
+   * @returns Promise<void>
+   */
+  async updateLaunchHistory(id: number, data: StorageBotLaunchHistoryUpdate): Promise<void> {
+    await this.db.update(botLaunchHistory).set(data).where(eq(botLaunchHistory.id, id));
+  }
+
+  /**
+   * Получить последние N запусков для токена
+   * @param tokenId - ID токена
+   * @param limit - Максимальное количество записей (по умолчанию 10)
+   * @returns Массив записей истории запусков
+   */
+  async getLaunchHistory(tokenId: number, limit = 10): Promise<BotLaunchHistory[]> {
+    return await this.db
+      .select()
+      .from(botLaunchHistory)
+      .where(eq(botLaunchHistory.tokenId, tokenId))
+      .orderBy(desc(botLaunchHistory.startedAt))
+      .limit(limit);
+  }
+
+  /**
+   * Получить логи конкретного запуска бота
+   * @param launchId - ID записи в bot_launch_history
+   * @returns Массив записей логов
+   */
+  async getBotLogsByLaunch(launchId: number): Promise<BotLog[]> {
+    return await this.db
+      .select()
+      .from(botLogs)
+      .where(eq(botLogs.launchId, launchId))
+      .orderBy(asc(botLogs.timestamp));
+  }
+
+  /**
+   * Получить активную (со статусом 'running') запись истории запуска для токена
+   * @param tokenId - ID токена
+   * @returns Последняя запись со статусом 'running' или undefined, если не найдена
+   */
+  async getActiveLaunchHistory(tokenId: number): Promise<BotLaunchHistory | undefined> {
+    const [record] = await this.db
+      .select()
+      .from(botLaunchHistory)
+      .where(and(eq(botLaunchHistory.tokenId, tokenId), eq(botLaunchHistory.status, 'running')))
+      .orderBy(desc(botLaunchHistory.startedAt))
+      .limit(1);
+    return record || undefined;
+  }
+
+  /**
+   * Закрывает все running-записи launch history для токена
+   * @param tokenId - ID токена
+   * @param data - Поля обновления (status, stoppedAt, errorMessage)
+   * @returns Число обновлённых строк
+   */
+  async closeAllRunningLaunchHistory(
+    tokenId: number,
+    data: StorageBotLaunchHistoryUpdate,
+  ): Promise<number> {
+    const result = await this.db
+      .update(botLaunchHistory)
+      .set(data)
+      .where(and(eq(botLaunchHistory.tokenId, tokenId), eq(botLaunchHistory.status, 'running')))
+      .returning({ id: botLaunchHistory.id });
+    return result.length;
+  }
+
+  /**
+   * tokenId с хотя бы одной running-записью в истории запусков
+   * @returns Список уникальных tokenId
+   */
+  async listTokenIdsWithRunningLaunchHistory(): Promise<number[]> {
+    const rows = await this.db
+      .selectDistinct({ tokenId: botLaunchHistory.tokenId })
+      .from(botLaunchHistory)
+      .where(eq(botLaunchHistory.status, 'running'));
+    return rows.map((r) => r.tokenId);
+  }
+
+  /**
+   * Получить статистику пользователей по токену
+   * @param tokenId - ID токена
+   * @returns Объект со статистикой: total_users, active_24h, active_7d, new_today
+   */
+  async getTokenUserStats(tokenId: number): Promise<{
+    total_users: number;
+    active_24h: number;
+    active_7d: number;
+    new_today: number;
+  }> {
+    // Получаем projectId по tokenId
+    const token = await this.getBotToken(tokenId);
+    if (!token) {
+      return {
+        total_users: 0,
+        active_24h: 0,
+        active_7d: 0,
+        new_today: 0,
+      };
+    }
+
+    const conditions = [
+      eq(botUsers.projectId, token.projectId),
+      eq(botUsers.tokenId, tokenId),
+    ];
+
+    const users = await this.db.select().from(botUsers).where(and(...conditions));
+
+    const now = new Date();
+    const dayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+    const total_users = users.length;
+    const active_24h = users.filter(u => 
+      u.lastInteraction && new Date(u.lastInteraction) > dayAgo
+    ).length;
+    const active_7d = users.filter(u => 
+      u.lastInteraction && new Date(u.lastInteraction) > weekAgo
+    ).length;
+    const new_today = users.filter(u => 
+      u.lastInteraction && new Date(u.lastInteraction) >= todayStart
+    ).length;
+
+    return {
+      total_users,
+      active_24h,
+      active_7d,
+      new_today,
+    };
+  }
+
+  // Коллабораторы проекта
+
+  /**
+   * Проверяет, имеет ли пользователь доступ к проекту (владелец или коллаборатор)
+   * @param projectId - ID проекта
+   * @param userId - ID пользователя Telegram
+   * @returns true, если пользователь является владельцем или коллаборатором
+   */
+  async hasProjectAccess(projectId: number, userId: number): Promise<boolean> {
+    const project = await this.getBotProject(projectId);
+    if (!project) return false;
+    // Явное приведение к числу — bigint из PostgreSQL может вернуться строкой
+    if (Number(project.ownerId) === Number(userId)) return true;
+
+    const [collab] = await this.db
+      .select()
+      .from(projectCollaborators)
+      .where(
+        and(
+          eq(projectCollaborators.projectId, projectId),
+          eq(projectCollaborators.userId, userId)
+        )
+      );
+    return !!collab;
+  }
+
+  /**
+   * Добавляет коллаборатора к проекту (игнорирует дубликаты)
+   * @param projectId - ID проекта
+   * @param userId - ID пользователя Telegram
+   * @param invitedBy - ID пригласившего пользователя (опционально)
+   */
+  async addCollaborator(projectId: number, userId: number, invitedBy?: number): Promise<void> {
+    await this.db
+      .insert(projectCollaborators)
+      .values({ projectId, userId, invitedBy: invitedBy ?? null })
+      .onConflictDoNothing();
+  }
+
+  /**
+   * Удаляет коллаборатора из проекта
+   * @param projectId - ID проекта
+   * @param userId - ID пользователя Telegram
+   * @returns true, если запись была удалена
+   */
+  async removeCollaborator(projectId: number, userId: number): Promise<boolean> {
+    await this.db
+      .delete(userProjectArchives)
+      .where(
+        and(
+          eq(userProjectArchives.projectId, projectId),
+          eq(userProjectArchives.userId, userId),
+        ),
+      );
+
+    const result = await this.db
+      .delete(projectCollaborators)
+      .where(
+        and(
+          eq(projectCollaborators.projectId, projectId),
+          eq(projectCollaborators.userId, userId)
+        )
+      );
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Возвращает список коллабораторов проекта
+   * @param projectId - ID проекта
+   * @returns Массив записей коллабораторов, отсортированных по дате добавления
+   */
+  async getCollaborators(projectId: number): Promise<ProjectCollaborator[]> {
+    return await this.db
+      .select()
+      .from(projectCollaborators)
+      .where(eq(projectCollaborators.projectId, projectId))
+      .orderBy(projectCollaborators.createdAt);
+  }
+
+  // Рассылки
+
+  /**
+   * Создать новую рассылку в базе данных
+   * @param data - Данные рассылки
+   * @returns Созданная запись рассылки
+   */
+  async createBroadcast(data: StorageBroadcastInput): Promise<Broadcast> {
+    const [record] = await this.db.insert(broadcasts).values(data).returning();
+    return record;
+  }
+
+  /**
+   * Получить список рассылок проекта
+   * @param projectId - ID проекта
+   * @param tokenId - Опциональный ID токена для фильтрации
+   * @returns Массив рассылок, отсортированных по дате создания (новые первые)
+   */
+  async getBroadcasts(projectId: number, tokenId?: number | null): Promise<Broadcast[]> {
+    const conditions = [eq(broadcasts.projectId, projectId)];
+    if (tokenId !== null && tokenId !== undefined) {
+      conditions.push(eq(broadcasts.tokenId, tokenId));
+    }
+    return await this.db.select().from(broadcasts)
+      .where(and(...conditions))
+      .orderBy(desc(broadcasts.createdAt));
+  }
+
+  /**
+   * Получить рассылку по ID
+   * @param id - ID рассылки
+   * @returns Рассылка или undefined, если не найдена
+   */
+  async getBroadcastById(id: number): Promise<Broadcast | undefined> {
+    const [record] = await this.db.select().from(broadcasts).where(eq(broadcasts.id, id));
+    return record || undefined;
+  }
+
+  /**
+   * Обновить данные рассылки
+   * @param id - ID рассылки
+   * @param data - Данные для обновления
+   * @returns Обновлённая рассылка или undefined
+   */
+  async updateBroadcast(id: number, data: StorageBroadcastUpdate): Promise<Broadcast | undefined> {
+    const [record] = await this.db.update(broadcasts).set(data).where(eq(broadcasts.id, id)).returning();
+    return record || undefined;
+  }
+
+  /**
+   * Остановить рассылку — установить status = 'stopped'
+   * @param id - ID рассылки
+   * @returns Обновлённая рассылка или undefined
+   */
+  async stopBroadcast(id: number): Promise<Broadcast | undefined> {
+    const [record] = await this.db
+      .update(broadcasts)
+      .set({ status: "stopped", finishedAt: new Date() })
+      .where(eq(broadcasts.id, id))
+      .returning();
+    return record || undefined;
+  }
+
+  /**
+   * Записать результат отправки одному пользователю
+   * @param data - Данные результата
+   * @returns Созданная запись результата
+   */
+  async createBroadcastResult(data: StorageBroadcastResultInput): Promise<BroadcastResult> {
+    const [record] = await this.db.insert(broadcastResults).values(data).returning();
+    return record;
+  }
+
+  /**
+   * Получить результаты рассылки
+   * @param broadcastId - ID рассылки
+   * @returns Массив результатов, отсортированных по дате отправки
+   */
+  async getBroadcastResults(broadcastId: number): Promise<BroadcastResult[]> {
+    return await this.db.select().from(broadcastResults)
+      .where(eq(broadcastResults.broadcastId, broadcastId))
+      .orderBy(asc(broadcastResults.sentAt));
+  }
+
+  /**
+   * Получить дочерние рассылки кампании
+   * @param campaignId - ID кампании
+   * @returns Массив дочерних рассылок, отсортированных по ID
+   */
+  async getBroadcastsByCampaignId(campaignId: number): Promise<Broadcast[]> {
+    return await this.db.select().from(broadcasts)
+      .where(eq(broadcasts.campaignId, campaignId))
+      .orderBy(asc(broadcasts.id));
+  }
+
+  // Кампании рассылок («большая рассылка»)
+
+  /**
+   * Создать кампанию рассылки
+   * @param data - Данные кампании
+   * @returns Созданная запись кампании
+   */
+  async createBroadcastCampaign(data: StorageBroadcastCampaignInput): Promise<BroadcastCampaign> {
+    const [record] = await this.db.insert(broadcastCampaigns).values(data).returning();
+    return record;
+  }
+
+  /**
+   * Получить кампанию рассылки по ID
+   * @param id - ID кампании
+   * @returns Кампания или undefined, если не найдена
+   */
+  async getBroadcastCampaignById(id: number): Promise<BroadcastCampaign | undefined> {
+    const [record] = await this.db.select().from(broadcastCampaigns).where(eq(broadcastCampaigns.id, id));
+    return record || undefined;
+  }
+
+  /**
+   * Получить список кампаний рассылок проекта
+   * @param projectId - ID проекта
+   * @returns Массив кампаний, отсортированных по дате создания (новые первые)
+   */
+  async getBroadcastCampaigns(projectId: number): Promise<BroadcastCampaign[]> {
+    return await this.db.select().from(broadcastCampaigns)
+      .where(eq(broadcastCampaigns.projectId, projectId))
+      .orderBy(desc(broadcastCampaigns.createdAt));
+  }
+
+  /**
+   * Обновить кампанию рассылки
+   * @param id - ID кампании
+   * @param data - Данные для обновления
+   * @returns Обновлённая кампания или undefined
+   */
+  async updateBroadcastCampaign(id: number, data: StorageBroadcastCampaignUpdate): Promise<BroadcastCampaign | undefined> {
+    const [record] = await this.db.update(broadcastCampaigns).set(data)
+      .where(eq(broadcastCampaigns.id, id)).returning();
+    return record || undefined;
+  }
+
+  /**
+   * Удалить кампанию рассылки — дочерние рассылки удаляются каскадом
+   * @param id - ID кампании
+   * @returns true, если запись была удалена
+   */
+  async deleteBroadcastCampaign(id: number): Promise<boolean> {
+    const deleted = await this.db.delete(broadcastCampaigns)
+      .where(eq(broadcastCampaigns.id, id)).returning();
+    return deleted.length > 0;
+  }
+
+  /**
+   * Получить пользователей для рассылки по фильтрам аудитории
+   * @param projectId - ID проекта
+   * @param tokenId - ID токена бота
+   * @param filters - Фильтры аудитории (теги, даты регистрации, активности)
+   * @returns Массив пользователей, подходящих под фильтры
+   */
+  async getUsersForBroadcast(projectId: number, tokenId: number, filters: BroadcastFilters): Promise<any[]> {
+    // Используем таблицу bot_users — там хранятся реальные пользователи бота
+    const conditions = [
+      eq(botUsers.projectId, projectId),
+      eq(botUsers.tokenId, tokenId),
+      eq(botUsers.isBot, 0),
+      // Не берём заблокировавших бота и удалённые аккаунты
+      sql`COALESCE(${botUsers.isBlocked}, 0) = 0`,
+      sql`COALESCE(${botUsers.isDeleted}, 0) = 0`,
+    ];
+
+    // Фильтрация по конкретным userId (ручной выбор аудитории)
+    if (filters.userIds) {
+      // Пустой список при ручном выборе — никого не рассылаем (иначе уйдёт всем)
+      if (filters.userIds.length === 0) {
+        return [];
+      }
+      conditions.push(sql`${botUsers.userId}::text IN (${sql.join(filters.userIds.map(id => sql`${id}`), sql`, `)})`);
+    }
+
+    if (filters.registeredFrom) {
+      conditions.push(sql`${botUsers.registeredAt} >= ${new Date(filters.registeredFrom)}`);
+    }
+    if (filters.registeredTo) {
+      conditions.push(sql`${botUsers.registeredAt} <= ${new Date(filters.registeredTo)}`);
+    }
+    if (filters.activeFrom) {
+      conditions.push(sql`${botUsers.lastInteraction} >= ${new Date(filters.activeFrom)}`);
+    }
+    if (filters.activeTo) {
+      conditions.push(sql`${botUsers.lastInteraction} <= ${new Date(filters.activeTo)}`);
+    }
+
+    const rows = await this.db.select().from(botUsers).where(and(...conditions));
+
+    // Фильтрация по тегам (хранятся в userData.tags)
+    let filtered = rows;
+    if (filters.tags && filters.tags.length > 0) {
+      filtered = rows.filter(u => {
+        const ud = (u.userData as Record<string, unknown>) || {};
+        const userTags = (ud.tags as string[]) || [];
+        return filters.tags!.every(tag => userTags.includes(tag));
+      });
+    }
+
+    // Приводим BotUser к формату совместимому с очередью отправки
+    return filtered.map(u => ({
+      id: 0,
+      projectId: u.projectId,
+      tokenId: u.tokenId,
+      userId: String(u.userId),
+      userName: u.username ?? null,
+      firstName: u.firstName ?? null,
+      lastName: u.lastName ?? null,
+      avatarUrl: u.avatarUrl ?? null,
+      isBot: u.isBot ?? 0,
+      isPremium: u.isPremium ?? 0,
+      lastInteraction: u.lastInteraction ?? null,
+      interactionCount: u.interactionCount ?? 0,
+      userData: u.userData ?? {},
+      currentState: null,
+      preferences: {},
+      commandsUsed: {},
+      sessionsCount: 0,
+      totalMessagesSent: 0,
+      totalMessagesReceived: 0,
+      deviceInfo: null,
+      locationData: null,
+      contactData: null,
+      isBlocked: u.isBlocked ?? 0,
+      isDeleted: u.isDeleted ?? 0,
+      isActive: u.isActive ?? 1,
+      tags: [],
+      notes: null,
+      createdAt: u.registeredAt ?? null,
+      updatedAt: u.lastInteraction ?? null,
+    })) as unknown as any[];
+  }
+
+  /**
+   * Пометить пользователя как заблокировавшего бота
+   * @param projectId - ID проекта
+   * @param tokenId - ID токена
+   * @param userId - Telegram user id
+   */
+  async markBotUserBlocked(projectId: number, tokenId: number, userId: number): Promise<void> {
+    await this.db
+      .update(botUsers)
+      .set({ isBlocked: 1 })
+      .where(
+        and(
+          eq(botUsers.projectId, projectId),
+          eq(botUsers.tokenId, tokenId),
+          eq(botUsers.userId, userId),
+        ),
+      );
+  }
+
+  /**
+   * Пометить пользователя как удалённый/деактивированный аккаунт
+   * @param projectId - ID проекта
+   * @param tokenId - ID токена
+   * @param userId - Telegram user id
+   */
+  async markBotUserDeleted(projectId: number, tokenId: number, userId: number): Promise<void> {
+    await this.db
+      .update(botUsers)
+      .set({ isDeleted: 1, isBlocked: 0 })
+      .where(
+        and(
+          eq(botUsers.projectId, projectId),
+          eq(botUsers.tokenId, tokenId),
+          eq(botUsers.userId, userId),
+        ),
+      );
+  }
+
+  // Переменные окружения бота
+
+  /**
+   * Получить все переменные окружения для токена
+   * @param tokenId - ID токена
+   * @returns Массив переменных окружения
+   */
+  async getEnvVariables(tokenId: number): Promise<BotEnvVariable[]> {
+    return await this.db.select().from(botEnvVariables)
+      .where(eq(botEnvVariables.tokenId, tokenId))
+      .orderBy(asc(botEnvVariables.key));
+  }
+
+  /**
+   * Получить переменную окружения по ID
+   * @param id - ID переменной
+   * @returns Переменная окружения или undefined
+   */
+  async getEnvVariable(id: number): Promise<BotEnvVariable | undefined> {
+    const [variable] = await this.db.select().from(botEnvVariables)
+      .where(eq(botEnvVariables.id, id));
+    return variable || undefined;
+  }
+
+  /**
+   * Создать новую переменную окружения
+   * @param data - Данные для создания
+   * @returns Созданная переменная
+   */
+  async createEnvVariable(data: StorageBotEnvVariableInput): Promise<BotEnvVariable> {
+    const [variable] = await this.db.insert(botEnvVariables)
+      .values(data)
+      .returning();
+    return variable;
+  }
+
+  /**
+   * Обновить переменную окружения
+   * @param id - ID переменной
+   * @param data - Данные для обновления
+   * @returns Обновлённая переменная или undefined
+   */
+  async updateEnvVariable(id: number, data: StorageBotEnvVariableUpdate): Promise<BotEnvVariable | undefined> {
+    const [variable] = await this.db.update(botEnvVariables)
+      .set({ ...data, updatedAt: new Date() })
+      .where(eq(botEnvVariables.id, id))
+      .returning();
+    return variable || undefined;
+  }
+
+  /**
+   * Удалить переменную окружения
+   * @param id - ID переменной
+   * @returns true, если переменная была удалена
+   */
+  async deleteEnvVariable(id: number): Promise<boolean> {
+    const result = await this.db.delete(botEnvVariables)
+      .where(eq(botEnvVariables.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Удалить все переменные окружения токена
+   * @param tokenId - ID токена
+   * @returns true, если переменные были удалены
+   */
+  async deleteEnvVariablesByToken(tokenId: number): Promise<boolean> {
+    const result = await this.db.delete(botEnvVariables)
+      .where(eq(botEnvVariables.tokenId, tokenId));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  // Bot Tables
+
+  /**
+   * Получить все таблицы проекта
+   * @param projectId - ID проекта
+   * @returns Массив таблиц
+   */
+  async getBotTables(projectId: number): Promise<BotTable[]> {
+    return await this.db.select().from(botTables)
+      .where(eq(botTables.projectId, projectId))
+      .orderBy(asc(botTables.id));
+  }
+
+  /**
+   * Создать новую таблицу проекта
+   * @param input - Данные для создания
+   * @returns Созданная таблица
+   */
+  async createBotTable(input: StorageBotTableInput): Promise<BotTable> {
+    const [table] = await this.db.insert(botTables).values(input).returning();
+    return table;
+  }
+
+  /**
+   * Удалить таблицу проекта
+   * @param id - ID таблицы
+   * @returns true, если таблица была удалена
+   */
+  async deleteBotTable(id: number): Promise<boolean> {
+    const result = await this.db.delete(botTables).where(eq(botTables.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Переименовать таблицу проекта
+   * @param id - ID таблицы
+   * @param name - Новое название
+   * @returns Обновлённая таблица или undefined
+   */
+  async renameBotTable(id: number, name: string): Promise<BotTable | undefined> {
+    const [table] = await this.db.update(botTables)
+      .set({ name })
+      .where(eq(botTables.id, id))
+      .returning();
+    return table || undefined;
+  }
+
+  /**
+   * Получить колонки таблицы
+   * @param tableId - ID таблицы
+   * @returns Массив колонок
+   */
+  async getBotTableColumns(tableId: number): Promise<BotTableColumn[]> {
+    return await this.db.select().from(botTableColumns)
+      .where(eq(botTableColumns.tableId, tableId))
+      .orderBy(asc(botTableColumns.position));
+  }
+
+  /**
+   * Создать колонку таблицы
+   * @param input - Данные для создания
+   * @returns Созданная колонка
+   */
+  async createBotTableColumn(input: StorageBotTableColumnInput): Promise<BotTableColumn> {
+    const [column] = await this.db.insert(botTableColumns).values(input).returning();
+    return column;
+  }
+
+  /**
+   * Удалить колонку таблицы
+   * @param id - ID колонки
+   * @returns true, если колонка была удалена
+   */
+  async deleteBotTableColumn(id: number): Promise<boolean> {
+    const result = await this.db.delete(botTableColumns).where(eq(botTableColumns.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Переименовать колонку таблицы
+   * @param id - ID колонки
+   * @param name - Новое название
+   * @returns Обновлённая колонка или undefined
+   */
+  async renameBotTableColumn(id: number, name: string): Promise<BotTableColumn | undefined> {
+    const [column] = await this.db.update(botTableColumns)
+      .set({ name })
+      .where(eq(botTableColumns.id, id))
+      .returning();
+    return column || undefined;
+  }
+
+  /**
+   * Получить строки таблицы
+   * @param tableId - ID таблицы
+   * @returns Массив строк
+   */
+  async getBotTableRows(tableId: number): Promise<BotTableRow[]> {
+    return await this.db.select().from(botTableRows)
+      .where(eq(botTableRows.tableId, tableId))
+      .orderBy(asc(botTableRows.rowIndex));
+  }
+
+  /**
+   * Создать строки таблицы (батч)
+   * @param inputs - Массив данных для создания
+   * @returns Массив созданных строк
+   */
+  async createBotTableRows(inputs: StorageBotTableRowInput[]): Promise<BotTableRow[]> {
+    if (!inputs.length) return [];
+    return await this.db.insert(botTableRows).values(inputs).returning();
+  }
+
+  /**
+   * Обновить данные строки таблицы
+   * @param id - ID строки
+   * @param data - Новые данные строки
+   * @returns Обновлённая строка или undefined
+   */
+  async updateBotTableRow(id: number, data: Record<string, string>): Promise<BotTableRow | undefined> {
+    const [row] = await this.db.update(botTableRows)
+      .set({ data })
+      .where(eq(botTableRows.id, id))
+      .returning();
+    return row || undefined;
+  }
+
+  /**
+   * Удалить строку таблицы
+   * @param id - ID строки
+   * @returns true, если строка была удалена
+   */
+  async deleteBotTableRow(id: number): Promise<boolean> {
+    const result = await this.db.delete(botTableRows).where(eq(botTableRows.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Переиндексировать строки таблицы (row_index = 0, 1, 2, ...)
+   * @param tableId - ID таблицы
+   */
+  async reindexBotTableRows(tableId: number): Promise<void> {
+    const rows = await this.db.select().from(botTableRows)
+      .where(eq(botTableRows.tableId, tableId))
+      .orderBy(asc(botTableRows.rowIndex));
+    await Promise.all(
+      rows.map((row, index) =>
+        this.db.update(botTableRows).set({ rowIndex: index }).where(eq(botTableRows.id, row.id))
+      )
+    );
+  }
+
+  // Worker Processes
+
+  /**
+   * Создать запись о процессе воркера
+   * @param data - Данные для создания записи
+   * @returns Созданная запись процесса воркера
+   */
+  async createWorkerProcess(data: StorageWorkerProcessInput): Promise<WorkerProcess> {
+    const [record] = await this.db.insert(workerProcesses).values(data).returning();
+    return record;
+  }
+
+  /**
+   * Остановить воркер проекта — установить status = 'stopped', stopped_at = NOW()
+   * @param projectId - ID проекта
+   * @returns true, если запись была обновлена
+   */
+  async stopWorkerProcess(projectId: number): Promise<boolean> {
+    const result = await this.db.update(workerProcesses)
+      .set({ status: "stopped", stoppedAt: new Date() })
+      .where(and(
+        eq(workerProcesses.projectId, projectId),
+        eq(workerProcesses.status, "running")
+      ))
+      .returning();
+    return result.length > 0;
+  }
+
+  /**
+   * Получить все активные воркеры (status = 'running')
+   * @returns Массив активных записей воркеров
+   */
+  async getActiveWorkers(): Promise<WorkerProcess[]> {
+    return await this.db.select().from(workerProcesses)
+      .where(eq(workerProcesses.status, "running"))
+      .orderBy(desc(workerProcesses.startedAt));
+  }
+
+  // Версии проектов (история снимков и откат)
+
+  /**
+   * Создать снимок версии проекта в базе данных
+   * @param projectId - ID проекта
+   * @param snapshot - Снимок данных проекта (BotDataWithSheets)
+   * @param label - Опциональная метка версии
+   * @param authorId - Опциональный ID автора снимка
+   * @param kind - Тип версии: "auto" (по умолчанию) или "manual" (ручной коммит)
+   * @param authorKind - Тип автора снимка: 'agent' — ИИ-агент (MCP), 'user'/null — обычный пользователь
+   * @returns Созданная версия проекта
+   */
+  async createProjectVersion(projectId: number, snapshot: unknown, label?: string, authorId?: number | null, kind: 'auto' | 'manual' = 'auto', authorKind?: 'user' | 'agent' | null): Promise<ProjectVersion> {
+    const [version] = await this.db.insert(projectVersions).values({
+      projectId,
+      snapshot,
+      label: label ?? null,
+      authorId: authorId ?? null,
+      kind,
+      authorKind: authorKind ?? null,
+    }).returning();
+    return version;
+  }
+
+  /**
+   * Получить список версий проекта, отсортированный по дате создания (DESC)
+   * @param projectId - ID проекта
+   * @returns Массив версий проекта
+   */
+  async listProjectVersions(projectId: number): Promise<ProjectVersion[]> {
+    return await this.db.select().from(projectVersions)
+      .where(eq(projectVersions.projectId, projectId))
+      .orderBy(desc(projectVersions.createdAt));
+  }
+
+  /**
+   * Получить одну версию проекта по ID
+   * @param versionId - ID версии
+   * @returns Версия проекта или undefined, если не найдена
+   */
+  async getProjectVersion(versionId: number): Promise<ProjectVersion | undefined> {
+    const [version] = await this.db.select().from(projectVersions)
+      .where(eq(projectVersions.id, versionId));
+    return version || undefined;
+  }
+
+  /**
+   * Получить самую свежую версию проекта (для дедупликации снимков)
+   * @param projectId - ID проекта
+   * @returns Самая свежая версия проекта или undefined, если версий нет
+   */
+  async getLatestProjectVersion(projectId: number): Promise<ProjectVersion | undefined> {
+    const [version] = await this.db.select().from(projectVersions)
+      .where(eq(projectVersions.projectId, projectId))
+      .orderBy(desc(projectVersions.createdAt))
+      .limit(1);
+    return version || undefined;
+  }
+
+  /**
+   * Удалить старые авто-снимки проекта, оставив последние keep штук.
+   * Ручные коммиты (kind='manual') не удаляются и не учитываются в лимите.
+   * @param projectId - ID проекта
+   * @param keep - Сколько последних авто-снимков сохранить
+   * @returns Promise<void>
+   */
+  async pruneProjectVersions(projectId: number, keep: number): Promise<void> {
+    // Берём только авто-снимки — ручные коммиты сохраняем всегда
+    const versions = await this.db.select({ id: projectVersions.id }).from(projectVersions)
+      .where(and(eq(projectVersions.projectId, projectId), eq(projectVersions.kind, 'auto')))
+      .orderBy(desc(projectVersions.createdAt));
+    const idsToDelete = versions.slice(keep).map((v) => v.id);
+    if (idsToDelete.length === 0) return;
+    await this.db.delete(projectVersions).where(inArray(projectVersions.id, idsToDelete));
+  }
+
+  /**
+   * Удалить одну версию проекта по id с проверкой принадлежности проекту.
+   * Операция необратима.
+   * @param projectId - ID проекта, которому должна принадлежать версия
+   * @param versionId - ID удаляемой версии
+   * @returns true, если версия была удалена
+   */
+  async deleteProjectVersion(projectId: number, versionId: number): Promise<boolean> {
+    const rows = await this.db.delete(projectVersions)
+      .where(and(eq(projectVersions.id, versionId), eq(projectVersions.projectId, projectId)))
+      .returning({ id: projectVersions.id });
+    return rows.length > 0;
+  }
+
+  /**
+   * Массово удалить версии проекта по фильтру, оставив keep последних по дате (DESC).
+   * Операция необратима.
+   * Для authorKind='user' учитываются версии с authorKind IS NULL или 'user';
+   * для authorKind='agent' — только версии с authorKind='agent'.
+   * @param projectId - ID проекта
+   * @param options - Фильтр удаления: keep (сколько последних сохранить), kind (вид версии), authorKind (тип автора)
+   * @returns Число удалённых версий
+   */
+  async deleteProjectVersionsBulk(
+    projectId: number,
+    options: { keep?: number; kind?: 'auto' | 'manual'; authorKind?: 'agent' | 'user' },
+  ): Promise<number> {
+    const conditions = [eq(projectVersions.projectId, projectId)];
+    if (options.kind) conditions.push(eq(projectVersions.kind, options.kind));
+    if (options.authorKind === 'agent') {
+      conditions.push(eq(projectVersions.authorKind, 'agent'));
+    } else if (options.authorKind === 'user') {
+      const userCondition = or(isNull(projectVersions.authorKind), eq(projectVersions.authorKind, 'user'));
+      if (userCondition) conditions.push(userCondition);
+    }
+
+    const versions = await this.db.select({ id: projectVersions.id }).from(projectVersions)
+      .where(and(...conditions))
+      .orderBy(desc(projectVersions.createdAt));
+    const idsToDelete = versions.slice(options.keep ?? 0).map((v) => v.id);
+    if (idsToDelete.length === 0) return 0;
+    await this.db.delete(projectVersions).where(inArray(projectVersions.id, idsToDelete));
+    return idsToDelete.length;
+  }
+}

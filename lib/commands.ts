@@ -1,0 +1,297 @@
+/**
+ * @fileoverview Стандартные команды Telegram и утилиты для работы с ними
+ * 
+ * Модуль предоставляет константы стандартных команд, функции валидации,
+ * генерации предложений и парсинга команд из текста пользователя.
+ * 
+ * @module commands
+ */
+
+import type { Node as BotNode } from '@shared/schema';
+
+/**
+ * Категория команды
+ * 
+ * @example
+ * const category: CommandCategory = 'system';
+ */
+export type CommandCategory = 'system' | 'user' | 'navigation' | 'admin';
+
+/**
+ * Стандартная команда Telegram
+ * 
+ * @example
+ * const cmd: StandardCommand = {
+ *   command: '/start',
+ *   description: 'Начать работу с ботом'
+ * };
+ */
+export interface StandardCommand {
+  /** Текст команды */
+  command: string;
+  /** Описание команды */
+  description: string;
+  /** Категория команды */
+  category: CommandCategory;
+  /** Показывать в меню */
+  showInMenu: boolean;
+}
+
+// Стандартные команды Telegram и их описания
+export const STANDARD_COMMANDS: StandardCommand[] = [
+  {
+    command: '/start',
+    description: 'Начать работу с ботом',
+    category: 'system',
+    showInMenu: true
+  },
+  {
+    command: '/help',
+    description: 'Показать справку',
+    category: 'system',
+    showInMenu: true
+  },
+  {
+    command: '/settings',
+    description: 'Настройки бота',
+    category: 'system',
+    showInMenu: true
+  },
+  {
+    command: '/menu',
+    description: 'Главное меню',
+    category: 'navigation',
+    showInMenu: true
+  },
+  {
+    command: '/profile',
+    description: 'Профиль пользователя',
+    category: 'user',
+    showInMenu: true
+  },
+  {
+    command: '/info',
+    description: 'Информация о боте',
+    category: 'system',
+    showInMenu: true
+  },
+  {
+    command: '/cancel',
+    description: 'Отменить текущее действие',
+    category: 'system',
+    showInMenu: false
+  },
+  {
+    command: '/back',
+    description: 'Вернуться назад',
+    category: 'navigation',
+    showInMenu: false
+  },
+  {
+    command: '/support',
+    description: 'Техническая поддержка',
+    category: 'system',
+    showInMenu: true
+  },
+  {
+    command: '/about',
+    description: 'О боте',
+    category: 'system',
+    showInMenu: true
+  },
+  {
+    command: '/subscribe',
+    description: 'Подписаться на уведомления',
+    category: 'user',
+    showInMenu: true
+  },
+  {
+    command: '/unsubscribe',
+    description: 'Отписаться от уведомлений',
+    category: 'user',
+    showInMenu: false
+  },
+  {
+    command: '/feedback',
+    description: 'Оставить отзыв',
+    category: 'user',
+    showInMenu: true
+  },
+  {
+    command: '/language',
+    description: 'Выбрать язык',
+    category: 'system',
+    showInMenu: true
+  },
+  {
+    command: '/notifications',
+    description: 'Настройки уведомлений',
+    category: 'user',
+    showInMenu: true
+  }
+];
+
+export const COMMAND_CATEGORIES = {
+  system: 'Системные',
+  user: 'Пользовательские',
+  navigation: 'Навигация',
+  admin: 'Администрирование'
+};
+
+/**
+ * Латинские команды из стандартного списка Telegram (для list_commands / подсказок).
+ * Свои команды тоже только латиница (a-z, 0-9, _) — ограничение Bot API / setMyCommands.
+ */
+export const LATIN_TELEGRAM_COMMANDS = new Set<string>([
+  ...STANDARD_COMMANDS.map((c) => c.command.toLowerCase()),
+  '/paysupport',
+  '/terms',
+]);
+
+/**
+ * Проверяет, что строка команды подходит для setMyCommands (только a-z0-9_)
+ * @param command - Команда с ведущим `/` или без
+ * @returns true, если Telegram примет команду в меню
+ */
+export function isLatinMenuCommand(command: string): boolean {
+  const bare = command.replace(/^\//, '').toLowerCase();
+  return /^[a-z][a-z0-9_]{0,31}$/.test(bare);
+}
+
+/**
+ * Проверяет, есть ли в команде кириллица
+ * @param command - Текст команды
+ * @returns true при наличии русских букв
+ */
+export function hasCyrillicInCommand(command: string): boolean {
+  return /[а-яёА-ЯЁ]/.test(command);
+}
+
+/**
+ * Валидация текста команды бота
+ * Telegram Bot API: только латинские a-z, цифры и `_` (1–32 символа после `/`).
+ * Кириллица в командах запрещена. Описание (description) может быть на русском.
+ * @param command - Текст команды с `/`
+ * @returns Результат валидации и список ошибок
+ */
+export function validateCommand(command: string): { isValid: boolean; errors: string[] } {
+  const errors: string[] = [];
+
+  if (!command) {
+    errors.push('Команда не может быть пустой');
+    return { isValid: false, errors };
+  }
+
+  if (!command.startsWith('/')) {
+    errors.push('Команда должна начинаться с символа "/"');
+  }
+
+  if (command.length < 2) {
+    errors.push('Команда должна содержать хотя бы один символ после "/"');
+  }
+
+  if (command.length > 33) {
+    errors.push('Команда не может быть длиннее 32 символов после "/"');
+  }
+
+  if (hasCyrillicInCommand(command)) {
+    errors.push(
+      'Команды только на английском (латиница): /buy, /refund. Кириллица недопустима (/купить нельзя)',
+    );
+  }
+
+  const lower = command.toLowerCase();
+  if (!isLatinMenuCommand(command) && command.startsWith('/') && !hasCyrillicInCommand(command)) {
+    errors.push(
+      'Команда: / + латиница a-z, цифры и _; начинается с буквы (например /buy, /my_shop)',
+    );
+  }
+
+  const reservedCommands = [
+    '/newbot',
+    '/mybots',
+    '/setname',
+    '/setdescription',
+    '/setabouttext',
+    '/setuserpic',
+    '/setinline',
+    '/setjoingroups',
+    '/setprivacy',
+  ];
+  if (reservedCommands.includes(lower)) {
+    errors.push('Эта команда зарезервирована системой Telegram');
+  }
+
+  return {
+    isValid: errors.length === 0,
+    errors,
+  };
+}
+
+// Генерация автодополнения команд
+export function getCommandSuggestions(input: string): typeof STANDARD_COMMANDS {
+  if (!input.startsWith('/')) {
+    return [];
+  }
+  
+  const query = input.toLowerCase();
+  return STANDARD_COMMANDS.filter(cmd => 
+    cmd.command.toLowerCase().includes(query) ||
+    cmd.description.toLowerCase().includes(query.slice(1))
+  ).slice(0, 10);
+}
+
+// Получение команды по тексту
+export function parseCommandFromText(text: string): string | null {
+  if (!text || !text.startsWith('/')) {
+    return null;
+  }
+  
+  const match = text.match(/^\/([a-zA-Z][a-zA-Z0-9_]*)/);
+  return match ? `/${match[1]}` : null;
+}
+
+/**
+ * Генерирует строку команд для настройки меню BotFather
+ * 
+ * @param nodes - Массив узлов бота
+ * @returns Строка команд в формате "command - description"
+ * 
+ * @example
+ * const commands = generateBotFatherCommands([
+ *   { type: 'command_trigger', data: { command: '/start', description: 'Запуск' } }
+ * ]);
+ */
+export function generateBotFatherCommands(nodes: BotNode[]): string {
+  if (!nodes || !Array.isArray(nodes)) {
+    return '';
+  }
+
+  const commandSourceNodes = [
+    ...nodes.filter(node =>
+      node &&
+      node.type === 'command_trigger' &&
+      node.data?.command &&
+      (node.data?.showInMenu !== false)
+    ),
+  ].filter((node, index, array) => {
+    const command = (node.data?.command || '').trim().toLowerCase();
+    if (!command) return false;
+    const firstIndex = array.findIndex(candidate => (candidate.data?.command || '').trim().toLowerCase() === command);
+    return firstIndex === index;
+  });
+
+  if (commandSourceNodes.length === 0) {
+    return '';
+  }
+
+  let botFatherCommands = '';
+
+  commandSourceNodes.forEach(node => {
+    const command = (node.data.command || '').replace('/', '');
+    const description = node.data.description || 'Команда бота';
+    botFatherCommands += `${command} - ${description}\n`;
+  });
+
+  return botFatherCommands.trim();
+}

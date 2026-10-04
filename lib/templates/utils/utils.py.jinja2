@@ -1,0 +1,747 @@
+{#
+  Утилиты для бота
+
+  @fileoverview Вспомогательные функции: is_admin, check_auth, get_user_variables, TTL-очистка user_data
+  @param {boolean} userDatabaseEnabled - Включена ли база данных пользователей
+  @param {boolean} hasInputTimeoutNodes - Нужны ли утилиты таймаута и form_session
+#}
+
+# Утилитарные функции
+
+# TTL для записей user_data (секунды)
+USER_DATA_TTL = 3600
+# Метки времени последней активности пользователей
+_user_last_seen: dict[int, float] = {}
+# Кеш данных пользовательских таблиц проекта (Bot Tables)
+_bot_tables_cache: dict | None = None
+_bot_tables_cache_ts: float = 0
+
+
+async def cleanup_user_data() -> None:
+    """Фоновая задача: удаляет записи user_data, неактивные дольше USER_DATA_TTL секунд.
+
+    Запускается один раз при старте бота и работает в бесконечном цикле.
+    Предотвращает бесконечный рост глобального словаря user_data.
+    """
+    import time
+    while True:
+        await asyncio.sleep(USER_DATA_TTL)
+        now = time.monotonic()
+        expired = [uid for uid, ts in _user_last_seen.items() if now - ts > USER_DATA_TTL]
+        for uid in expired:
+            user_data.pop(uid, None)
+            _user_last_seen.pop(uid, None)
+        if expired:
+            logging.debug(f"🧹 TTL-очистка user_data: удалено {len(expired)} записей")
+
+{%- if hasInputTimeoutNodes %}
+
+# Активные задачи таймаута ожидания ввода: user_id -> asyncio.Task
+_input_timeout_tasks: dict[int, asyncio.Task] = {}
+
+
+async def _cancel_input_timeout_task(user_id: int) -> None:
+    """Отменяет запланированный таймаут ожидания ввода для пользователя."""
+    task = _input_timeout_tasks.pop(user_id, None)
+    if task and not task.done():
+        task.cancel()
+
+
+async def _input_timeout_worker(user_id: int, seconds: float, message: str) -> None:
+    """Фоновая задача: по истечении времени отправляет сообщение и сбрасывает форму."""
+    try:
+        await asyncio.sleep(seconds)
+        if user_id not in user_data or "waiting_for_input" not in user_data.get(user_id, {}):
+            return
+        try:
+            await bot.send_message(user_id, message)
+        except Exception as e:
+            logging.warning(f"Не удалось отправить сообщение о таймауте пользователю {user_id}: {e}")
+        await _clear_form_session(user_id)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        _input_timeout_tasks.pop(user_id, None)
+
+
+async def _schedule_input_timeout(user_id: int, seconds: float, message: str) -> None:
+    """Планирует сброс ожидания ввода по истечении заданного времени."""
+    await _cancel_input_timeout_task(user_id)
+    if seconds <= 0:
+        return
+    _input_timeout_tasks[user_id] = asyncio.create_task(_input_timeout_worker(user_id, seconds, message))
+
+
+def _track_form_variable(user_id: int, var_name: str) -> None:
+    """Добавляет имя переменной в сессию формы для последующей очистки при отмене."""
+    if not var_name:
+        return
+    if user_id not in user_data:
+        user_data[user_id] = {}
+    form_session = user_data[user_id].setdefault("form_session", {})
+    variables = form_session.setdefault("variables", [])
+    if var_name not in variables:
+        variables.append(var_name)
+
+
+async def _clear_form_session(user_id: int) -> None:
+    """Отменяет таймер, сбрасывает waiting_for_input и очищает переменные формы."""
+    await _cancel_input_timeout_task(user_id)
+    if user_id not in user_data:
+        return
+    store = user_data[user_id]
+    form_session = store.get("form_session", {})
+    for var_name in form_session.get("variables", []):
+        store.pop(var_name, None)
+    store.pop("form_session", None)
+    store.pop("waiting_for_input", None)
+{%- endif %}
+
+{%- if adminOnly %}
+
+async def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+{%- endif %}
+
+def get_user_variables(user_id):
+    return user_data.get(user_id, {})
+
+
+async def init_user_variables(user_id: int, from_user) -> str:
+    """Инициализирует переменные пользователя в локальном хранилище.
+    Обновляет метку времени активности для TTL-очистки.
+
+    Args:
+        user_id (int): ID пользователя Telegram
+        from_user: Объект пользователя aiogram (types.User)
+
+    Returns:
+        str: Имя пользователя (username или first_name)
+    """
+    import time
+    _user_last_seen[user_id] = time.monotonic()
+    if user_id not in user_data:
+        user_data[user_id] = {}
+    username = getattr(from_user, 'username', None) or ''
+    first_name = getattr(from_user, 'first_name', None) or ''
+    last_name = getattr(from_user, 'last_name', None) or ''
+    user_name = username or first_name or str(user_id)
+    user_data[user_id]['username'] = username
+    user_data[user_id]['first_name'] = first_name
+    user_data[user_id]['last_name'] = last_name
+    user_data[user_id]['user_name'] = user_name
+    user_data[user_id]['user_id'] = user_id
+    user_data[user_id]['language_code'] = getattr(from_user, 'language_code', None) or ''
+    user_data[user_id]['is_premium'] = getattr(from_user, 'is_premium', None) or False
+    user_data[user_id]['is_bot'] = getattr(from_user, 'is_bot', None) or False
+    return user_name
+
+
+async def capture_message_context(user_id: int, message) -> None:
+    """Записывает контекст входящего сообщения в user_data для подстановки переменных.
+
+    Args:
+        user_id: ID пользователя Telegram
+        message: Объект types.Message или None для сброса полей ответа
+    """
+    import time
+    _user_last_seen[user_id] = time.monotonic()
+    if user_id not in user_data:
+        user_data[user_id] = {}
+    store = user_data[user_id]
+
+    _empty_reply = {
+        'reply_to_user_id': '',
+        'reply_to_username': '',
+        'reply_to_first_name': '',
+        'reply_to_last_name': '',
+        'reply_to_message_id': '',
+        'reply_to_text': '',
+    }
+    if message is None:
+        store.update(_empty_reply)
+        return
+
+    chat = getattr(message, 'chat', None)
+    store['chat_id'] = str(chat.id) if chat and chat.id is not None else ''
+    store['chat_type'] = str(getattr(chat, 'type', '') or '') if chat else ''
+    store['message_id'] = str(message.message_id) if getattr(message, 'message_id', None) else ''
+    store['message_text'] = (getattr(message, 'text', None) or getattr(message, 'caption', None) or '')
+
+    if getattr(message, 'photo', None):
+        store['message_type'] = 'photo'
+    elif getattr(message, 'video', None):
+        store['message_type'] = 'video'
+    elif getattr(message, 'document', None):
+        store['message_type'] = 'document'
+    elif getattr(message, 'audio', None):
+        store['message_type'] = 'audio'
+    elif getattr(message, 'voice', None):
+        store['message_type'] = 'voice'
+    elif getattr(message, 'animation', None):
+        store['message_type'] = 'animation'
+    elif getattr(message, 'sticker', None):
+        store['message_type'] = 'sticker'
+    elif getattr(message, 'text', None):
+        store['message_type'] = 'text'
+    else:
+        store['message_type'] = 'other'
+
+    reply = getattr(message, 'reply_to_message', None)
+    if reply and getattr(reply, 'from_user', None):
+        reply_user = reply.from_user
+        store['reply_to_user_id'] = str(reply_user.id)
+        store['reply_to_username'] = getattr(reply_user, 'username', None) or ''
+        store['reply_to_first_name'] = getattr(reply_user, 'first_name', None) or ''
+        store['reply_to_last_name'] = getattr(reply_user, 'last_name', None) or ''
+        store['reply_to_message_id'] = str(reply.message_id) if getattr(reply, 'message_id', None) else ''
+        store['reply_to_text'] = (getattr(reply, 'text', None) or getattr(reply, 'caption', None) or '')
+    else:
+        store.update(_empty_reply)
+
+
+{%- if userDatabaseEnabled %}
+
+async def check_auth(user_id: int) -> bool:
+    if db_pool:
+        user = await get_user_from_db(user_id)
+        return user is not None
+    return user_id in user_data
+
+{%- else %}
+async def check_auth(user_id: int) -> bool:
+    return user_id in user_data
+
+{%- endif %}
+
+
+async def init_all_user_vars(user_id: int) -> dict:
+    """Собирает все переменные пользователя из памяти и БД.
+    Память (user_data) всегда имеет приоритет над БД.
+    Глобальные переменные (user_data[0]) доступны всем как fallback.
+
+    Returns:
+        dict: Объединённый словарь всех переменных пользователя,
+              включая плоские ключи вида "responseVar.field"
+    """
+    all_vars = dict(user_data.get(user_id, {}))
+    # Fallback: глобальные переменные из системного пользователя (schedule_trigger)
+    # Не перезаписывают пользовательские, не копируют служебные поля
+    if user_id != 0:
+        for _gk, _gv in user_data.get(0, {}).items():
+            if _gk not in all_vars and not _gk.startswith("_"):
+                all_vars[_gk] = _gv
+    # Добавляем системные переменные бота — доступны в URL и текстах узлов
+    # Не перезаписываем bot_token если пользователь уже ввёл свой токен
+    if "bot_token" not in all_vars:
+        all_vars["bot_token"] = BOT_TOKEN or ""
+    # Добавляем user_id, project_id и token_id как системные переменные
+    if "user_id" not in all_vars:
+        all_vars["user_id"] = str(user_id)
+    if "project_id" not in all_vars:
+        all_vars["project_id"] = str(PROJECT_ID) if PROJECT_ID else ""
+    if "token_id" not in all_vars:
+        all_vars["token_id"] = str(TOKEN_ID) if TOKEN_ID else ""
+    # Десериализуем строковые JSON-значения обратно в dict/list
+    # (Redis FSM и другие хранилища могут сериализовать dict в строку)
+    import json as _json_init
+    for _k in list(all_vars.keys()):
+        _v = all_vars[_k]
+        if isinstance(_v, str) and len(_v) > 1 and _v[0] in ('{', '['):
+            try:
+                all_vars[_k] = _json_init.loads(_v)
+            except Exception:
+                pass
+{%- if userDatabaseEnabled %}
+    try:
+        if db_pool:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT * FROM bot_users WHERE user_id = $1 AND project_id = $2 AND token_id = $3", user_id, PROJECT_ID, TOKEN_ID)
+                if row:
+                    for key in row.keys():
+                        # Данные из БД не перезаписывают актуальные значения из памяти
+                        if key not in all_vars and row[key] is not None:
+                            all_vars[key] = row[key]
+                    raw_user_data = row.get('user_data')
+                    if raw_user_data:
+                        import json as _json
+                        extra = _json.loads(raw_user_data) if isinstance(raw_user_data, str) else raw_user_data
+                        if isinstance(extra, dict):
+                            for k, v in extra.items():
+                                if k not in all_vars:
+                                    all_vars[k] = v
+    except Exception as e:
+        logging.warning(f"⚠️ Не удалось загрузить переменные из БД: {e}")
+{%- endif %}
+    # Загружаем данные из пользовательских таблиц проекта (Bot Tables)
+    # Для таблиц с одной строкой: плоские переменные table.имя.колонка (обратная совместимость) + массив
+    # Для таблиц с несколькими строками: только массив table.имя = [{col: val, ...}, ...]
+    global _bot_tables_cache, _bot_tables_cache_ts
+    import time as _time_mod
+    # Сбрасываем кеш каждые 60 секунд
+    if _bot_tables_cache is not None and (_time_mod.time() - _bot_tables_cache_ts) > 60:
+        _bot_tables_cache = None
+    if _bot_tables_cache is None and db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                _tbl_rows = await conn.fetch("""
+                    SELECT bt.name AS table_name, btc.name AS col_name, btc.id AS col_id, btr.data, btr.row_index
+                    FROM bot_tables bt
+                    JOIN bot_table_columns btc ON btc.table_id = bt.id
+                    JOIN bot_table_rows btr ON btr.table_id = bt.id
+                    WHERE bt.project_id = $1
+                    ORDER BY bt.id, btr.row_index, btc.position
+                """, PROJECT_ID)
+                # Группируем данные: {table_name: {row_index: {col_name: value}}}
+                _tables_data = {}
+                for _r in _tbl_rows:
+                    _tname = _r["table_name"]
+                    _cname = _r["col_name"]
+                    _cid = str(_r["col_id"])
+                    _row_idx = _r["row_index"]
+                    _raw_data = _r["data"]
+                    if isinstance(_raw_data, str):
+                        import json as _json_tbl
+                        try:
+                            _data = _json_tbl.loads(_raw_data)
+                        except Exception:
+                            _data = {}
+                    elif isinstance(_raw_data, dict):
+                        _data = _raw_data
+                    else:
+                        _data = {}
+                    _val = _data.get(_cid, "")
+                    if _tname not in _tables_data:
+                        _tables_data[_tname] = {}
+                    if _row_idx not in _tables_data[_tname]:
+                        _tables_data[_tname][_row_idx] = {}
+                    _tables_data[_tname][_row_idx][_cname] = str(_val) if _val else ""
+                # Формируем кеш: массивы и плоские переменные
+                _cache = {}
+                for _tname, _rows_dict in _tables_data.items():
+                    # Собираем массив объектов (каждый объект = одна строка таблицы)
+                    _sorted_indices = sorted(_rows_dict.keys())
+                    _arr = [_rows_dict[_idx] for _idx in _sorted_indices]
+                    # Массив сохраняем всегда (как list Python для _flatten_dict)
+                    _cache[f"table.{_tname}"] = _arr
+                    # Для таблиц с одной строкой — также плоские переменные (обратная совместимость)
+                    if len(_arr) == 1:
+                        for _cname, _cval in _arr[0].items():
+                            _cache[f"table.{_tname}.{_cname}"] = _cval
+                _bot_tables_cache = _cache
+                _bot_tables_cache_ts = _time_mod.time()
+        except Exception as e:
+            logging.warning(f"⚠️ Не удалось загрузить Bot Tables: {e}")
+            _bot_tables_cache = {}
+    if _bot_tables_cache:
+        for _tk, _tv in _bot_tables_cache.items():
+            if _tk not in all_vars:
+                all_vars[_tk] = _tv
+
+    # Рекурсивно разворачиваем dict/list-значения в плоские ключи для dot-notation подстановки.
+    # Поддерживает произвольную глубину вложенности (до max_depth уровней).
+    # Гарантирует что {a.b.c} найдётся через all_vars["a.b.c"] даже при глубокой вложенности.
+    # Списки разворачиваются с числовыми индексами: photos[0][0].file_id
+    def _flatten_dict(_prefix: str, _obj, _result: dict, _depth: int = 0, _max_depth: int = 5) -> None:
+        if _depth > _max_depth:
+            return
+        if isinstance(_obj, dict):
+            for _dk, _dv in _obj.items():
+                _flatten_dict(f"{_prefix}.{_dk}", _dv, _result, _depth + 1, _max_depth)
+        elif isinstance(_obj, list):
+            for _li, _lv in enumerate(_obj):
+                _flatten_dict(f"{_prefix}[{_li}]", _lv, _result, _depth + 1, _max_depth)
+                # Также добавляем отрицательный индекс [-N] для удобства обращения к последним элементам
+                _neg_idx = _li - len(_obj)
+                if _neg_idx != _li:
+                    _flatten_dict(f"{_prefix}[{_neg_idx}]", _lv, _result, _depth + 1, _max_depth)
+        elif _obj is None:
+            # None явно записывается как "" чтобы перезаписать устаревшее значение из предыдущего запроса
+            _result[_prefix] = ""
+        elif isinstance(_obj, (str, int, float, bool)):
+            _result[_prefix] = str(_obj)
+    _flat_keys = {}
+    for _k, _v in list(all_vars.items()):
+        if isinstance(_v, (dict, list)):
+            _flatten_dict(_k, _v, _flat_keys)
+    all_vars.update(_flat_keys)
+    return all_vars
+
+
+{%- if not userDatabaseEnabled %}
+async def save_message_to_api(user_id, message_type: str, message_text: str = None, node_id: str = None, message_data: dict = None):
+    """Заглушка save_message_to_api когда БД отключена"""
+    return None
+{%- endif %}
+
+
+_user_var_locks: dict = {}
+
+def _get_user_var_lock(user_id: int) -> asyncio.Lock:
+    """Возвращает asyncio.Lock пользователя для атомарных операций с переменными.
+
+    Используется set_variable (mode=expression) чтобы инкремент счётчика
+    из параллельных веток (parallel_split) не терял значения.
+
+    Args:
+        user_id (int): ID пользователя Telegram
+
+    Returns:
+        asyncio.Lock: Лок пользователя (создаётся при первом обращении)
+    """
+    if user_id not in _user_var_locks:
+        _user_var_locks[user_id] = asyncio.Lock()
+    return _user_var_locks[user_id]
+
+
+async def set_user_var(user_id: int, key: str, value) -> None:
+    """Сохраняет переменную пользователя в память и БД (fire-and-forget).
+
+    Запись в память — синхронная (мгновенно), запись в БД — fire-and-forget (фоново).
+    Следующий узел прочитает актуальное значение из user_data без ожидания БД.
+
+    Args:
+        user_id (int): ID пользователя Telegram
+        key (str): Имя переменной
+        value: Значение переменной
+    """
+    if user_id not in user_data:
+        user_data[user_id] = {}
+    user_data[user_id][key] = value
+{%- if userDatabaseEnabled %}
+    # Источник трафика — в отдельные колонки bot_users (для аналитики)
+    if key == "deep_link_param":
+        asyncio.create_task(sync_user_attribution_to_db(user_id, deep_link_param=value))
+    elif key == "referrer_id":
+        asyncio.create_task(sync_user_attribution_to_db(user_id, referrer_id=value))
+    # Fire-and-forget: user_data JSON в фоне, не блокируя ответ пользователю
+    asyncio.create_task(_persist_user_var(user_id, key, value))
+{%- endif %}
+
+
+{%- if userDatabaseEnabled %}
+async def _persist_user_var(user_id: int, key: str, value) -> None:
+    """Фоновая запись переменной пользователя в БД (вызывается через create_task).
+
+    Args:
+        user_id (int): ID пользователя Telegram
+        key (str): Имя переменной
+        value: Значение переменной
+    """
+    try:
+        await update_user_data_in_db(user_id, key, value)
+    except Exception as e:
+        logging.warning(f"⚠️ _persist_user_var: не удалось сохранить {key} в БД: {e}")
+{%- endif %}
+
+
+def _eval_expr(template: str, user_vars: dict):
+    """Вычисляет выражение с подстановкой переменных из user_vars.
+
+    Поддерживает арифметику (+, -, *, /, //, %, **), логику (and, or, not),
+    тернарный if/else, сравнения, безопасные функции
+    (round, abs, int, float, min, max, str, reversed, thousands), строковые
+    методы (replace, strip, lower, upper, startswith, endswith, split, join)
+    и проверки (isdigit, isnumeric, isdecimal, isalpha, isalnum, isspace).
+    Генераторы и comprehension не поддерживаются.
+    При любой ошибке возвращает исходный шаблон без изменений.
+
+    Args:
+        template: Строка-выражение, например "{step} + 1" или "'{text}'.replace('a', 'b')"
+        user_vars: Словарь переменных пользователя
+
+    Returns:
+        Результат вычисления или исходный шаблон при ошибке
+    """
+    import re as _re_expr, ast as _ast_expr
+
+    def _replacer(match):
+        full_path = match.group(1)
+        path = full_path.split('.')
+        # Сначала пробуем полный путь как плоский ключ (напр. "sell_item.quantity")
+        if full_path in user_vars:
+            val = user_vars[full_path]
+            if val is None or val == '':
+                return '0'
+            return str(val)
+        # Пробуем составные плоские ключи (напр. "pilot.credits" → ищем "pilot.credits")
+        val = user_vars
+        for key in path:
+            if isinstance(val, dict):
+                # Сначала пробуем оставшийся путь как плоский ключ
+                remaining = '.'.join(path[path.index(key):])
+                if remaining in val:
+                    val = val[remaining]
+                    break
+                val = val.get(key, 0)
+            else:
+                return '0'
+        if val is None or val == '':
+            return '0'
+        return str(val)
+
+    expr = _re_expr.sub(r'\{([^}]+)\}', _replacer, template)
+    try:
+        tree = _ast_expr.parse(expr, mode='eval')
+        _allowed = (
+            _ast_expr.Expression, _ast_expr.BinOp, _ast_expr.UnaryOp,
+            _ast_expr.Constant,
+            _ast_expr.Add, _ast_expr.Sub, _ast_expr.Mult, _ast_expr.Div,
+            _ast_expr.FloorDiv, _ast_expr.Mod, _ast_expr.Pow,
+            _ast_expr.USub, _ast_expr.UAdd,
+            _ast_expr.Call, _ast_expr.Name, _ast_expr.Load,
+            _ast_expr.Attribute, _ast_expr.Subscript, _ast_expr.Index, _ast_expr.Slice,
+            _ast_expr.IfExp, _ast_expr.Compare,
+            _ast_expr.Gt, _ast_expr.GtE, _ast_expr.Lt, _ast_expr.LtE, _ast_expr.Eq, _ast_expr.NotEq,
+            _ast_expr.BoolOp, _ast_expr.And, _ast_expr.Or, _ast_expr.Not,
+            _ast_expr.List, _ast_expr.Dict, _ast_expr.Tuple,
+        )
+        _safe_funcs = {'round': round, 'abs': abs, 'int': int, 'float': float, 'min': min, 'max': max, 'str': str, 'reversed': reversed, 'thousands': lambda n: f"{int(float(n)):,}".replace(",", " ")}
+        _safe_methods = {'replace', 'strip', 'lstrip', 'rstrip', 'lower', 'upper', 'startswith', 'endswith', 'split', 'join', 'count', 'find', 'format', 'isdigit', 'isnumeric', 'isdecimal', 'isalpha', 'isalnum', 'isspace'}
+        for _node in _ast_expr.walk(tree):
+            if not isinstance(_node, _allowed):
+                return template
+            if isinstance(_node, _ast_expr.Name) and _node.id not in _safe_funcs and _node.id not in user_vars:
+                return template
+            if isinstance(_node, _ast_expr.Attribute) and _node.attr not in _safe_methods:
+                return template
+            if isinstance(_node, _ast_expr.Call):
+                if isinstance(_node.func, _ast_expr.Name) and _node.func.id not in _safe_funcs:
+                    return template
+                if isinstance(_node.func, _ast_expr.Attribute) and _node.func.attr not in _safe_methods:
+                    return template
+        # Собираем namespace: функции + переменные пользователя (приведённые к числам где возможно)
+        _eval_ns = dict(_safe_funcs)
+        for _vk, _vv in user_vars.items():
+            if _vk in _safe_funcs:
+                continue
+            try:
+                _eval_ns[_vk] = float(_vv) if '.' in str(_vv) else int(_vv)
+            except (ValueError, TypeError):
+                _eval_ns[_vk] = str(_vv) if _vv is not None else 0
+        return eval(compile(tree, '<expr>', 'eval'), {"__builtins__": {}}, _eval_ns)
+    except Exception:
+        return template
+
+
+def replace_variables_in_text(text: str, variables: dict, filters: dict = None) -> str:
+    """Заменяет переменные вида {var_name} и {var.path.nested} в тексте на их значения
+
+    Args:
+        text: Исходный текст с переменными
+        variables: Словарь переменных для подстановки
+        filters: Словарь фильтров форматирования (опционально)
+
+    Returns:
+        str: Текст с подставленными значениями
+    """
+    if not text or not variables:
+        return text or ''
+    import re as _re
+    import json as _json
+    import time as _time_mod
+
+    # Обработка {__now_plus_N} — заменяем на текущий timestamp + N секунд
+    def _replace_now_plus(m):
+        _seconds = int(m.group(1))
+        return str(int(_time_mod.time()) + _seconds)
+    text = _re.sub(r'\{__now_plus_(\d+)\}', _replace_now_plus, text)
+    # Обработка {__now} и {__now__}
+    text = text.replace('{__now}', str(int(_time_mod.time())))
+    text = text.replace('{__now__}', str(int(_time_mod.time())))
+
+    # ─── Встроенные переменные (доступны всегда) ────────────────────────────
+    from datetime import datetime as _dt
+    import pytz as _pytz
+    import time as _time_mod
+    _msk = _pytz.timezone("Europe/Moscow")
+    _now_msk = _dt.now(_msk)
+    _now_ts = int(_time_mod.time())
+    variables.setdefault("now", _now_msk.strftime("%d.%m.%Y %H:%M:%S"))
+    variables.setdefault("today", _now_msk.strftime("%d.%m.%Y"))
+    variables.setdefault("time", _now_msk.strftime("%H:%M:%S"))
+    variables.setdefault("__now", str(_now_ts))
+    variables.setdefault("__now__", str(_now_ts))
+    # Динамические __now_plus_N (секунды)
+    for _k in list(variables.keys()):
+        pass  # уже заданы выше
+    # Поддержка {__now_plus_N} через regex в replace_variables_in_text ниже
+
+    # ─── Обработка итерации по массиву в тексте ─────────────────────────────
+    # Синтаксис в тексте пользователя: {каждый элемент} — см. документацию
+    # Внутри блока доступны поля текущего элемента + __index (с 1)
+    _each_open = "{" + "#each"  # разбиваем чтобы не конфликтовать с шаблонизатором
+    _each_pattern = _re.compile(r'\{' + r'#each\s+([\w.\[\]]+)\}(.*?)\{/each\}', _re.DOTALL)
+
+    def _expand_each(_m):
+        _var_path = _m.group(1)
+        _tpl = _m.group(2)
+        # Убираем ведущий перенос строки после открывающего тега
+        if _tpl.startswith('\n'):
+            _tpl = _tpl[1:]
+        # Убираем завершающий перенос строки перед {/each}
+        if _tpl.endswith('\n'):
+            _tpl = _tpl[:-1]
+        # Получаем массив из переменных
+        _items = variables.get(_var_path)
+        if _items is None:
+            # Пробуем через dot-notation
+            _segments = _var_path.split('.')
+            _obj = variables
+            for _seg in _segments:
+                if isinstance(_obj, dict):
+                    _obj = _obj.get(_seg)
+                else:
+                    _obj = None
+                    break
+            _items = _obj
+        if isinstance(_items, str):
+            try:
+                _items = _json.loads(_items)
+            except Exception:
+                _items = None
+        if not isinstance(_items, list):
+            return ''
+        _lines = []
+        for _i, _item in enumerate(_items):
+            _item_vars = dict(variables)  # копируем родительские переменные
+            if isinstance(_item, dict):
+                _item_vars.update(_item)
+            else:
+                _item_vars['value'] = str(_item) if _item is not None else ''
+            _item_vars['__index'] = str(_i + 1)
+            _item_vars['__index0'] = str(_i)
+            _line = replace_variables_in_text(_tpl, _item_vars, filters)
+            _lines.append(_line)
+        return '\n'.join(_lines)
+
+    # Раскрываем все each-блоки (поддержка вложенности через рекурсию)
+    _prev = None
+    result = text
+    while _prev != result:
+        _prev = result
+        result = _each_pattern.sub(_expand_each, result)
+
+    # ─── Обработка inline-выражений {=...} ─────────────────────────────────────
+    def _inline_expr_replacer(_m_expr):
+        """Вычисляет inline-выражение {=expr} через _eval_expr."""
+        _expr_body = _m_expr.group(1)
+        _expr_result = _eval_expr(_expr_body, variables)
+        # Если _eval_expr вернул исходный шаблон (ошибка/невалидное) — оставляем как есть
+        if str(_expr_result) == _expr_body:
+            return _m_expr.group(0)
+        return str(_expr_result)
+
+    result = _re.sub(r'\{=([^}]+)\}', _inline_expr_replacer, result)
+
+    # ─── Основная замена переменных {var} ─────────────────────────────────────
+
+    def _resolve(var_path: str) -> str | None:
+        """Разрешает переменную, поддерживая dot-notation и индексы массивов вида [0]"""
+        # Сначала ищем точное совпадение в плоском словаре (включая ключи вида a.b[0].c)
+        val = variables.get(var_path)
+        if val is not None:
+            # dict/list сериализуем как валидный JSON, не Python repr
+            if isinstance(val, (dict, list)):
+                return _json.dumps(val, ensure_ascii=False)
+            return str(val)
+        # Если нет точного совпадения — пробуем обойти путь вручную
+        # Разбиваем путь на сегменты: "a.b[0][1].c" → ["a", "b", "[0]", "[1]", "c"]
+        segments = _re.split(r'\.(?![^\[]*\])', var_path)
+        root_key = segments[0]
+        root = variables.get(root_key)
+        if root is None:
+            return None
+        # Если корень — строка, пробуем распарсить как JSON
+        if isinstance(root, str):
+            try:
+                root = _json.loads(root)
+            except Exception:
+                return None
+        obj = root
+        for seg in segments[1:]:
+            # Сегмент может содержать индексы: "photos[0][1]", "photos[-1]" или просто "field"
+            parts = _re.split(r'(\[-?\d+\])', seg)
+            for part in parts:
+                if not part:
+                    continue
+                idx_match = _re.fullmatch(r'\[(-?\d+)\]', part)
+                if idx_match:
+                    idx = int(idx_match.group(1))
+                    if not isinstance(obj, list):
+                        return None
+                    try:
+                        obj = obj[idx]
+                    except IndexError:
+                        return None
+                else:
+                    if not isinstance(obj, dict):
+                        return None
+                    obj = obj.get(part)
+                    if obj is None:
+                        return None
+        return str(obj) if obj is not None else None
+
+    def _replacer(match):
+        var_path = match.group(1)
+        resolved = _resolve(var_path)
+        return resolved if resolved is not None else match.group(0)
+
+    # Паттерн поддерживает: {var}, {a.b.c}, {a.b[0][1].c}
+    # Многопроходная замена: если после подстановки остались {}, делаем ещё проход (макс 3)
+    for _pass in range(3):
+        _new_result = _re.sub(r'\{([\w.\[\]]+)\}', _replacer, result)
+        if _new_result == result:
+            break
+        result = _new_result
+    return result
+
+
+{%- include 'navigation/navigate-to-node.py.jinja2' %}
+
+
+
+async def _publish_log_to_redis(level: str, message: str) -> None:
+    """Публикует строку лога в Redis канал для real-time доставки.
+    Вызывается параллельно с обычным logging — не блокирует основной поток.
+
+    @param level - Уровень лога: INFO, WARNING, ERROR, DEBUG
+    @param message - Текст сообщения
+    """
+    if _redis_client is None:
+        return
+    try:
+        import json as _json
+        from datetime import datetime as _dt
+        await _redis_client.publish(
+            f"bot:logs:{PROJECT_ID}:{TOKEN_ID}",
+            _json.dumps({
+                "level": level,
+                "message": message,
+                "timestamp": _dt.now().isoformat(),
+                "projectId": PROJECT_ID,
+                "tokenId": TOKEN_ID,
+            })
+        )
+    except Exception:
+        pass
+
+
+class _RedisLogHandler(logging.Handler):
+    """Logging handler для публикации логов в Redis Pub/Sub канал."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Публикует запись лога в Redis асинхронно через create_task."""
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_publish_log_to_redis(record.levelname, self.format(record)))
+        except RuntimeError:
+            pass  # Event loop не запущен — пропускаем
+
+
+# Регистрируем handler если Redis доступен
+if _redis_client is not None:
+    _redis_log_handler = _RedisLogHandler()
+    _redis_log_handler.setLevel(logging.INFO)
+    logging.getLogger().addHandler(_redis_log_handler)

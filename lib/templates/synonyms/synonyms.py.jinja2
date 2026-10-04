@@ -1,0 +1,261 @@
+{#
+  Шаблон обработчиков синонимов
+
+  @fileoverview Генерирует Python код для обработки синонимов команд и сообщений
+  @param {array} synonymEntries - Массив объектов SynonymEntry:
+    - synonym: string          — текст синонима
+    - nodeId: string           — ID узла
+    - nodeType: string         — тип узла (start|command|message|pin_message|unpin_message|delete_message|
+                                           ban_user|unban_user|mute_user|unmute_user|kick_user|
+                                           promote_user|demote_user|admin_rights)
+    - functionName: string     — имя функции оригинального обработчика (для command/start)
+    - originalCommand: string  — оригинальная команда (для command/start)
+    - messageText: string      — текст ответа (для content management)
+    - disableNotification: bool — отключить уведомление (для pin_message)
+    - reason: string           — причина (для ban/kick/mute)
+    - untilDate: number        — дата бана (для ban_user, 0 = навсегда)
+    - duration: number         — длительность мута в секундах (для mute_user)
+    - canSendMessages: bool    — разрешить сообщения (для mute_user)
+    - canSendMediaMessages: bool — разрешить медиа (для mute_user)
+    - canDeleteMessages: bool  — право удалять сообщения (для promote_user)
+    - canInviteUsers: bool     — право приглашать (для promote_user)
+    - canPinMessages: bool     — право закреплять (для promote_user)
+#}
+
+# Обработчики синонимов
+{% for entry in synonymEntries -%}
+{%- set sanitized_synonym = entry.synonym | replace(' ', '_') | safe_name -%}
+{%- set sanitized_node_id = entry.nodeId | safe_name -%}
+
+{# ── COMMAND / START синонимы ── #}
+{% if entry.nodeType in ['start', 'command'] %}
+{% set fn = entry.functionName if entry.functionName else 'start' %}
+{% set cmd = entry.originalCommand if entry.originalCommand else '/start' %}
+
+@dp.message(lambda message: message.text and message.text.lower() == "{{ entry.synonym | lower }}")
+async def {{ fn }}_synonym_{{ sanitized_synonym }}_handler(message: types.Message):
+    # Синоним для команды {{ cmd }}
+    await {{ fn }}_handler(message)
+
+{# ── MESSAGE синонимы (MockCallback) ── #}
+{% elif entry.nodeType == 'message' %}
+
+@dp.message(lambda message: message.text and message.text.lower() == "{{ entry.synonym | lower }}")
+async def message_{{ sanitized_node_id }}_synonym_{{ sanitized_synonym }}_handler(message: types.Message):
+    # Синоним для сообщения {{ entry.nodeId }}
+    user_id = message.from_user.id
+    logging.info(f"Пользователь {user_id} написал синоним '{{ entry.synonym }}' для узла {{ entry.nodeId }}")
+
+    class MockCallback:
+        def __init__(self, data, user, msg):
+            self.data = data
+            self._is_fake = True
+            self.from_user = user
+            self.message = msg
+
+        async def answer(self, *args, **kwargs):
+            pass
+
+        async def edit_text(self, text, **kwargs):
+            try:
+                return await self.message.edit_text(text, **kwargs)
+            except Exception as e:
+                logging.warning(f"Не удалось отредактировать сообщение: {e}")
+                return await self.message.answer(text, **kwargs)
+
+    mock_callback = MockCallback("{{ entry.nodeId }}", message.from_user, message)
+    await handle_callback_{{ sanitized_node_id }}(mock_callback, state=None)
+
+{# ── CONTENT MANAGEMENT синонимы (pin/unpin/delete) ── #}
+{% elif entry.nodeType in ['pin_message', 'unpin_message', 'delete_message'] %}
+{% set default_text = "✅ Сообщение закреплено" if entry.nodeType == 'pin_message' else ("✅ Сообщение откреплено" if entry.nodeType == 'unpin_message' else "🗑️ Сообщение успешно удалено!") %}
+{% set msg_text = entry.messageText if entry.messageText else default_text %}
+
+@dp.message(lambda message: message.text and (message.text.lower() == "{{ entry.synonym | lower }}" or message.text.lower().startswith("{{ entry.synonym | lower }} ")) and message.chat.type in ['group', 'supergroup'])
+async def {{ entry.nodeType }}_{{ sanitized_node_id }}_synonym_{{ sanitized_synonym }}_handler(message: types.Message):
+    """Обработчик синонима '{{ entry.synonym }}' для {{ entry.nodeType }}"""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    target_message_id = None
+
+    if message.reply_to_message:
+        target_message_id = message.reply_to_message.message_id
+        logging.info(f"Пользователь {user_id} использовал '{{ entry.synonym }}' для сообщения {target_message_id} (через ответ)")
+    else:
+        text_parts = message.text.split()
+        if len(text_parts) > 1 and text_parts[1].isdigit():
+            target_message_id = int(text_parts[1])
+            logging.info(f"Пользователь {user_id} использовал '{{ entry.synonym }}' для сообщения {target_message_id} (через ID)")
+        else:
+            await message.answer("❌ Укажите сообщение: ответьте на сообщение или напишите '{{ entry.synonym }} ID_сообщения'")
+            return
+
+    try:
+{% if entry.nodeType == 'pin_message' %}
+        await bot.pin_chat_message(
+            chat_id=chat_id,
+            message_id=target_message_id,
+            disable_notification={{ "True" if entry.disableNotification else "False" }}
+        )
+        await message.answer("{{ msg_text }}")
+        logging.info(f"Сообщение {target_message_id} закреплено пользователем {user_id}")
+{% elif entry.nodeType == 'unpin_message' %}
+        await bot.unpin_chat_message(chat_id=chat_id, message_id=target_message_id)
+        await message.answer("{{ msg_text }}")
+        logging.info(f"Сообщение {target_message_id} откреплено пользователем {user_id}")
+{% elif entry.nodeType == 'delete_message' %}
+        await bot.delete_message(chat_id=chat_id, message_id=target_message_id)
+        await message.answer("{{ msg_text }}")
+        logging.info(f"Сообщение {target_message_id} удалено пользователем {user_id}")
+{% endif %}
+
+    except TelegramBadRequest as e:
+        if "message to pin not found" in str(e) or "message not found" in str(e):
+            await message.answer("❌ Сообщение не найдено")
+        elif "not enough rights" in str(e) or "CHAT_ADMIN_REQUIRED" in str(e):
+            await message.answer("❌ Недостаточно прав для выполнения операции")
+        else:
+            await message.answer(f"❌ Ошибка: {e}")
+        logging.error(f"Ошибка {{ entry.nodeType }}: {e}")
+    except Exception as e:
+        await message.answer("❌ Произошла неожиданная ошибка")
+        logging.error(f"Неожиданная ошибка в {{ entry.nodeType }}: {e}")
+
+
+{# ── USER MANAGEMENT синонимы (ban/unban/mute/unmute/kick/promote/demote/admin_rights) ── #}
+{% elif entry.nodeType in ['ban_user', 'unban_user', 'mute_user', 'unmute_user', 'kick_user', 'promote_user', 'demote_user', 'admin_rights'] %}
+{% set chat_filter = "" if entry.nodeType == 'admin_rights' else " and message.chat.type in ['group', 'supergroup']" %}
+
+@dp.message(lambda message: message.text and (message.text.lower() == "{{ entry.synonym | lower }}" or message.text.lower().startswith("{{ entry.synonym | lower }} ")){{ chat_filter }})
+async def {{ entry.nodeType }}_{{ sanitized_node_id }}_synonym_{{ sanitized_synonym }}_handler(message: types.Message):
+    """Обработчик синонима '{{ entry.synonym }}' для {{ entry.nodeType }}"""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    target_user_id = None
+
+    if message.reply_to_message:
+        target_user_id = message.reply_to_message.from_user.id
+        logging.info(f"Пользователь {user_id} использовал '{{ entry.synonym }}' для пользователя {target_user_id} (через ответ)")
+    else:
+        text_parts = message.text.split()
+        if len(text_parts) > 1 and text_parts[1].isdigit():
+            target_user_id = int(text_parts[1])
+            logging.info(f"Пользователь {user_id} использовал '{{ entry.synonym }}' для пользователя {target_user_id} (через ID)")
+        else:
+            await message.answer("❌ Укажите пользователя: ответьте на сообщение или напишите '{{ entry.synonym }} ID_пользователя'")
+            return
+
+    if not target_user_id:
+        await message.answer("❌ Не удалось определить пользователя")
+        return
+
+    current_node_type = "{{ entry.nodeType }}"
+    try:
+{% if entry.nodeType == 'ban_user' %}
+{% set reason = entry.reason if entry.reason else 'Нарушение правил группы' %}
+{% set until_date = entry.untilDate if entry.untilDate else 0 %}
+{% if until_date and until_date > 0 %}
+        await bot.ban_chat_member(chat_id=chat_id, user_id=target_user_id, until_date={{ until_date }})
+        await message.answer(f"✅ Пользователь {target_user_id} заблокирован до {{ until_date }}\nПричина: {{ reason }}")
+{% else %}
+        await bot.ban_chat_member(chat_id=chat_id, user_id=target_user_id)
+        await message.answer(f"✅ Пользователь {target_user_id} заблокирован навсегда\nПричина: {{ reason }}")
+{% endif %}
+        logging.info(f"Пользователь {target_user_id} заблокирован администратором {user_id}")
+{% elif entry.nodeType == 'unban_user' %}
+        await bot.unban_chat_member(chat_id=chat_id, user_id=target_user_id, only_if_banned=True)
+        await message.answer(f"✅ Пользователь {target_user_id} разблокирован")
+        logging.info(f"Пользователь {target_user_id} разблокирован администратором {user_id}")
+{% elif entry.nodeType == 'kick_user' %}
+{% set reason = entry.reason if entry.reason else 'Нарушение правил группы' %}
+        await bot.ban_chat_member(chat_id=chat_id, user_id=target_user_id)
+        await bot.unban_chat_member(chat_id=chat_id, user_id=target_user_id)
+        await message.answer(f"✅ Пользователь {target_user_id} исключен из группы\nПричина: {{ reason }}")
+        logging.info(f"Пользователь {target_user_id} исключен администратором {user_id}")
+{% elif entry.nodeType == 'mute_user' %}
+{% set duration = entry.duration if entry.duration else 3600 %}
+{% set reason = entry.reason if entry.reason else 'Нарушение правил группы' %}
+{% set can_send = entry.canSendMessages | default(false) %}
+{% set can_media = entry.canSendMediaMessages | default(false) %}
+        from datetime import datetime, timedelta
+        until_date = datetime.now() + timedelta(seconds={{ duration }})
+        await bot.restrict_chat_member(
+            chat_id=chat_id, user_id=target_user_id,
+            permissions=types.ChatPermissions(
+                can_send_messages={{ can_send | to_python_boolean }},
+                can_send_media_messages={{ can_media | to_python_boolean }}
+            ), until_date=until_date
+        )
+        hours = {{ duration }} // 3600
+        minutes = ({{ duration }} % 3600) // 60
+        time_str = f"{hours}ч {minutes}м" if hours > 0 else f"{minutes}м"
+        await message.answer(f"✅ Пользователь {target_user_id} ограничен на {time_str}\nПричина: {{ reason }}")
+        logging.info(f"Пользователь {target_user_id} ограничен администратором {user_id}")
+{% elif entry.nodeType == 'unmute_user' %}
+        await bot.restrict_chat_member(
+            chat_id=chat_id, user_id=target_user_id,
+            permissions=types.ChatPermissions(
+                can_send_messages=True, can_send_media_messages=True,
+                can_send_polls=True, can_send_other_messages=True,
+                can_add_web_page_previews=True
+            )
+        )
+        await message.answer(f"✅ Ограничения с пользователя {target_user_id} сняты")
+        logging.info(f"Ограничения с пользователя {target_user_id} сняты администратором {user_id}")
+{% elif entry.nodeType == 'promote_user' %}
+{% set can_delete = entry.canDeleteMessages | default(true) %}
+{% set can_invite = entry.canInviteUsers | default(true) %}
+{% set can_pin = entry.canPinMessages | default(true) %}
+        await bot.promote_chat_member(
+            chat_id=chat_id, user_id=target_user_id,
+            can_delete_messages={{ can_delete | to_python_boolean }},
+            can_invite_users={{ can_invite | to_python_boolean }},
+            can_pin_messages={{ can_pin | to_python_boolean }}
+        )
+        await message.answer(f"✅ Пользователь {target_user_id} назначен администратором")
+        logging.info(f"Пользователь {target_user_id} назначен администратором пользователем {user_id}")
+{% elif entry.nodeType == 'demote_user' %}
+        await bot.promote_chat_member(
+            chat_id=chat_id, user_id=target_user_id,
+            can_change_info=False, can_delete_messages=False,
+            can_invite_users=False, can_restrict_members=False,
+            can_pin_messages=False, can_promote_members=False
+        )
+        await message.answer(f"✅ Права администратора сняты с пользователя {target_user_id}")
+        logging.info(f"Права администратора сняты с пользователя {target_user_id} администратором {user_id}")
+{% elif entry.nodeType == 'admin_rights' %}
+        class MockCallback:
+            def __init__(self, data, user, msg):
+                self.data = data
+                self.from_user = user
+                self.message = msg
+
+            async def answer(self):
+                pass
+
+            async def edit_text(self, text, **kwargs):
+                try:
+                    return await self.message.edit_text(text, **kwargs)
+                except Exception as e:
+                    logging.warning(f"Не удалось отредактировать сообщение: {e}")
+                    return await self.message.answer(text, **kwargs)
+
+        mock_callback = MockCallback("{{ entry.nodeId }}", message.from_user, message)
+        await handle_callback_{{ sanitized_node_id }}(mock_callback, bot)
+        return
+{% endif %}
+
+    except TelegramBadRequest as e:
+        if "not enough rights" in str(e) or "CHAT_ADMIN_REQUIRED" in str(e):
+            await message.answer("❌ Недостаточно прав для выполнения операции")
+        else:
+            await message.answer(f"❌ Ошибка: {e}")
+        logging.error(f"Ошибка {current_node_type}: {e}")
+    except Exception as e:
+        await message.answer("❌ Произошла неожиданная ошибка")
+        logging.error(f"Неожиданная ошибка в {current_node_type}: {e}")
+
+{% endif %}
+{% endfor %}

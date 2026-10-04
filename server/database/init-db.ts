@@ -1,0 +1,891 @@
+/**
+ * @fileoverview Инициализация и мягкие миграции серверной схемы базы данных
+ */
+
+import { sql } from 'drizzle-orm';
+import { db } from './db';
+
+/**
+ * Асинхронная функция для выполнения SQL-запроса с повторными попытками
+ *
+ * @param db - Объект базы данных для выполнения запроса
+ * @param query - SQL-запрос для выполнения
+ * @param description - Описание операции для логирования
+ * @param maxRetries - Максимальное количество попыток выполнения (по умолчанию 3)
+ * @returns void
+ *
+ * @description
+ * Функция выполняет SQL-запрос с возможностью повторных попыток в случае ошибки.
+ * При каждой неудачной попытке выводится предупреждение с информацией об ошибке.
+ * После каждой неудачной попытки происходит задержка перед следующей попыткой,
+ * длительность которой увеличивается с каждой попыткой.
+ */
+async function executeWithRetry(db: any, query: any, description: string, maxRetries = 3) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      await db.execute(query);
+      console.log(`✅ ${description} - успешно`);
+      return;
+    } catch (error) {
+      console.warn(`⚠️ ${description} - попытка ${attempt}/${maxRetries} не удалась:`, error);
+      if (attempt === maxRetries) {
+        throw error;
+      }
+      // Ожидание перед повторной попыткой (уменьшенное время ожидания)
+      await new Promise(resolve => setTimeout(resolve, 500 * attempt));
+    }
+  }
+}
+
+/**
+ * Асинхронная функция инициализации таблиц базы данных
+ *
+ * @returns Promise<boolean> - Возвращает true при успешной инициализации, false в случае ошибки
+ *
+ * @description
+ * Функция проверяет подключение к базе данных и создает необходимые таблицы,
+ * если они не существуют. Поддерживает механизм повторных попыток подключения
+ * с экспоненциальным увеличением времени ожидания между попытками.
+ *
+ * Создает следующие таблицы:
+ * - telegram_users: информация о пользователях Telegram
+ * - bot_projects: проекты ботов
+ * - bot_tokens: токены для ботов
+ * - bot_instances: экземпляры запущенных ботов
+ * - bot_templates: сценарии ботов
+ * - media_files: медиафайлы, используемые в ботах
+ * - bot_groups: группы, в которых работают боты
+ * - group_members: участники групп
+ * - bot_users: пользователи ботов
+ * - user_telegram_settings: настройки Telegram API пользователей
+ * - bot_messages: сообщения ботов
+ * - bot_message_media: медиафайлы к сообщениям ботов
+ * - app_settings: глобальные настройки приложения (ключ-значение)
+ *
+ * Также выполняет миграции для добавления новых столбцов в существующие таблицы,
+ * если они отсутствуют.
+ *
+ * @example
+ * // Пример использования функции
+ * const success = await initializeDatabaseTables();
+ * if (success) {
+ *   console.log('База данных успешно инициализирована');
+ * } else {
+ *   console.log('Ошибка инициализации базы данных');
+ * }
+ */
+export async function initializeDatabaseTables() {
+  console.log('🔧 Инициализация таблиц базы данных...');
+
+  try {
+    // Проверяем соединение с расширенным таймаутом и логикой повторных попыток
+    console.log('🧪 Проверка соединения с базой данных...');
+
+    let connectionAttempts = 0;
+    const maxConnectionAttempts = 5;
+    let connected = false;
+
+    while (!connected && connectionAttempts < maxConnectionAttempts) {
+      connectionAttempts++;
+      try {
+        console.log(`📡 Попытка подключения ${connectionAttempts}/${maxConnectionAttempts}...`);
+
+        const healthCheckPromise = db.execute(sql`SELECT 1 as health`);
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Таймаут подключения к базе данных после 30 секунд')), 30000)
+        );
+
+        await Promise.race([healthCheckPromise, timeoutPromise]);
+        connected = true;
+        console.log('✅ Соединение с базой данных успешно установлено!');
+
+      } catch (error: any) {
+        console.error(`❌ Попытка подключения ${connectionAttempts} не удалась:`, error.message);
+
+        if (connectionAttempts >= maxConnectionAttempts) {
+          console.error('💥 Все попытки подключения не удались. База данных может быть недоступна.');
+          console.error('🔍 Детали ошибки:', {
+            code: error.code,
+            errno: error.errno,
+            syscall: error.syscall,
+            message: error.message
+          });
+
+          // Возвращаем false вместо выбрасывания исключения, чтобы позволить приложению запуститься без БД
+          console.log('⚠️ Запуск приложения без инициализации базы данных...');
+          return false;
+        }
+
+        // Ожидание перед повторной попыткой с экспоненциальным затуханием
+        const waitTime = Math.min(1000 * Math.pow(2, connectionAttempts - 1), 10000);
+        console.log(`⏳ Ожидание ${waitTime}мс перед повторной попыткой...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      }
+    }
+
+    if (!connected) {
+      console.error('💥 Не удалось установить соединение с базой данных после всех попыток');
+      return false;
+    }
+
+    // Создаем таблицы если их нет (с поддержкой IF NOT EXISTS)
+    // Сначала создаем telegram_users, так как на неё ссылаются другие таблицы
+    await executeWithRetry(db, sql`
+      CREATE TABLE IF NOT EXISTS telegram_users (
+        id BIGINT PRIMARY KEY,
+        first_name TEXT NOT NULL,
+        last_name TEXT,
+        username TEXT,
+        photo_url TEXT,
+        auth_date BIGINT,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+    `, "Создание таблицы telegram_users");
+
+    await executeWithRetry(db, sql`
+      CREATE TABLE IF NOT EXISTS bot_projects (
+        id SERIAL PRIMARY KEY,
+        owner_id BIGINT REFERENCES telegram_users(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        description TEXT,
+        data JSONB NOT NULL,
+        bot_token TEXT,
+        user_database_enabled INTEGER DEFAULT 1,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+    `, "Создание таблицы bot_projects");
+
+    await executeWithRetry(db, sql`
+      CREATE TABLE IF NOT EXISTS bot_tokens (
+        id SERIAL PRIMARY KEY,
+        project_id INTEGER REFERENCES bot_projects(id) ON DELETE CASCADE NOT NULL,
+        name TEXT NOT NULL,
+        token TEXT NOT NULL,
+        is_default INTEGER DEFAULT 0,
+        is_active INTEGER DEFAULT 1,
+        description TEXT,
+        bot_first_name TEXT,
+        bot_username TEXT,
+        bot_description TEXT,
+        bot_short_description TEXT,
+        bot_photo_url TEXT,
+        bot_can_join_groups INTEGER,
+        bot_can_read_all_group_messages INTEGER,
+        bot_supports_inline_queries INTEGER,
+        bot_has_main_web_app INTEGER,
+        last_used_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+    `, "Создание таблицы bot_tokens");
+
+    await executeWithRetry(db, sql`
+      CREATE TABLE IF NOT EXISTS bot_instances (
+        id SERIAL PRIMARY KEY,
+        project_id INTEGER REFERENCES bot_projects(id) NOT NULL,
+        token_id INTEGER REFERENCES bot_tokens(id) ON DELETE CASCADE NOT NULL,
+        status TEXT NOT NULL,
+        token TEXT NOT NULL,
+        process_id TEXT,
+        started_at TIMESTAMP DEFAULT NOW(),
+        stopped_at TIMESTAMP,
+        error_message TEXT
+      );
+    `, "Создание таблицы bot_instances");
+
+    await executeWithRetry(db, sql`
+      CREATE TABLE IF NOT EXISTS bot_templates (
+        id SERIAL PRIMARY KEY,
+        owner_id BIGINT REFERENCES telegram_users(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        description TEXT,
+        data JSONB NOT NULL,
+        category TEXT DEFAULT 'custom',
+        tags TEXT[],
+        is_public INTEGER DEFAULT 0,
+        difficulty TEXT DEFAULT 'easy',
+        author_id TEXT,
+        author_name TEXT,
+        use_count INTEGER NOT NULL DEFAULT 0,
+        rating INTEGER NOT NULL DEFAULT 0,
+        rating_count INTEGER NOT NULL DEFAULT 0,
+        featured INTEGER NOT NULL DEFAULT 0,
+        version TEXT DEFAULT '1.0.0',
+        preview_image TEXT,
+        last_used_at TIMESTAMP,
+        download_count INTEGER NOT NULL DEFAULT 0,
+        like_count INTEGER NOT NULL DEFAULT 0,
+        bookmark_count INTEGER NOT NULL DEFAULT 0,
+        view_count INTEGER NOT NULL DEFAULT 0,
+        language TEXT DEFAULT 'ru',
+        requires_token INTEGER NOT NULL DEFAULT 0,
+        complexity INTEGER NOT NULL DEFAULT 1,
+        estimated_time INTEGER NOT NULL DEFAULT 5,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+    `, "Создание таблицы bot_templates");
+
+    await executeWithRetry(db, sql`
+      CREATE TABLE IF NOT EXISTS media_files (
+        id SERIAL PRIMARY KEY,
+        project_id INTEGER REFERENCES bot_projects(id) ON DELETE CASCADE NOT NULL,
+        file_name TEXT NOT NULL,
+        file_type TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        file_size INTEGER NOT NULL,
+        mime_type TEXT NOT NULL,
+        url TEXT NOT NULL,
+        description TEXT,
+        tags TEXT[] DEFAULT '{}',
+        is_public INTEGER DEFAULT 0,
+        usage_count INTEGER DEFAULT 0,
+        telegram_file_id TEXT,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+    `, "Создание таблицы media_files");
+
+    await executeWithRetry(db, sql`
+      CREATE TABLE IF NOT EXISTS bot_groups (
+        id SERIAL PRIMARY KEY,
+        project_id INTEGER REFERENCES bot_projects(id) ON DELETE CASCADE NOT NULL,
+        token_id INTEGER REFERENCES bot_tokens(id) ON DELETE CASCADE,
+        group_id TEXT,
+        name TEXT NOT NULL,
+        url TEXT NOT NULL,
+        is_admin INTEGER DEFAULT 0,
+        member_count INTEGER,
+        is_active INTEGER DEFAULT 1,
+        description TEXT,
+        settings JSONB DEFAULT '{}',
+        avatar_url TEXT,
+        chat_type TEXT DEFAULT 'group',
+        invite_link TEXT,
+        admin_rights JSONB DEFAULT '{"can_manage_chat": false, "can_change_info": false, "can_delete_messages": false, "can_invite_users": false, "can_restrict_members": false, "can_pin_messages": false, "can_promote_members": false, "can_manage_video_chats": false}',
+        messages_count INTEGER DEFAULT 0,
+        active_users INTEGER DEFAULT 0,
+        last_activity TIMESTAMP,
+        is_public INTEGER DEFAULT 0,
+        language TEXT DEFAULT 'ru',
+        timezone TEXT,
+        tags TEXT[] DEFAULT '{}',
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+    `, "Создание таблицы bot_groups");
+
+    await executeWithRetry(db, sql`
+      CREATE UNIQUE INDEX IF NOT EXISTS bot_groups_project_token_group_uniq
+      ON bot_groups (project_id, token_id, group_id)
+      WHERE group_id IS NOT NULL AND token_id IS NOT NULL;
+    `, "Уникальный индекс bot_groups (project_id, token_id, group_id)");
+
+    await executeWithRetry(db, sql`
+      CREATE INDEX IF NOT EXISTS bot_groups_project_token_idx
+      ON bot_groups (project_id, token_id);
+    `, "Индекс bot_groups (project_id, token_id)");
+
+    await executeWithRetry(db, sql`
+      CREATE TABLE IF NOT EXISTS group_members (
+        id SERIAL PRIMARY KEY,
+        group_id INTEGER REFERENCES bot_groups(id) ON DELETE CASCADE NOT NULL,
+        user_id BIGINT NOT NULL,
+        username TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        status TEXT DEFAULT 'member',
+        is_bot INTEGER DEFAULT 0,
+        admin_rights JSONB DEFAULT '{}',
+        custom_title TEXT,
+        restrictions JSONB DEFAULT '{}',
+        restricted_until TIMESTAMP,
+        joined_at TIMESTAMP DEFAULT NOW(),
+        last_seen TIMESTAMP,
+        message_count INTEGER DEFAULT 0,
+        is_active INTEGER DEFAULT 1,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+    `, "Создание таблицы group_members");
+
+    await executeWithRetry(db, sql`
+      CREATE TABLE IF NOT EXISTS bot_users (
+        user_id BIGINT NOT NULL,
+        project_id INTEGER NOT NULL DEFAULT 0,
+        token_id INTEGER NOT NULL DEFAULT 0,
+        username TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        avatar_url TEXT,
+        is_bot INTEGER DEFAULT 0,
+        registered_at TIMESTAMP DEFAULT NOW(),
+        last_interaction TIMESTAMP DEFAULT NOW(),
+        interaction_count INTEGER DEFAULT 0,
+        user_data JSONB DEFAULT '{}',
+        is_active INTEGER DEFAULT 1,
+        is_blocked INTEGER DEFAULT 0,
+        is_deleted INTEGER DEFAULT 0,
+        is_premium INTEGER DEFAULT 0,
+        language_code TEXT,
+        deep_link_param TEXT,
+        referrer_id TEXT,
+        PRIMARY KEY (user_id, project_id, token_id)
+      );
+    `, "Создание таблицы bot_users");
+
+    await executeWithRetry(db, sql`
+      CREATE TABLE IF NOT EXISTS user_telegram_settings (
+        id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL UNIQUE,
+        api_id TEXT,
+        api_hash TEXT,
+        phone_number TEXT,
+        session_string TEXT,
+        is_active INTEGER DEFAULT 1,
+        last_login TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+    `, "Создание таблицы user_telegram_settings");
+
+    await executeWithRetry(db, sql`
+      CREATE TABLE IF NOT EXISTS bot_messages (
+        id SERIAL PRIMARY KEY,
+        project_id INTEGER REFERENCES bot_projects(id) ON DELETE CASCADE NOT NULL,
+        token_id INTEGER NOT NULL DEFAULT 0,
+        user_id TEXT NOT NULL,
+        message_type TEXT NOT NULL,
+        message_text TEXT,
+        message_data JSONB,
+        node_id TEXT,
+        primary_media_id INTEGER REFERENCES media_files(id) ON DELETE SET NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `, "Создание таблицы bot_messages");
+
+    await executeWithRetry(db, sql`
+      CREATE TABLE IF NOT EXISTS bot_message_media (
+        id SERIAL PRIMARY KEY,
+        message_id INTEGER REFERENCES bot_messages(id) ON DELETE CASCADE NOT NULL,
+        media_file_id INTEGER REFERENCES media_files(id) ON DELETE CASCADE NOT NULL,
+        media_kind TEXT NOT NULL,
+        order_index INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `, "Создание таблицы bot_message_media");
+
+    await executeWithRetry(db, sql`
+      CREATE TABLE IF NOT EXISTS message_activity_daily (
+        project_id INTEGER NOT NULL REFERENCES bot_projects(id) ON DELETE CASCADE,
+        token_id INTEGER NOT NULL DEFAULT 0,
+        day DATE NOT NULL,
+        incoming_count INTEGER NOT NULL DEFAULT 0,
+        outgoing_count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (project_id, token_id, day)
+      );
+    `, "Создание таблицы message_activity_daily");
+
+    await executeWithRetry(db, sql`
+      CREATE TABLE IF NOT EXISTS user_activity_daily (
+        project_id INTEGER NOT NULL REFERENCES bot_projects(id) ON DELETE CASCADE,
+        token_id INTEGER NOT NULL DEFAULT 0,
+        day DATE NOT NULL,
+        user_id BIGINT NOT NULL,
+        first_seen_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (project_id, token_id, day, user_id)
+      );
+    `, "Создание таблицы user_activity_daily");
+
+    await executeWithRetry(db, sql`
+      CREATE INDEX IF NOT EXISTS user_activity_daily_project_day_idx
+      ON user_activity_daily (project_id, day);
+    `, "Индекс user_activity_daily_project_day_idx");
+
+    await executeWithRetry(db, sql`
+      CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+    `, "Создание таблицы app_settings");
+
+    // Миграция: добавление primary_media_id в bot_messages если его нет
+    try {
+      const columnCheck = await db.execute(sql`
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'bot_messages'
+        AND column_name = 'primary_media_id';
+      `);
+
+      if (columnCheck.rows.length === 0) {
+        console.log('🔄 Добавляем колонку primary_media_id в таблицу bot_messages...');
+        await executeWithRetry(db, sql`
+          ALTER TABLE bot_messages
+          ADD COLUMN primary_media_id INTEGER REFERENCES media_files(id) ON DELETE SET NULL;
+        `, "Миграция: добавление primary_media_id");
+        console.log('✅ Колонка primary_media_id успешно добавлена');
+      }
+    } catch (error) {
+      console.log('⚠️ Ошибка при проверке/добавлении колонки primary_media_id:', error);
+    }
+
+    // Миграция: добавление sort_order в bot_projects если его нет
+    try {
+      const columnCheck = await db.execute(sql`
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'bot_projects' AND column_name = 'sort_order';
+      `);
+      if (columnCheck.rows.length === 0) {
+        console.log('🔄 Добавляем колонку sort_order в таблицу bot_projects...');
+        await executeWithRetry(db, sql`
+          ALTER TABLE bot_projects ADD COLUMN sort_order REAL DEFAULT 0;
+        `, "Миграция: добавление sort_order в bot_projects");
+        // Инициализируем sort_order по текущему id
+        await executeWithRetry(db, sql`
+          UPDATE bot_projects SET sort_order = id WHERE sort_order = 0;
+        `, "Инициализация sort_order");
+        console.log('✅ Колонка sort_order успешно добавлена в bot_projects');
+      }
+    } catch (error) {
+      console.log('⚠️ Ошибка при проверке/добавлении колонки sort_order в bot_projects:', error);
+    }
+
+    // Миграция: добавление owner_id в bot_projects если его нет
+    try {
+      const columnCheck = await db.execute(sql`
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'bot_projects'
+        AND column_name = 'owner_id';
+      `);
+
+      if (columnCheck.rows.length === 0) {
+        console.log('🔄 Добавляем колонку owner_id в таблицу bot_projects...');
+        await executeWithRetry(db, sql`
+          ALTER TABLE bot_projects
+          ADD COLUMN owner_id BIGINT REFERENCES telegram_users(id) ON DELETE CASCADE;
+        `, "Миграция: добавление owner_id в bot_projects");
+        console.log('✅ Колонка owner_id успешно добавлена в bot_projects');
+      }
+    } catch (error) {
+      console.log('⚠️ Ошибка при проверке/добавлении колонки owner_id в bot_projects:', error);
+    }
+
+    try {
+      const columnCheck = await db.execute(sql`
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'bot_projects'
+        AND column_name = 'admin_ids';
+      `);
+
+      if (columnCheck.rows.length === 0) {
+        console.log('🔄 Добавляем колонку admin_ids в таблицу bot_projects...');
+        await executeWithRetry(db, sql`
+          ALTER TABLE bot_projects
+          ADD COLUMN admin_ids TEXT DEFAULT '';
+        `, "Миграция: добавление admin_ids в bot_projects");
+        console.log('✅ Колонка admin_ids успешно добавлена в bot_projects');
+      }
+    } catch (error) {
+      console.log('⚠️ Ошибка при проверке/добавлении колонки admin_ids в bot_projects:', error);
+    }
+
+    // Миграция: добавление owner_id в bot_templates если его нет
+    try {
+      const columnCheck = await db.execute(sql`
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'bot_templates'
+        AND column_name = 'owner_id';
+      `);
+
+      if (columnCheck.rows.length === 0) {
+        console.log('🔄 Добавляем колонку owner_id в таблицу bot_templates...');
+        await executeWithRetry(db, sql`
+          ALTER TABLE bot_templates
+          ADD COLUMN owner_id BIGINT REFERENCES telegram_users(id) ON DELETE CASCADE;
+        `, "Миграция: добавление owner_id в bot_templates");
+        console.log('✅ Колонка owner_id успешно добавлена в bot_templates');
+      }
+    } catch (error) {
+      console.log('⚠️ Ошибка при проверке/добавлении колонки owner_id в bot_templates:', error);
+    }
+
+    // Миграция: добавление owner_id в bot_tokens если его нет
+    try {
+      const columnCheck = await db.execute(sql`
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'bot_tokens'
+        AND column_name = 'owner_id';
+      `);
+
+      if (columnCheck.rows.length === 0) {
+        console.log('🔄 Добавляем колонку owner_id в таблицу bot_tokens...');
+        await executeWithRetry(db, sql`
+          ALTER TABLE bot_tokens
+          ADD COLUMN owner_id BIGINT REFERENCES telegram_users(id) ON DELETE CASCADE;
+        `, "Миграция: добавление owner_id в bot_tokens");
+        console.log('✅ Колонка owner_id успешно добавлена в bot_tokens');
+      }
+    } catch (error) {
+      console.log('⚠️ Ошибка при проверке/добавлении колонки owner_id в bot_tokens:', error);
+    }
+
+    // Миграция: добавление track_execution_time в bot_tokens если его нет
+    try {
+      const columnCheck = await db.execute(sql`
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'bot_tokens'
+        AND column_name = 'track_execution_time';
+      `);
+
+      if (columnCheck.rows.length === 0) {
+        console.log('🔄 Добавляем колонку track_execution_time в таблицу bot_tokens...');
+        await executeWithRetry(db, sql`
+          ALTER TABLE bot_tokens
+          ADD COLUMN track_execution_time INTEGER DEFAULT 0;
+        `, "Миграция: добавление track_execution_time в bot_tokens");
+        console.log('✅ Колонка track_execution_time успешно добавлена в bot_tokens');
+      }
+    } catch (error) {
+      console.log('⚠️ Ошибка при проверке/добавлении колонки track_execution_time в bot_tokens:', error);
+    }
+
+    // Миграция: добавление total_execution_seconds в bot_tokens если его нет
+    try {
+      const columnCheck = await db.execute(sql`
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'bot_tokens'
+        AND column_name = 'total_execution_seconds';
+      `);
+
+      if (columnCheck.rows.length === 0) {
+        console.log('🔄 Добавляем колонку total_execution_seconds в таблицу bot_tokens...');
+        await executeWithRetry(db, sql`
+          ALTER TABLE bot_tokens
+          ADD COLUMN total_execution_seconds INTEGER DEFAULT 0;
+        `, "Миграция: добавление total_execution_seconds в bot_tokens");
+        console.log('✅ Колонка total_execution_seconds успешно добавлена в bot_tokens');
+      }
+    } catch (error) {
+      console.log('⚠️ Ошибка при проверке/добавлении колонки total_execution_seconds в bot_tokens:', error);
+    }
+
+    // Миграция: добавление protect_content в bot_tokens если его нет
+    try {
+      const columnCheck = await db.execute(sql`
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'bot_tokens'
+        AND column_name = 'protect_content';
+      `);
+
+      if (columnCheck.rows.length === 0) {
+        console.log('🔄 Добавляем колонку protect_content в таблицу bot_tokens...');
+        await executeWithRetry(db, sql`
+          ALTER TABLE bot_tokens
+          ADD COLUMN protect_content INTEGER DEFAULT 0;
+        `, "Миграция: добавление protect_content в bot_tokens");
+        console.log('✅ Колонка protect_content успешно добавлена в bot_tokens');
+      }
+    } catch (error) {
+      console.log('⚠️ Ошибка при проверке/добавлении колонки protect_content в bot_tokens:', error);
+    }
+
+    // Миграция: добавление catch_all_handlers в bot_tokens если его нет
+    try {
+      await executeWithRetry(db, sql`
+        ALTER TABLE bot_tokens
+        ADD COLUMN IF NOT EXISTS catch_all_handlers INTEGER DEFAULT 1;
+      `, "Миграция: добавление catch_all_handlers в bot_tokens");
+    } catch (error) {
+      console.log('⚠️ Ошибка при проверке/добавлении колонки catch_all_handlers в bot_tokens:', error);
+    }
+
+    // Миграция: добавление content_cache в bot_tokens если его нет
+    try {
+      await executeWithRetry(db, sql`
+        ALTER TABLE bot_tokens
+        ADD COLUMN IF NOT EXISTS content_cache INTEGER DEFAULT 0;
+      `, "Миграция: добавление content_cache в bot_tokens");
+      await executeWithRetry(db, sql`
+        ALTER TABLE bot_tokens ALTER COLUMN content_cache SET DEFAULT 0;
+      `, "Миграция: DEFAULT content_cache = 0");
+    } catch (error) {
+      console.log('⚠️ Ошибка при проверке/добавлении колонки content_cache в bot_tokens:', error);
+    }
+
+    // Миграция: срок хранения сообщений диалога
+    try {
+      await executeWithRetry(db, sql`
+        ALTER TABLE bot_tokens
+        ADD COLUMN IF NOT EXISTS messages_retention_days INTEGER NOT NULL DEFAULT 0;
+      `, "Миграция: добавление messages_retention_days в bot_tokens");
+    } catch (error) {
+      console.log('⚠️ Ошибка при проверке/добавлении колонки messages_retention_days в bot_tokens:', error);
+    }
+
+    // Миграция: добавить project_id в bot_users и обновить первичный ключ
+    try {
+      const columnCheck = await db.execute(sql`
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'bot_users'
+        AND column_name = 'project_id';
+      `);
+
+      if (columnCheck.rows.length === 0) {
+        console.log('🔄 Мигрируем таблицу bot_users: добавляем project_id и составной PK...');
+        await executeWithRetry(db, sql`
+          ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS project_id INTEGER NOT NULL DEFAULT 0;
+        `, "Миграция: добавление project_id в bot_users");
+        await executeWithRetry(db, sql`
+          ALTER TABLE bot_users DROP CONSTRAINT IF EXISTS bot_users_pkey;
+        `, "Миграция: удаление старого PK bot_users");
+        await executeWithRetry(db, sql`
+          ALTER TABLE bot_users ADD PRIMARY KEY (user_id, project_id);
+        `, "Миграция: добавление составного PK в bot_users");
+        console.log('✅ Таблица bot_users успешно мигрирована');
+      }
+    } catch (error) {
+      console.log('⚠️ Ошибка при миграции таблицы bot_users:', error);
+    }
+
+    // Миграция: добавить token_id в bot_messages
+    try {
+      await executeWithRetry(db, sql`
+        ALTER TABLE bot_messages
+        ADD COLUMN IF NOT EXISTS token_id INTEGER NOT NULL DEFAULT 0;
+      `, "Миграция: добавление token_id в bot_messages");
+    } catch (error) {
+      console.log('⚠️ Ошибка при миграции token_id в bot_messages:', error);
+    }
+
+    // Миграция: добавить telegram_message_id в bot_messages
+    try {
+      await executeWithRetry(db, sql`
+        ALTER TABLE bot_messages
+        ADD COLUMN IF NOT EXISTS telegram_message_id INTEGER;
+      `, "Миграция: добавление telegram_message_id в bot_messages");
+    } catch (error) {
+      console.log('⚠️ Ошибка при миграции telegram_message_id в bot_messages:', error);
+    }
+
+    // Миграция: добавить chat_type и chat_id в bot_messages
+    try {
+      await executeWithRetry(db, sql`
+        ALTER TABLE bot_messages
+        ADD COLUMN IF NOT EXISTS chat_type TEXT DEFAULT 'private';
+      `, "Миграция: добавление chat_type в bot_messages");
+      await executeWithRetry(db, sql`
+        ALTER TABLE bot_messages
+        ADD COLUMN IF NOT EXISTS chat_id TEXT;
+      `, "Миграция: добавление chat_id в bot_messages");
+    } catch (error) {
+      console.log('⚠️ Ошибка при миграции chat_type/chat_id в bot_messages:', error);
+    }
+
+    // Миграция: добавить token_id в bot_users и обновить первичный ключ
+    try {
+      await executeWithRetry(db, sql`
+        ALTER TABLE bot_users
+        ADD COLUMN IF NOT EXISTS token_id INTEGER NOT NULL DEFAULT 0;
+      `, "Миграция: добавление token_id в bot_users");
+      await executeWithRetry(db, sql`
+        ALTER TABLE bot_users DROP CONSTRAINT IF EXISTS bot_users_pkey;
+      `, "Миграция: пересоздание PK bot_users");
+      await executeWithRetry(db, sql`
+        ALTER TABLE bot_users
+        ADD PRIMARY KEY (user_id, project_id, token_id);
+      `, "Миграция: добавление PK user_id + project_id + token_id");
+    } catch (error) {
+      console.log('⚠️ Ошибка при миграции token_id в bot_users:', error);
+    }
+
+    // Миграция: добавление telegram_file_id в media_files если его нет
+    try {
+      const columnCheck = await db.execute(sql`
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'media_files'
+        AND column_name = 'telegram_file_id';
+      `);
+
+      if (columnCheck.rows.length === 0) {
+        console.log('🔄 Добавляем колонку telegram_file_id в таблицу media_files...');
+        await executeWithRetry(db, sql`
+          ALTER TABLE media_files
+          ADD COLUMN telegram_file_id TEXT;
+        `, "Миграция: добавление telegram_file_id в media_files");
+        console.log('✅ Колонка telegram_file_id успешно добавлена в media_files');
+      }
+    } catch (error) {
+      console.log('⚠️ Ошибка при проверке/добавлении колонки telegram_file_id в media_files:', error);
+    }
+
+    // Миграция: добавление полей трекинга в bot_users (Этап 2A)
+    try {
+      await executeWithRetry(db, sql`
+        ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS is_premium INTEGER DEFAULT 0;
+      `, "Миграция: добавление is_premium в bot_users");
+      await executeWithRetry(db, sql`
+        ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS language_code TEXT;
+      `, "Миграция: добавление language_code в bot_users");
+      await executeWithRetry(db, sql`
+        ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS deep_link_param TEXT;
+      `, "Миграция: добавление deep_link_param в bot_users");
+      await executeWithRetry(db, sql`
+        ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS referrer_id TEXT;
+      `, "Миграция: добавление referrer_id в bot_users");
+      await executeWithRetry(db, sql`
+        ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS avatar_url TEXT;
+      `, "Миграция: добавление avatar_url в bot_users");
+      await executeWithRetry(db, sql`
+        ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS is_bot INTEGER DEFAULT 0;
+      `, "Миграция: добавление is_bot в bot_users");
+    } catch (error) {
+      console.log('⚠️ Ошибка при миграции полей трекинга в bot_users:', error);
+    }
+
+    // Миграция: добавить buttons в broadcasts (инлайн-кнопки сообщения рассылки)
+    try {
+      await executeWithRetry(db, sql`
+        ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS buttons JSON DEFAULT '[]';
+      `, "Миграция: добавление buttons в broadcasts");
+    } catch (error) {
+      console.log('⚠️ Ошибка при миграции buttons в broadcasts:', error);
+    }
+
+    // Миграция: добавить buttons_per_row в broadcasts (раскладка кнопок по рядам)
+    try {
+      await executeWithRetry(db, sql`
+        ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS buttons_per_row INTEGER DEFAULT 0;
+      `, "Миграция: добавление buttons_per_row в broadcasts");
+    } catch (error) {
+      console.log('⚠️ Ошибка при миграции buttons_per_row в broadcasts:', error);
+    }
+
+    // Миграция: кампании рассылок («большая рассылка» по нескольким ботам)
+    try {
+      await executeWithRetry(db, sql`
+        CREATE TABLE IF NOT EXISTS broadcast_campaigns (
+          id SERIAL PRIMARY KEY,
+          project_id INTEGER NOT NULL REFERENCES bot_projects(id) ON DELETE CASCADE,
+          name TEXT NOT NULL,
+          message_text TEXT NOT NULL,
+          media_urls JSON DEFAULT '[]',
+          buttons JSON DEFAULT '[]',
+          buttons_per_row INTEGER DEFAULT 0,
+          filters JSONB NOT NULL DEFAULT '{}',
+          token_ids JSONB NOT NULL DEFAULT '[]',
+          status TEXT NOT NULL DEFAULT 'pending',
+          total_count INTEGER NOT NULL DEFAULT 0,
+          sent_count INTEGER NOT NULL DEFAULT 0,
+          delivered_count INTEGER NOT NULL DEFAULT 0,
+          failed_count INTEGER NOT NULL DEFAULT 0,
+          blocked_count INTEGER NOT NULL DEFAULT 0,
+          deleted_count INTEGER NOT NULL DEFAULT 0,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+          started_at TIMESTAMP WITH TIME ZONE,
+          finished_at TIMESTAMP WITH TIME ZONE
+        );
+      `, "Миграция: создание таблицы broadcast_campaigns");
+      await executeWithRetry(db, sql`
+        CREATE INDEX IF NOT EXISTS broadcast_campaigns_project_idx
+          ON broadcast_campaigns (project_id, created_at DESC);
+      `, "Миграция: индекс broadcast_campaigns_project_idx");
+      await executeWithRetry(db, sql`
+        ALTER TABLE broadcasts
+          ADD COLUMN IF NOT EXISTS campaign_id INTEGER REFERENCES broadcast_campaigns(id) ON DELETE CASCADE;
+      `, "Миграция: добавление campaign_id в broadcasts");
+      await executeWithRetry(db, sql`
+        CREATE INDEX IF NOT EXISTS broadcasts_campaign_idx ON broadcasts (campaign_id);
+      `, "Миграция: индекс broadcasts_campaign_idx");
+    } catch (error) {
+      console.log('⚠️ Ошибка при миграции broadcast_campaigns:', error);
+    }
+
+    // Миграция: is_blocked / is_deleted у bot_users и счётчики рассылок
+    try {
+      await executeWithRetry(db, sql`
+        ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS is_blocked INTEGER NOT NULL DEFAULT 0;
+      `, "Миграция: is_blocked в bot_users");
+      await executeWithRetry(db, sql`
+        ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS is_deleted INTEGER NOT NULL DEFAULT 0;
+      `, "Миграция: is_deleted в bot_users");
+      await executeWithRetry(db, sql`
+        ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS blocked_count INTEGER NOT NULL DEFAULT 0;
+      `, "Миграция: blocked_count в broadcasts");
+      await executeWithRetry(db, sql`
+        ALTER TABLE broadcasts ADD COLUMN IF NOT EXISTS deleted_count INTEGER NOT NULL DEFAULT 0;
+      `, "Миграция: deleted_count в broadcasts");
+      await executeWithRetry(db, sql`
+        ALTER TABLE broadcast_campaigns ADD COLUMN IF NOT EXISTS blocked_count INTEGER NOT NULL DEFAULT 0;
+      `, "Миграция: blocked_count в broadcast_campaigns");
+      await executeWithRetry(db, sql`
+        ALTER TABLE broadcast_campaigns ADD COLUMN IF NOT EXISTS deleted_count INTEGER NOT NULL DEFAULT 0;
+      `, "Миграция: deleted_count в broadcast_campaigns");
+    } catch (error) {
+      console.log('⚠️ Ошибка при миграции флагов блокировки рассылки:', error);
+    }
+
+    // Миграция: token_id у bot_groups (группы per-bot для мультибот-рассылки)
+    try {
+      await executeWithRetry(db, sql`
+        ALTER TABLE bot_groups
+          ADD COLUMN IF NOT EXISTS token_id INTEGER REFERENCES bot_tokens(id) ON DELETE CASCADE;
+      `, "Миграция: token_id в bot_groups");
+      await executeWithRetry(db, sql`
+        DROP INDEX IF EXISTS bot_groups_project_group_uniq;
+      `, "Миграция: drop bot_groups_project_group_uniq");
+      await executeWithRetry(db, sql`
+        CREATE UNIQUE INDEX IF NOT EXISTS bot_groups_project_token_group_uniq
+          ON bot_groups (project_id, token_id, group_id)
+          WHERE group_id IS NOT NULL AND token_id IS NOT NULL;
+      `, "Миграция: bot_groups_project_token_group_uniq");
+      await executeWithRetry(db, sql`
+        CREATE INDEX IF NOT EXISTS bot_groups_project_token_idx
+          ON bot_groups (project_id, token_id);
+      `, "Миграция: bot_groups_project_token_idx");
+    } catch (error) {
+      console.log('⚠️ Ошибка при миграции token_id в bot_groups:', error);
+    }
+
+    // Миграция: личный архив проектов пользователя
+    try {
+      await executeWithRetry(db, sql`
+        CREATE TABLE IF NOT EXISTS user_project_archives (
+          user_id BIGINT NOT NULL REFERENCES telegram_users(id) ON DELETE CASCADE,
+          project_id INTEGER NOT NULL REFERENCES bot_projects(id) ON DELETE CASCADE,
+          archived_at TIMESTAMP NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (user_id, project_id)
+        );
+      `, "Миграция: создание таблицы user_project_archives");
+      await executeWithRetry(db, sql`
+        CREATE INDEX IF NOT EXISTS idx_user_project_archives_user
+          ON user_project_archives(user_id);
+      `, "Миграция: индекс idx_user_project_archives_user");
+      await executeWithRetry(db, sql`
+        CREATE INDEX IF NOT EXISTS idx_user_project_archives_project
+          ON user_project_archives(project_id);
+      `, "Миграция: индекс idx_user_project_archives_project");
+    } catch (error) {
+      console.log('⚠️ Ошибка при миграции user_project_archives:', error);
+    }
+
+    console.log('✅ Таблицы базы данных успешно инициализированы!');
+    return true;
+  } catch (error) {
+    console.error('❌ Инициализация базы данных не удалась:', error);
+    return false;
+  }
+}

@@ -1,0 +1,76 @@
+/**
+ * @fileoverview Переключатель проекта в стиле Railway
+ * @description Компонент выбора активного проекта через дропдаун без рамки и фона
+ */
+
+import { ChevronDown, FolderOpen, Check } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { IdBadge } from '@/components/editor/database/user-database/components/header/project-name-label';
+
+/**
+ * Свойства переключателя проекта
+ */
+export interface ProjectSwitcherProps {
+  /** Список доступных проектов */
+  projects: Array<{ id: number; name: string }>;
+  /** ID текущего активного проекта */
+  currentProjectId: number;
+  /** Имя текущего проекта (если его нет в списке, например в архиве) */
+  currentProjectName?: string;
+  /** Обработчик выбора проекта */
+  onSelect: (id: number) => void;
+}
+
+/**
+ * Переключатель проекта в стиле Railway — текст + стрелка, без рамки
+ * @param props - Свойства компонента
+ * @returns JSX элемент
+ */
+export function ProjectSwitcher({
+  projects,
+  currentProjectId,
+  currentProjectName,
+  onSelect,
+}: ProjectSwitcherProps) {
+  const current = projects.find((p) => p.id === currentProjectId);
+  const displayName = current?.name ?? currentProjectName ?? 'Проект';
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="ghost"
+          title={displayName}
+          className="h-8 min-w-0 max-w-[min(100%,18rem)] gap-1 border-none px-1.5 text-sm font-medium shadow-none focus-visible:ring-0 sm:max-w-72 md:max-w-80 xl:max-w-96"
+        >
+          <span className="truncate">{displayName}</span>
+          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        </Button>
+      </DropdownMenuTrigger>
+
+      <DropdownMenuContent align="start" className="min-w-[14rem] max-w-[min(100vw-2rem,24rem)]">
+        {projects.map((project) => (
+          <DropdownMenuItem
+            key={project.id}
+            onClick={() => onSelect(project.id)}
+            className="flex items-center gap-2"
+            title={project.name}
+          >
+            <FolderOpen className="h-4 w-4 text-muted-foreground flex-shrink-0" />
+            <span className="flex-1 truncate">{project.name}</span>
+            <IdBadge id={project.id} />
+            {project.id === currentProjectId && (
+              <Check className="h-3.5 w-3.5 text-primary flex-shrink-0" />
+            )}
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}

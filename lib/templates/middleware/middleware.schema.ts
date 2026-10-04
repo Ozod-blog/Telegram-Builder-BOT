@@ -1,0 +1,19 @@
+/**
+ * @fileoverview Zod схема для валидации параметров middleware
+ * @module templates/middleware/middleware.schema
+ */
+
+import { z } from 'zod';
+
+/** Схема для валидации параметров middleware */
+export const middlewareParamsSchema = z.object({
+  /** Включена ли база данных пользователей */
+  userDatabaseEnabled: z.boolean().optional().default(false),
+  /** Автоматически регистрировать пользователей при первом обращении */
+  autoRegisterUsers: z.boolean().optional().default(false),
+  /** Сохранять входящие фото от пользователей в БД */
+  saveIncomingMedia: z.boolean().optional().default(false),
+});
+
+/** Тип параметров middleware (выведен из схемы) */
+export type MiddlewareParams = z.infer<typeof middlewareParamsSchema>;

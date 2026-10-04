@@ -1,0 +1,204 @@
+/**
+ * @fileoverview Утилиты управления подключением к БД: health-мониторинг, retry и транзакции
+ * @module server/database/db-utils
+ */
+
+import { sql } from 'drizzle-orm';
+import { db, pool } from './db';
+
+/**
+ * Класс для управления и мониторинга подключения к базе данных
+ * Предоставляет проверку работоспособности, retry и транзакции
+ */
+export class DatabaseManager {
+  private static instance: DatabaseManager;
+  private healthCheckInterval: NodeJS.Timeout | null = null;
+
+  /**
+   * Статистика подключения к базе данных (обновляется health-check'ом)
+   */
+  private connectionStats = {
+    /** Общее количество соединений */
+    totalConnections: 0,
+    /** Активные соединения */
+    activeConnections: 0,
+    /** Неиспользуемые соединения */
+    idleConnections: 0,
+    /** Количество ошибок */
+    errors: 0,
+    /** Время последней проверки работоспособности */
+    lastHealthCheck: new Date()
+  };
+
+  /**
+   * Приватный конструктор для реализации паттерна Singleton
+   */
+  private constructor() { }
+
+  /**
+   * Получить экземпляр класса DatabaseManager (реализация паттерна Singleton)
+   * @returns Экземпляр класса DatabaseManager
+   */
+  static getInstance(): DatabaseManager {
+    if (!DatabaseManager.instance) {
+      DatabaseManager.instance = new DatabaseManager();
+    }
+    return DatabaseManager.instance;
+  }
+
+  /**
+   * Запускает мониторинг работоспособности базы данных
+   * @param intervalMs Интервал проверки в миллисекундах (по умолчанию 30000 мс)
+   */
+  startHealthMonitoring(intervalMs: number = 30000): void {
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+    }
+
+    this.healthCheckInterval = setInterval(async () => {
+      try {
+        await this.performHealthCheck();
+      } catch (error: any) {
+        const errorMessage = error?.message || 'Неизвестная ошибка';
+        // Тихо игнорируем ошибки соединения - переподключение произойдёт автоматически
+        if (!errorMessage.includes('Connection terminated')) {
+          console.warn('⚠️ Мониторинг БД:', errorMessage);
+        }
+        this.connectionStats.errors++;
+      }
+    }, intervalMs);
+
+    console.log('✅ Мониторинг работоспособности базы данных запущен');
+  }
+
+  /**
+   * Останавливает мониторинг работоспособности базы данных
+   */
+  stopHealthMonitoring(): void {
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+      this.healthCheckInterval = null;
+    }
+    console.log('Мониторинг работоспособности базы данных остановлен');
+  }
+
+  /**
+   * Выполняет проверку работоспособности базы данных
+   * @returns Promise<boolean> - true, если проверка прошла успешно, иначе false
+   */
+  async performHealthCheck(): Promise<boolean> {
+    try {
+      // Проверка соединения с помощью простого запроса
+      await db.execute(sql`SELECT 1 as health`);
+
+      // Обновление статистики соединений, если пул доступен
+      if (pool) {
+        this.connectionStats.totalConnections = pool.totalCount || 0;
+        this.connectionStats.activeConnections = (pool.totalCount || 0) - (pool.idleCount || 0);
+        this.connectionStats.idleConnections = pool.idleCount || 0;
+      }
+      this.connectionStats.lastHealthCheck = new Date();
+
+      return true;
+    } catch (error: any) {
+      const errorMessage = error?.message || 'Неизвестная ошибка';
+
+      // Не логируем как ошибку, если соединение просто закрылось (это нормально при перезапуске БД)
+      if (errorMessage.includes('Connection terminated unexpectedly') ||
+          errorMessage.includes('Connection terminated') ||
+          errorMessage.includes('ECONNRESET') ||
+          errorMessage.includes('ETIMEDOUT')) {
+        console.warn('⚠️ Соединение с БД разорвано (переподключение...):', errorMessage);
+      } else {
+        console.error('❌ Проверка работоспособности БД не удалась:', errorMessage);
+      }
+
+      this.connectionStats.errors++;
+      return false;
+    }
+  }
+
+  /**
+   * Выполняет операцию с базой данных с логикой повторных попыток
+   * @param operation Функция, представляющая операцию с базой данных
+   * @param maxRetries Максимальное количество повторных попыток (по умолчанию 3)
+   * @param retryDelay Задержка между попытками в миллисекундах (по умолчанию 1000)
+   * @returns Promise<T> Результат выполнения операции
+   */
+  async executeWithRetry<T>(
+    operation: () => Promise<T>,
+    maxRetries: number = 3,
+    retryDelay: number = 1000
+  ): Promise<T> {
+    let lastError: Error | null = null;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        return await operation();
+      } catch (error) {
+        lastError = error as Error;
+        console.warn(`Операция с базой данных не удалась (попытка ${attempt}/${maxRetries}):`, error);
+
+        if (attempt === maxRetries) {
+          break;
+        }
+
+        // Ожидание перед повторной попыткой
+        await new Promise(resolve => setTimeout(resolve, retryDelay * attempt));
+      }
+    }
+
+    throw lastError;
+  }
+
+  /**
+   * Обертка для выполнения транзакции с автоматическим откатом
+   * @param operation Функция, представляющая операции в транзакции
+   * @returns Promise<T> Результат выполнения транзакции
+   */
+  async transaction<T>(
+    operation: (txDb: any) => Promise<T>
+  ): Promise<T> {
+    return await db.transaction(async (tx) => {
+      try {
+        const result = await operation(tx);
+        return result;
+      } catch (error: any) {
+        console.error('Подробная ошибка:', error?.message, error?.stack);
+        throw new Error(`Транзакция не удалась: ${error?.message || 'Неизвестная ошибка'}`);
+      }
+    });
+  }
+}
+
+/**
+ * Экземпляр менеджера базы данных (реализация паттерна Singleton)
+ */
+export const dbManager = DatabaseManager.getInstance();
+
+// Автоматический запуск мониторинга при импорте модуля
+dbManager.startHealthMonitoring();
+
+/**
+ * Обработка корректного завершения работы приложения
+ * Останавливает мониторинг работоспособности базы данных
+ */
+process.on('SIGTERM', () => {
+  dbManager.stopHealthMonitoring();
+});
+
+/**
+ * Обработка завершения работы через сигнал прерывания
+ * Останавливает мониторинг работоспособности базы данных
+ */
+process.on('SIGINT', () => {
+  dbManager.stopHealthMonitoring();
+});
+
+/**
+ * Обработка завершения работы через SIGHUP
+ * Останавливает мониторинг работоспособности базы данных
+ */
+process.on('SIGHUP', () => {
+  dbManager.stopHealthMonitoring();
+});

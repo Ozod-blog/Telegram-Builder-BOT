@@ -1,0 +1,44 @@
+/**
+ * @fileoverview Параметры для шаблона импортов
+ * @module templates/imports/imports.params
+ */
+
+/** Параметры для генерации Python импортов */
+export interface ImportsTemplateParams {
+  /** Включена ли база данных пользователей (asyncpg, json) */
+  userDatabaseEnabled?: boolean;
+  /** Есть ли inline кнопки (нужен TelegramBadRequest) */
+  hasInlineButtons?: boolean;
+  /** Есть ли автопереходы (нужен TelegramBadRequest) */
+  hasAutoTransitions?: boolean;
+  /** Есть ли узлы с медиа (нужен aiohttp) */
+  hasMediaNodes?: boolean;
+  /** Есть ли ссылки на /uploads/ (нужен aiohttp) */
+  hasUploadImages?: boolean;
+  /** Есть ли узлы с HTML/Markdown форматированием (нужен ParseMode) */
+  hasParseModeNodes?: boolean;
+  /** Есть ли узлы с группами медиа (attachedMedia.length > 1) */
+  hasMediaGroups?: boolean;
+  /** Есть ли узлы с URL изображениями (imageUrl.startsWith('http')) */
+  hasUrlImages?: boolean;
+  /** Есть ли узлы требующие datetime */
+  hasDatetimeNodes?: boolean;
+  /** Есть ли узлы требующие timezone */
+  hasTimezoneNodes?: boolean;
+  /** Есть ли reply-клавиатура */
+  hasReplyKeyboard?: boolean;
+  /** Есть ли локальные медиафайлы */
+  hasLocalMediaFiles?: boolean;
+  /** Есть ли команды бота */
+  hasBotCommands?: boolean;
+  /** Есть ли deep link триггеры (нужен CommandObject) */
+  hasDeepLinkTriggers?: boolean;
+  /** Есть ли узлы userbot_message (нужен Telethon) */
+  hasUserbotNodes?: boolean;
+  /** Есть ли узлы rate_counter (нужен deque и time) */
+  hasRateCounterNodes?: boolean;
+  /** Есть ли узлы send_invoice (нужен LabeledPrice) */
+  hasSendInvoiceNodes?: boolean;
+  /** Есть ли таймаут ожидания ввода или сбор ответов */
+  hasInputTimeoutNodes?: boolean;
+}

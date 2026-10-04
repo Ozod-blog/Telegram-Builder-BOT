@@ -1,0 +1,14 @@
+/**
+ * @fileoverview Экспорт типов параметров шаблонов
+ * @module templates/types
+ */
+
+export type { ImportsTemplateParams } from './imports-params';
+export type { ConfigTemplateParams } from './config-params';
+export type { BotTemplateParams, BotTemplateNode } from './bot-params';
+export type { HeaderTemplateParams } from './header-params';
+export type { DatabaseTemplateParams } from './database-params';
+export type { UtilsTemplateParams } from './utils-params';
+export type { MainTemplateParams } from './main-params';
+export type { HttpRequestTemplateParams, HttpRequestMethod } from '../http-request/http-request.params';
+export type { KeyboardLayout, KeyboardRow } from './keyboard-layout';

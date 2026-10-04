@@ -1,0 +1,347 @@
+{#
+  Запуск бота
+
+  @fileoverview Главная функция main() и запуск поллинга
+  @param {boolean} userDatabaseEnabled - Включена ли база данных пользователей (для инициализации БД)
+  @param {boolean} hasInlineButtons - Есть ли inline кнопки (для callback middleware)
+  @param {list} menuCommands - Список команд меню [{command, description}]
+#}
+{% if menuCommands and menuCommands | length > 0 %}
+async def set_bot_commands():
+    """Настройка меню команд для BotFather. Ошибка не должна ронять старт бота."""
+    from aiogram.exceptions import TelegramRetryAfter
+    commands = [
+{% for cmd in menuCommands %}
+        BotCommand(command="{{ cmd.command }}", description="{{ cmd.description }}"),
+{% endfor %}
+    ]
+    for _attempt in range(1, 4):
+        try:
+            await bot.set_my_commands(commands)
+            return
+        except TelegramRetryAfter as _err:
+            _wait = getattr(_err, "retry_after", 5) + 1
+            logging.warning(
+                f"Flood на SetMyCommands: ждём {_wait}с (попытка {_attempt}/3)"
+            )
+            await asyncio.sleep(_wait)
+        except Exception as _err:
+            logging.warning(f"Меню команд не обновлено: {_err}")
+            return
+    logging.warning(
+        "Меню команд не обновлено: лимит Telegram, бот продолжает работу"
+    )
+
+{% endif %}
+
+# Event остановки: worker pool вызывает request_bot_stop() (signal в воркере заглушен)
+_bot_stop_event = None
+
+
+def request_bot_stop():
+    """Graceful stop от worker pool — ставит _stop_event без cancel задачи."""
+    global _bot_stop_event
+    if _bot_stop_event is not None:
+        _bot_stop_event.set()
+
+
+async def main():
+    """Главная функция запуска бота"""
+    global db_pool, dp, _redis_client, _redis_connected, _bot_stop_event
+
+    _stop_event = asyncio.Event()
+    _bot_stop_event = _stop_event
+    _lock_acquired = False
+    _background_tasks: list = []  # Все фоновые задачи для корректной отмены при остановке
+    _webhook_runner = None  # aiohttp runner для корректного завершения webhook-сервера
+    _polling_task = None  # Задача dp.start_polling для stop_polling при CancelledError
+
+    def signal_handler(signum, _frame):
+        print(f"⚠️ Получен сигнал {signum}, начинаем корректное завершение...")
+        _stop_event.set()
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    try:
+        # Инициализация Redis клиента (если REDIS_URL задан)
+        _redis_connected = await init_redis_client()
+        
+        # Если Redis успешно подключился — переключаем storage у уже созданного Dispatcher
+        if _redis_connected and _redis_client is not None:
+            dp.fsm.storage = RedisStorage(_redis_client, TOKEN_ID)
+            logging.info("🔴 FSM хранилище: Redis")
+        else:
+            logging.info("🐘 FSM хранилище: PostgreSQL")
+
+        # Distributed lock через Redis — защита от двойного запуска (только в polling режиме)
+        # В webhook режиме двойной запуск невозможен — Telegram шлёт апдейты на один URL
+        if not WEBHOOK_URL and _redis_connected and _redis_client is not None:
+            _lock_key = f"bot:lock:{BOT_TOKEN[-10:]}"
+            _lock_acquired = await _redis_client.set(_lock_key, "1", nx=True, ex=60)
+            if not _lock_acquired:
+                logging.warning(
+                    f"⚠️ Бот уже запущен (Redis lock занят, TOKEN_ID={TOKEN_ID}). Завершаем дублирующий процесс."
+                )
+                return
+            logging.info("🔒 Redis lock получен — бот запускается")
+
+            # Фоновая задача: обновляем lock каждые 30 секунд пока бот работает
+            async def _refresh_lock():
+                while True:
+                    await asyncio.sleep(30)
+                    try:
+                        await _redis_client.expire(_lock_key, 60)
+                    except Exception:
+                        pass
+
+            _background_tasks.append(asyncio.create_task(_refresh_lock()))
+
+        # Публикуем событие о запуске бота в Redis (если доступен)
+        if _redis_connected and _redis_client is not None:
+            try:
+                import json as _json
+                await _redis_client.publish(
+                    f"bot:started:{PROJECT_ID}:{TOKEN_ID}",
+                    _json.dumps({"projectId": PROJECT_ID, "tokenId": TOKEN_ID, "timestamp": __import__('datetime').datetime.now().isoformat()})
+                )
+            except Exception:
+                pass
+
+        {%- if userDatabaseEnabled %}
+        await init_database()
+        {%- endif %}
+
+        # Загружаем кэш Telegram file_id из media_file_tokens только для текущего TOKEN_ID
+        if db_pool:
+            await _load_media_file_id_cache()
+
+{%- if projectId and contentCache %}
+        # Загрузка контента из таблицы _content
+        if db_pool:
+            await load_content(db_pool)
+{%- endif %}
+
+        {%- if menuCommands and menuCommands | length > 0 %}
+        await set_bot_commands()
+        {%- endif %}
+
+        {# Фильтр устаревших апдейтов — регистрируем первым чтобы отсеивать до всей логики #}
+        dp.message.middleware(stale_update_filter_middleware)
+
+        {%- if userDatabaseEnabled %}
+        dp.message.middleware(message_logging_middleware)
+        dp.message.outer_middleware(BotOutgoingLoggingMiddleware())
+        _wrap_bot_send_message(bot)
+        _wrap_bot_send_photo(bot)
+        _wrap_bot_send_video(bot)
+        _wrap_bot_send_audio(bot)
+        _wrap_bot_send_document(bot)
+        _wrap_message_answer(bot)
+        _wrap_bot_send_sticker(bot)
+        _wrap_bot_send_voice(bot)
+        _wrap_bot_send_animation(bot)
+        _wrap_bot_send_media_group(bot)
+        {%- if hasInlineButtons %}
+        dp.callback_query.middleware(callback_query_logging_middleware)
+        {%- endif %}
+        {%- endif %}
+
+        {%- if autoRegisterUsers %}
+        dp.message.middleware(register_user_middleware)
+        {%- endif %}
+
+        {%- if incomingMessageTriggerMiddlewares and incomingMessageTriggerMiddlewares | length > 0 %}
+        {%- for mw in incomingMessageTriggerMiddlewares %}
+        dp.message.middleware({{ mw }})
+        {%- endfor %}
+        {%- endif %}
+
+        {%- if managedBotUpdatedTriggerMiddlewares and managedBotUpdatedTriggerMiddlewares | length > 0 %}
+        {%- for mw in managedBotUpdatedTriggerMiddlewares %}
+        dp.message.middleware({{ mw }})
+        {%- endfor %}
+        {%- endif %}
+
+        # Запускаем фоновую задачу TTL-очистки user_data
+        _background_tasks.append(asyncio.create_task(cleanup_user_data()))
+
+{%- if hasUserbotNodes %}
+        # Подключаем Telethon userbot клиент
+        if userbot_client:
+            await userbot_client.connect()
+            if not await userbot_client.is_user_authorized():
+                logging.error("❌ Userbot не авторизован — проверьте USERBOT_SESSION_STRING")
+            else:
+                logging.info("🟣 Telethon userbot подключён")
+{%- endif %}
+
+{%- if projectId and contentCache %}
+        # Фоновая перезагрузка контента из _content каждые 60 сек (fallback)
+        if db_pool:
+            _background_tasks.append(asyncio.create_task(_content_reload_loop(db_pool)))
+        # Мгновенное обновление контента через Redis pub/sub
+        if _redis_connected:
+            _background_tasks.append(asyncio.create_task(_content_subscribe_redis()))
+{%- endif %}
+
+        # Выбор режима запуска: webhook или polling
+        if WEBHOOK_URL:
+            # Webhook режим — запускаем aiohttp сервер
+            from aiohttp import web
+            from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+
+            webhook_path = f"/api/webhook/{PROJECT_ID}/{TOKEN_ID}"
+            full_webhook_url = f"{WEBHOOK_URL.rstrip('/')}{webhook_path}"
+
+            logging.info(f"🌐 Webhook режим: {full_webhook_url}")
+            logging.info(f"🔌 Порт aiohttp: {WEBHOOK_PORT}")
+
+            await bot.set_webhook(full_webhook_url)
+
+            app = web.Application()
+            SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/webhook")
+            setup_application(app, dp, bot=bot)
+{%- if hasApiTrigger %}
+            register_api_trigger_routes(app)
+{%- endif %}
+
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, host="0.0.0.0", port=WEBHOOK_PORT)
+            await site.start()
+            _webhook_runner = runner
+
+            logging.info(f"✅ Webhook сервер запущен на порту {WEBHOOK_PORT}")
+            await _stop_event.wait()
+
+            await runner.cleanup()
+            _webhook_runner = None
+            await bot.delete_webhook()
+        else:
+            # Polling режим — с backoff при Telegram Conflict (два getUpdates)
+            logging.info("🔄 Polling режим")
+{%- if hasApiTrigger %}
+            from aiohttp import web
+            _api_app = web.Application()
+            register_api_trigger_routes(_api_app)
+            _api_runner = web.AppRunner(_api_app)
+            await _api_runner.setup()
+            _api_site = web.TCPSite(_api_runner, host="0.0.0.0", port=WEBHOOK_PORT)
+            await _api_site.start()
+            _webhook_runner = _api_runner
+            logging.info(f"✅ API сервер запущен на порту {WEBHOOK_PORT}")
+{%- endif %}
+            _conflict_attempt = 0
+            _max_conflict_retries = 6
+            while _conflict_attempt < _max_conflict_retries:
+                try:
+                    _polling_task = asyncio.create_task(dp.start_polling(bot))
+                    _background_tasks.append(_polling_task)
+                    await _stop_event.wait()
+                    await dp.stop_polling()
+                    try:
+                        await _polling_task
+                    except Exception:
+                        pass
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _poll_err:
+                    _err_text = f"{type(_poll_err).__name__}: {_poll_err}"
+                    if "Conflict" not in _err_text and "terminated by other getUpdates" not in _err_text:
+                        raise
+                    _conflict_attempt += 1
+                    logging.warning(
+                        f"⚠️ Telegram Conflict (попытка {_conflict_attempt}/{_max_conflict_retries}), ждём 10с..."
+                    )
+                    if _stop_event.is_set():
+                        break
+                    await asyncio.sleep(10)
+            else:
+                logging.error("❌ Polling остановлен: исчерпаны попытки после Telegram Conflict")
+    except KeyboardInterrupt:
+        print("⚠️ Получен сигнал остановки, завершаем работу...")
+    except SystemExit:
+        print("⚠️ Системное завершение, завершаем работу...")
+    except asyncio.CancelledError:
+        print("⚠️ Бот остановлен воркером (CancelledError)")
+        # Пытаемся закрыть getUpdates до проброса cancel (иначе Conflict у нового инстанса)
+        try:
+            await dp.stop_polling()
+        except Exception:
+            pass
+        if _polling_task is not None and not _polling_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(_polling_task), timeout=3.0)
+            except Exception:
+                pass
+        # Пробрасываем cancel воркеру: иначе _run_bot видит нормальный выход и
+        # эмитит bot_exited:{id}:running вместо stopped
+        raise
+    except Exception as e:
+        logging.error(f"Ошибка: {e}")
+        raise
+    finally:
+        _bot_stop_event = None
+        # Отменяем все фоновые задачи перед закрытием ресурсов
+        for _task in _background_tasks:
+            if not _task.done():
+                _task.cancel()
+        if _background_tasks:
+            try:
+                await asyncio.gather(*_background_tasks, return_exceptions=True)
+            except Exception:
+                pass
+        _background_tasks.clear()
+
+        # Останавливаем webhook-сервер если он был запущен (освобождаем порт)
+        if _webhook_runner:
+            try:
+                await _webhook_runner.cleanup()
+            except Exception:
+                pass
+        {%- if hasScheduleTrigger %}
+        # Останавливаем фоновые schedule-задачи
+        try:
+            await _cancel_schedule_tasks()
+        except Exception:
+            pass
+        {%- endif %}
+
+        {%- if userDatabaseEnabled %}
+        if db_pool:
+            await db_pool.close()
+        {%- endif %}
+
+        # Освобождаем Redis lock при завершении (только в polling режиме — в webhook lock не устанавливался)
+        if not WEBHOOK_URL and _redis_connected and _redis_client is not None and _lock_acquired:
+            try:
+                await _redis_client.delete(f"bot:lock:{BOT_TOKEN[-10:]}")
+                logging.info("🔓 Redis lock освобождён")
+            except Exception:
+                pass
+
+        # Публикуем событие об остановке бота в Redis (если доступен)
+        if _redis_connected and _redis_client is not None:
+            try:
+                import json as _json
+                await _redis_client.publish(
+                    f"bot:stopped:{PROJECT_ID}:{TOKEN_ID}",
+                    _json.dumps({"projectId": PROJECT_ID, "tokenId": TOKEN_ID, "timestamp": __import__('datetime').datetime.now().isoformat()})
+                )
+            except Exception:
+                pass
+
+        await bot.session.close()
+
+{%- if hasUserbotNodes %}
+        # Отключаем Telethon userbot
+        if userbot_client and userbot_client.is_connected():
+            await userbot_client.disconnect()
+            logging.info("🟣 Telethon userbot отключён")
+{%- endif %}
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

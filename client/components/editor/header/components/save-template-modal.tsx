@@ -1,0 +1,362 @@
+import { useState } from 'react';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
+import { Label } from '@/components/ui/label';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Save, Loader2 } from 'lucide-react';
+import { useToast } from '@/hooks/use-toast';
+import { useTelegramAuth } from '@/components/editor/header/hooks/use-telegram-auth';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { apiRequest } from '@/queryClient';
+import type { BotData } from '@/types/bot';
+
+/**
+ * Интерфейс пропсов для модального окна сохранения сценария
+ * @interface SaveTemplateModalProps
+ */
+interface SaveTemplateModalProps {
+  /** Флаг открытия модального окна */
+  isOpen: boolean;
+  /** Функция закрытия модального окна */
+  onClose: () => void;
+  /** Данные бота для сохранения в сценарий */
+  botData: BotData;
+  /** Необязательное название проекта для автозаполнения */
+  projectName?: string;
+}
+
+/**
+ * Интерфейс данных формы создания сценария
+ * @interface TemplateFormData
+ */
+interface TemplateFormData {
+  /** Название сценария */
+  name: string;
+  /** Описание сценария */
+  description: string;
+  /** Категория сценария */
+  category: string;
+  /** Флаг публичности сценария */
+  isPublic: boolean;
+  /** Флаг анонимного сохранения */
+  isAnonymous: boolean;
+}
+
+/**
+ * Компонент модального окна для сохранения бота как сценария
+ *
+ * Позволяет пользователю сохранить текущий бот в виде сценария с настройками:
+ * - Название и описание сценария
+ * - Категория (пользовательский, бизнес, утилиты, игры)
+ * - Публичность (доступен другим пользователям)
+ * - Анонимность (скрыть имя автора)
+ *
+ * Поддерживает как обычные, так и многолистовые сценарии ботов.
+ * Автоматически вычисляет статистику сценария (узлы, связи, команды, кнопки).
+ *
+ * @param {SaveTemplateModalProps} props - Пропсы компонента
+ * @returns {JSX.Element} Модальное окно сохранения сценария
+ */
+export function SaveTemplateModal({ isOpen, onClose, botData, projectName }: SaveTemplateModalProps) {
+  const [formData, setFormData] = useState<TemplateFormData>({
+    name: projectName ? `${projectName} - Сценарий` : 'Новый сценарий',
+    description: '',
+    category: 'custom',
+    isPublic: false,
+    isAnonymous: false,
+  });
+  const { toast } = useToast();
+  const { user } = useTelegramAuth();
+  const queryClient = useQueryClient();
+
+  /**
+   * Функция для вычисления статистики бота с поддержкой многолистовых сценариев
+   *
+   * Анализирует структуру данных бота и подсчитывает:
+   * - Общее количество узлов (nodes)
+   * - Общее количество связей (connections + interSheetConnections)
+   * - Количество команд (узлы с полем command)
+   * - Общее количество кнопок во всех узлах
+   *
+   * @param {BotData | any} data - Данные бота для анализа
+   * @returns {Object} Объект со статистикой: nodes, connections, commands, buttons
+   */
+  const getStats = (data: BotData | any) => {
+    let nodes: any[] = [];
+    let connections: any[] = [];
+
+    // Проверяем, это многолистовой сценарий или обычный
+    if (data.sheets && Array.isArray(data.sheets)) {
+      // Многолистовой сценарий - собираем все узлы и связи из всех листов
+      data.sheets.forEach((sheet: any) => {
+        if (sheet.nodes) nodes.push(...sheet.nodes);
+        if (sheet.connections) connections.push(...sheet.connections);
+      });
+      // Добавляем межлистовые связи
+      if (data.interSheetConnections) {
+        connections.push(...data.interSheetConnections);
+      }
+    } else {
+      // Обычный сценарий
+      nodes = data.nodes || [];
+      connections = data.connections || [];
+    }
+    
+    return {
+      nodes: nodes.length,
+      connections: connections.length,
+      commands: nodes.filter(node => node.data?.command).length,
+      buttons: nodes.reduce((acc, node) => acc + (node.data?.buttons?.length || 0), 0),
+    };
+  };
+
+  const stats = getStats(botData);
+
+  /**
+   * Мутация для сохранения сценария на сервере
+   *
+   * Отправляет POST запрос на /api/templates с данными формы и бота.
+   * При успешном сохранении:
+   * - Инвалидирует кэш сценариев
+   * - Показывает уведомление об успехе
+   * - Закрывает модальное окно
+   * - Сбрасывает форму
+   *
+   * При ошибке показывает уведомление об ошибке.
+   */
+  const saveTemplateMutation = useMutation({
+    mutationFn: async (data: TemplateFormData) => {
+      return await apiRequest('POST', '/api/templates', {
+        name: data.name,
+        description: data.description,
+        category: data.category,
+        tags: [],
+        isPublic: data.isPublic ? 1 : 0,
+        difficulty: 'easy',
+        language: 'ru',
+        requiresToken: 1,
+        complexity: 1,
+        estimatedTime: 5,
+        authorName: data.isAnonymous ? null : (user?.username || 'Пользователь'),
+        data: botData,
+      });
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['/api/templates'] });
+      queryClient.invalidateQueries({ queryKey: ['/api/templates/category/custom'] });
+      toast({
+        title: 'Сценарий сохранен',
+        description: 'Ваш сценарий бота успешно сохранен',
+      });
+      onClose();
+      resetForm();
+    },
+    onError: () => {
+      toast({
+        title: 'Ошибка',
+        description: 'Не удалось сохранить сценарий',
+        variant: 'destructive',
+      });
+    },
+  });
+
+  /**
+   * Функция сброса формы к начальным значениям
+   *
+   * Восстанавливает все поля формы к значениям по умолчанию:
+   * - Название: "{projectName} - Сценарий" или "Новый сценарий"
+   * - Описание: пустая строка
+   * - Категория: "custom"
+   * - Публичность: false
+   * - Анонимность: false
+   */
+  const resetForm = () => {
+    setFormData({
+      name: projectName ? `${projectName} - Сценарий` : 'Новый сценарий',
+      description: '',
+      category: 'custom',
+      isPublic: false,
+      isAnonymous: false,
+    });
+  };
+
+
+  /**
+   * Обработчик сохранения сценария
+   *
+   * Выполняет валидацию формы (проверяет наличие названия)
+   * и запускает мутацию сохранения сценария.
+   *
+   * При отсутствии названия показывает ошибку валидации.
+   */
+  const handleSave = () => {
+    if (!formData.name.trim()) {
+      toast({
+        title: 'Ошибка',
+        description: 'Название сценария обязательно',
+        variant: 'destructive',
+      });
+      return;
+    }
+    saveTemplateMutation.mutate(formData);
+  };
+
+  /**
+   * Список доступных категорий сценариев
+   *
+   * Содержит предопределенные категории для классификации сценариев:
+   * - custom: Пользовательский
+   * - business: Бизнес
+   * - utility: Утилиты
+   * - games: Игры
+   */
+  const categories = [
+    { value: 'custom', label: 'Пользовательский' },
+    { value: 'business', label: 'Бизнес' },
+    { value: 'utility', label: 'Утилиты' },
+    { value: 'games', label: 'Игры' },
+  ];
+
+  return (
+    <Dialog open={isOpen} onOpenChange={onClose}>
+      <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <Save className="h-5 w-5" />
+            Сохранить как сценарий
+          </DialogTitle>
+          <DialogDescription className="sr-only">
+            Сохраните текущую схему бота как сценарий для повторного использования
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-6 py-4">
+          {/* Название */}
+          <div className="space-y-2">
+            <Label htmlFor="name">Название сценария</Label>
+            <Input
+              id="name"
+              value={formData.name}
+              onChange={(e) => setFormData(prev => ({ ...prev, name: e.target.value }))}
+              placeholder="Введите название сценария"
+            />
+          </div>
+
+          {/* Описание */}
+          <div className="space-y-2">
+            <Label htmlFor="description">Описание</Label>
+            <Textarea
+              id="description"
+              value={formData.description}
+              onChange={(e) => setFormData(prev => ({ ...prev, description: e.target.value }))}
+              placeholder="Краткое описание того, для чего предназначен этот сценарий"
+              rows={3}
+            />
+          </div>
+
+          {/* Категория */}
+          <div className="space-y-2">
+            <Label>Категория</Label>
+            <Select
+              value={formData.category}
+              onValueChange={(value) => setFormData(prev => ({ ...prev, category: value }))}
+            >
+              <SelectTrigger>
+                <SelectValue placeholder="Выберите категорию" />
+              </SelectTrigger>
+              <SelectContent>
+                {categories.map((category) => (
+                  <SelectItem key={category.value} value={category.value}>
+                    {category.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          {/* Публичность */}
+          <div className="space-y-3">
+            <div className="flex items-center space-x-2">
+              <input
+                id="isPublic"
+                type="checkbox"
+                checked={formData.isPublic}
+                onChange={(e) => setFormData(prev => ({ ...prev, isPublic: e.target.checked }))}
+                className="h-4 w-4"
+              />
+              <Label htmlFor="isPublic">
+                Сделать сценарий публичным (другие пользователи смогут его использовать)
+              </Label>
+            </div>
+
+            {/* Предупреждение о видимости */}
+            {formData.isPublic && !formData.isAnonymous && (
+              <div className="p-3 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded-lg text-sm text-yellow-800 dark:text-yellow-200">
+                ⚠️ <strong>Внимание!</strong> Ваш юзернейм Telegram будет виден всем, кто использует этот сценарий.
+              </div>
+            )}
+
+            {/* Анонимность */}
+            <div className="flex items-center space-x-2">
+              <input
+                id="isAnonymous"
+                type="checkbox"
+                checked={formData.isAnonymous}
+                onChange={(e) => setFormData(prev => ({ ...prev, isAnonymous: e.target.checked }))}
+                className="h-4 w-4"
+              />
+              <Label htmlFor="isAnonymous">
+                Сохранить анонимно (скрыть мой юзернейм)
+              </Label>
+            </div>
+
+            {/* Инфо об анонимности */}
+            {formData.isAnonymous && (
+              <div className="p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg text-sm text-blue-800 dark:text-blue-200">
+                ✓ Сценарий будет сохранён как "Сохранено от сообщества"
+              </div>
+            )}
+          </div>
+
+          {/* Статистика сценария */}
+          <div className="p-4 bg-muted rounded-lg">
+            <h4 className="font-medium mb-2">Информация о сценарии:</h4>
+            <div className="grid grid-cols-2 gap-4 text-sm">
+              <div>
+                <span className="text-muted-foreground">Узлов:</span>
+                <span className="ml-2 font-medium">{stats.nodes}</span>
+              </div>
+              <div>
+                <span className="text-muted-foreground">Связей:</span>
+                <span className="ml-2 font-medium">{stats.connections}</span>
+              </div>
+              <div>
+                <span className="text-muted-foreground">Команд:</span>
+                <span className="ml-2 font-medium">{stats.commands}</span>
+              </div>
+              <div>
+                <span className="text-muted-foreground">Кнопок:</span>
+                <span className="ml-2 font-medium">{stats.buttons}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
+            Отмена
+          </Button>
+          <Button
+            onClick={handleSave}
+            disabled={saveTemplateMutation.isPending || !formData.name.trim()}
+          >
+            {saveTemplateMutation.isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+            Сохранить сценарий
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}

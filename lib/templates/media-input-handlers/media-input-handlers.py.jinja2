@@ -1,0 +1,775 @@
+{#
+  Обработчики входящих медиафайлов от пользователя
+
+  @param {boolean} hasPhotoInput   - Есть узлы с enablePhotoInput
+  @param {boolean} hasVideoInput   - Есть узлы с enableVideoInput
+  @param {boolean} hasAudioInput   - Есть узлы с enableAudioInput
+  @param {boolean} hasDocumentInput - Есть узлы с enableDocumentInput
+  @param {boolean} hasLocationInput - Есть узлы с enableLocationInput
+  @param {boolean} hasContactInput - Есть узлы с enableContactInput
+  @param {string}  navigationCode  - Код навигации к следующему узлу
+  @param {Array}   mediaMetadataConfigs - Конфигурация сохранения метаданных медиа
+  @param {boolean} hasInputTimeoutNodes - Нужны ли вызовы таймаута/form_session
+#}
+
+{% macro finalize_media_input(var_name) %}
+{% if hasInputTimeoutNodes %}
+    await _cancel_input_timeout_task(user_id)
+    _track_form_variable(user_id, {{ var_name }})
+{% endif %}
+    del user_data[user_id]["waiting_for_input"]
+{% endmacro %}
+
+{% if hasPhotoInput %}
+# Обработчик получения фото от пользователя
+@dp.message(F.photo)
+async def handle_photo_input(message: types.Message):
+    user_id = message.from_user.id
+    logging.info(f"📸 Получено фото от пользователя {user_id}")
+
+    if user_id not in user_data or "waiting_for_input" not in user_data[user_id]:
+        logging.info(f"Фото от пользователя {user_id} проигнорировано - не ожидается ввод")
+        return
+
+    waiting_config = user_data[user_id]["waiting_for_input"]
+    waiting_modes = waiting_config.get("modes", []) if isinstance(waiting_config, dict) else []
+    if not (
+        isinstance(waiting_config, dict) and (
+            waiting_config.get("type") == "photo" or
+            (isinstance(waiting_modes, list) and "photo" in waiting_modes)
+        )
+    ):
+        logging.info(f"Фото от пользователя {user_id} проигнорировано - ожидается другой тип ввода")
+        return
+
+    photo_variable = waiting_config.get("photo_variable") or waiting_config.get("variable") or "user_photo"
+    node_id = waiting_config.get("node_id", "unknown")
+    next_node_id = waiting_config.get("next_node_id")
+
+    photo_file_id = message.photo[-1].file_id
+    logging.info(f"Получен file_id фото: {photo_file_id}")
+
+    saved_msg = await save_message_to_api(
+        user_id=str(user_id),
+        message_type="user",
+        message_text="[Фото ответ]",
+        node_id=node_id,
+        message_data={"photo": {"file_id": photo_file_id, "file_size": message.photo[-1].file_size or 0, "width": message.photo[-1].width, "height": message.photo[-1].height, "file_unique_id": message.photo[-1].file_unique_id}, "is_photo_answer": True}
+    )
+
+    media_result = None
+    if saved_msg and "id" in saved_msg:
+        media_result = await save_media_to_db(
+            file_id=photo_file_id,
+            file_type="photo",
+            file_name=f"photo_{photo_file_id}",
+            file_size=message.photo[-1].file_size if message.photo[-1].file_size else 0,
+            mime_type="image/jpeg"
+        )
+        if media_result:
+            await link_media_to_message(
+                message_id=saved_msg["id"],
+                media_id=media_result["id"],
+                media_kind="photo",
+                order_index=0
+            )
+
+    photo_data = {
+        "value": photo_file_id,
+        "type": "photo",
+        "photoUrl": media_result["url"] if media_result else None,
+        "timestamp": datetime.now().isoformat()
+    }
+    user_data[user_id][photo_variable] = photo_data
+
+    saved_to_db = await update_user_data_in_db(user_id, photo_variable, photo_data)
+    if saved_to_db:
+        logging.info(f"Фото сохранено в БД: {photo_variable} (пользователь {user_id})")
+    else:
+        logging.warning(f"Не удалось сохранить фото в БД, данные сохранены локально")
+{% if mediaMetadataConfigs %}
+{% for config in mediaMetadataConfigs %}
+{% if config.mediaType == 'photo' %}
+
+    # Сохранение метаданных фото
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'file_id' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.file_id if config.customNames.file_id else config.baseVariable + '_file_id' }}"] = photo_file_id
+    await update_user_data_in_db(user_id, "{{ config.customNames.file_id if config.customNames.file_id else config.baseVariable + '_file_id' }}", photo_file_id)
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'file_unique_id' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.file_unique_id if config.customNames.file_unique_id else config.baseVariable + '_file_unique_id' }}"] = message.photo[-1].file_unique_id
+    await update_user_data_in_db(user_id, "{{ config.customNames.file_unique_id if config.customNames.file_unique_id else config.baseVariable + '_file_unique_id' }}", message.photo[-1].file_unique_id)
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'file_size' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.file_size if config.customNames.file_size else config.baseVariable + '_file_size' }}"] = message.photo[-1].file_size or 0
+    await update_user_data_in_db(user_id, "{{ config.customNames.file_size if config.customNames.file_size else config.baseVariable + '_file_size' }}", message.photo[-1].file_size or 0)
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'width' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.width if config.customNames.width else config.baseVariable + '_width' }}"] = message.photo[-1].width
+    await update_user_data_in_db(user_id, "{{ config.customNames.width if config.customNames.width else config.baseVariable + '_width' }}", message.photo[-1].width)
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'height' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.height if config.customNames.height else config.baseVariable + '_height' }}"] = message.photo[-1].height
+    await update_user_data_in_db(user_id, "{{ config.customNames.height if config.customNames.height else config.baseVariable + '_height' }}", message.photo[-1].height)
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'small_file_id' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.small_file_id if config.customNames.small_file_id else config.baseVariable + '_small_file_id' }}"] = message.photo[0].file_id
+    await update_user_data_in_db(user_id, "{{ config.customNames.small_file_id if config.customNames.small_file_id else config.baseVariable + '_small_file_id' }}", message.photo[0].file_id)
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'small_width' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.small_width if config.customNames.small_width else config.baseVariable + '_small_width' }}"] = message.photo[0].width
+    await update_user_data_in_db(user_id, "{{ config.customNames.small_width if config.customNames.small_width else config.baseVariable + '_small_width' }}", message.photo[0].width)
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'small_height' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.small_height if config.customNames.small_height else config.baseVariable + '_small_height' }}"] = message.photo[0].height
+    await update_user_data_in_db(user_id, "{{ config.customNames.small_height if config.customNames.small_height else config.baseVariable + '_small_height' }}", message.photo[0].height)
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'sizes_count' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.sizes_count if config.customNames.sizes_count else config.baseVariable + '_sizes_count' }}"] = len(message.photo)
+    await update_user_data_in_db(user_id, "{{ config.customNames.sizes_count if config.customNames.sizes_count else config.baseVariable + '_sizes_count' }}", len(message.photo))
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'all_sizes' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.all_sizes if config.customNames.all_sizes else config.baseVariable + '_all_sizes' }}"] = json.dumps([{"file_id": p.file_id, "w": p.width, "h": p.height, "size": p.file_size or 0} for p in message.photo])
+    await update_user_data_in_db(user_id, "{{ config.customNames.all_sizes if config.customNames.all_sizes else config.baseVariable + '_all_sizes' }}", json.dumps([{"file_id": p.file_id, "w": p.width, "h": p.height, "size": p.file_size or 0} for p in message.photo]))
+{% endif %}
+{% endif %}
+{% endfor %}
+{% endif %}
+
+    {{ finalize_media_input('photo_variable') }}
+    logging.info(f"Фото сохранено: {photo_variable} = {photo_file_id}")
+
+    if next_node_id:
+        logging.info(f"🚀 Переходим к следующему узлу: {next_node_id}")
+        try:
+            user_record = await get_user_from_db(user_id)
+            if user_record and "user_data" in user_record:
+                user_vars = user_record["user_data"]
+            else:
+                user_vars = user_data.get(user_id, {})
+            {{ navigationCode | indent(12) }}
+        except Exception as e:
+            logging.error(f"Ошибка при переходе к следующему узлу {next_node_id}: {e}")
+    return
+{% endif %}
+
+{% if hasVideoInput %}
+# Обработчик получения видео от пользователя
+@dp.message(F.video)
+async def handle_video_input(message: types.Message):
+    user_id = message.from_user.id
+    logging.info(f"🎥 Получено видео от пользователя {user_id}")
+
+    if user_id not in user_data or "waiting_for_input" not in user_data[user_id]:
+        logging.info(f"Видео от пользователя {user_id} проигнорировано - не ожидается ввод")
+        return
+
+    waiting_config = user_data[user_id]["waiting_for_input"]
+    waiting_modes = waiting_config.get("modes", []) if isinstance(waiting_config, dict) else []
+    if not (
+        isinstance(waiting_config, dict) and (
+            waiting_config.get("type") == "video" or
+            (isinstance(waiting_modes, list) and "video" in waiting_modes)
+        )
+    ):
+        logging.info(f"Видео от пользователя {user_id} проигнорировано - ожидается другой тип ввода")
+        return
+
+    video_variable = waiting_config.get("video_variable") or waiting_config.get("variable") or "user_video"
+    node_id = waiting_config.get("node_id", "unknown")
+    next_node_id = waiting_config.get("next_node_id")
+
+    video_file_id = message.video.file_id
+    logging.info(f"🎥 Получен file_id видео: {video_file_id}")
+
+    # Извлекаем thumbnail если есть
+    video_thumb = None
+    if message.video.thumbnail:
+        video_thumb = {"file_id": message.video.thumbnail.file_id, "file_unique_id": message.video.thumbnail.file_unique_id, "width": message.video.thumbnail.width, "height": message.video.thumbnail.height}
+
+    saved_msg = await save_message_to_api(
+        user_id=str(user_id),
+        message_type="user",
+        message_text="[Видео ответ]",
+        node_id=node_id,
+        message_data={"video": {"file_id": video_file_id, "file_size": message.video.file_size or 0, "duration": message.video.duration, "width": message.video.width, "height": message.video.height, "file_unique_id": message.video.file_unique_id, "thumbnail": video_thumb}, "is_video_answer": True}
+    )
+
+    media_result = None
+    if saved_msg and "id" in saved_msg:
+        media_result = await save_media_to_db(
+            file_id=video_file_id,
+            file_type="video",
+            file_name=f"video_{video_file_id}",
+            file_size=message.video.file_size if message.video.file_size else 0,
+            mime_type=message.video.mime_type or "video/mp4"
+        )
+        if media_result:
+            await link_media_to_message(
+                message_id=saved_msg["id"],
+                media_id=media_result["id"],
+                media_kind="video",
+                order_index=0
+            )
+
+    video_data = {
+        "value": video_file_id,
+        "type": "video",
+        "videoUrl": media_result["url"] if media_result else None,
+        "timestamp": datetime.now().isoformat()
+    }
+    user_data[user_id][video_variable] = video_data
+
+    saved_to_db = await update_user_data_in_db(user_id, video_variable, video_data)
+    if saved_to_db:
+        logging.info(f"✅ Видео сохранено в БД: {video_variable} = {video_file_id} (пользователь {user_id})")
+    else:
+        logging.warning(f"⚠️ Не удалось сохранить видео в БД, данные сохранены локально")
+{% if mediaMetadataConfigs %}
+{% for config in mediaMetadataConfigs %}
+{% if config.mediaType == 'video' %}
+
+    # Сохранение метаданных видео
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'file_id' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.file_id if config.customNames.file_id else config.baseVariable + '_file_id' }}"] = message.video.file_id
+    await update_user_data_in_db(user_id, "{{ config.customNames.file_id if config.customNames.file_id else config.baseVariable + '_file_id' }}", message.video.file_id)
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'file_unique_id' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.file_unique_id if config.customNames.file_unique_id else config.baseVariable + '_file_unique_id' }}"] = message.video.file_unique_id
+    await update_user_data_in_db(user_id, "{{ config.customNames.file_unique_id if config.customNames.file_unique_id else config.baseVariable + '_file_unique_id' }}", message.video.file_unique_id)
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'thumbnail' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.thumbnail if config.customNames.thumbnail else config.baseVariable + '_thumbnail' }}"] = message.video.thumbnail.file_id if message.video.thumbnail else ""
+    await update_user_data_in_db(user_id, "{{ config.customNames.thumbnail if config.customNames.thumbnail else config.baseVariable + '_thumbnail' }}", message.video.thumbnail.file_id if message.video.thumbnail else "")
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'duration' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.duration if config.customNames.duration else config.baseVariable + '_duration' }}"] = message.video.duration
+    await update_user_data_in_db(user_id, "{{ config.customNames.duration if config.customNames.duration else config.baseVariable + '_duration' }}", message.video.duration)
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'file_size' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.file_size if config.customNames.file_size else config.baseVariable + '_file_size' }}"] = message.video.file_size or 0
+    await update_user_data_in_db(user_id, "{{ config.customNames.file_size if config.customNames.file_size else config.baseVariable + '_file_size' }}", message.video.file_size or 0)
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'file_name' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.file_name if config.customNames.file_name else config.baseVariable + '_file_name' }}"] = message.video.file_name or ""
+    await update_user_data_in_db(user_id, "{{ config.customNames.file_name if config.customNames.file_name else config.baseVariable + '_file_name' }}", message.video.file_name or "")
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'width' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.width if config.customNames.width else config.baseVariable + '_width' }}"] = message.video.width
+    await update_user_data_in_db(user_id, "{{ config.customNames.width if config.customNames.width else config.baseVariable + '_width' }}", message.video.width)
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'height' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.height if config.customNames.height else config.baseVariable + '_height' }}"] = message.video.height
+    await update_user_data_in_db(user_id, "{{ config.customNames.height if config.customNames.height else config.baseVariable + '_height' }}", message.video.height)
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'mime_type' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.mime_type if config.customNames.mime_type else config.baseVariable + '_mime_type' }}"] = message.video.mime_type or ""
+    await update_user_data_in_db(user_id, "{{ config.customNames.mime_type if config.customNames.mime_type else config.baseVariable + '_mime_type' }}", message.video.mime_type or "")
+{% endif %}
+{% endif %}
+{% endfor %}
+{% endif %}
+
+    {{ finalize_media_input('video_variable') }}
+    logging.info(f"🎥 Видео сохранено: {video_variable} = {video_file_id}")
+
+    if next_node_id:
+        logging.info(f"🚀 Переходим к следующему узлу: {next_node_id}")
+        try:
+            user_record = await get_user_from_db(user_id)
+            if user_record and "user_data" in user_record:
+                user_vars = user_record["user_data"]
+            else:
+                user_vars = user_data.get(user_id, {})
+            {{ navigationCode | indent(12) }}
+        except Exception as e:
+            logging.error(f"Ошибка при переходе к следующему узлу {next_node_id}: {e}")
+    return
+{% endif %}
+
+{% if hasAudioInput %}
+# Обработчик получения аудио от пользователя
+@dp.message(F.audio | F.voice)
+async def handle_audio_input(message: types.Message):
+    user_id = message.from_user.id
+    logging.info(f"🎵 Получено аудио от пользователя {user_id}")
+
+    if user_id not in user_data or "waiting_for_input" not in user_data[user_id]:
+        logging.info(f"Аудио от пользователя {user_id} проигнорировано - не ожидается ввод")
+        return
+
+    waiting_config = user_data[user_id]["waiting_for_input"]
+    waiting_modes = waiting_config.get("modes", []) if isinstance(waiting_config, dict) else []
+    if not (
+        isinstance(waiting_config, dict) and (
+            waiting_config.get("type") == "audio" or
+            (isinstance(waiting_modes, list) and "audio" in waiting_modes)
+        )
+    ):
+        logging.info(f"Аудио от пользователя {user_id} проигнорировано - ожидается другой тип ввода")
+        return
+
+    audio_variable = waiting_config.get("audio_variable") or waiting_config.get("variable") or "user_audio"
+    node_id = waiting_config.get("node_id", "unknown")
+    next_node_id = waiting_config.get("next_node_id")
+
+    if message.audio:
+        audio_file_id = message.audio.file_id
+        audio_thumb = {"file_id": message.audio.thumbnail.file_id, "file_unique_id": message.audio.thumbnail.file_unique_id} if message.audio.thumbnail else None
+        audio_duration = message.audio.duration
+        audio_meta = {"file_id": audio_file_id, "file_size": message.audio.file_size or 0, "duration": audio_duration, "file_unique_id": message.audio.file_unique_id, "file_name": message.audio.file_name, "thumbnail": audio_thumb}
+    elif message.voice:
+        audio_file_id = message.voice.file_id
+        audio_duration = message.voice.duration
+        audio_meta = {"file_id": audio_file_id, "file_size": message.voice.file_size or 0, "duration": audio_duration, "file_unique_id": message.voice.file_unique_id}
+    else:
+        logging.error("Не удалось получить file_id аудио")
+        return
+    logging.info(f"🎵 Получен file_id аудио: {audio_file_id}")
+
+    file_type_key = "voice" if message.voice else "audio"
+    saved_msg = await save_message_to_api(
+        user_id=str(user_id),
+        message_type="user",
+        message_text="[Аудио ответ]",
+        node_id=node_id,
+        message_data={file_type_key: audio_meta, "is_audio_answer": True}
+    )
+
+    media_result = None
+    if saved_msg and "id" in saved_msg:
+        file_type = "voice" if message.voice else "audio"
+        media_result = await save_media_to_db(
+            file_id=audio_file_id,
+            file_type=file_type,
+            file_name=f"{file_type}_{audio_file_id}",
+            file_size=(message.audio.file_size if message.audio else message.voice.file_size) or 0,
+            mime_type=(message.audio.mime_type if message.audio else "audio/ogg") or "audio/ogg"
+        )
+        if media_result:
+            await link_media_to_message(
+                message_id=saved_msg["id"],
+                media_id=media_result["id"],
+                media_kind=file_type,
+                order_index=0
+            )
+
+    audio_data = {
+        "value": audio_file_id,
+        "type": "audio",
+        "audioUrl": media_result["url"] if media_result else None,
+        "timestamp": datetime.now().isoformat()
+    }
+    user_data[user_id][audio_variable] = audio_data
+
+    saved_to_db = await update_user_data_in_db(user_id, audio_variable, audio_data)
+    if saved_to_db:
+        logging.info(f"✅ Аудио сохранено в БД: {audio_variable} = {audio_file_id} (пользователь {user_id})")
+    else:
+        logging.warning(f"⚠️ Не удалось сохранить аудио в БД, данные сохранены локально")
+{% if mediaMetadataConfigs %}
+{% for config in mediaMetadataConfigs %}
+{% if config.mediaType == 'audio' %}
+
+    # Сохранение метаданных аудио
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'file_id' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.file_id if config.customNames.file_id else config.baseVariable + '_file_id' }}"] = audio_file_id
+    await update_user_data_in_db(user_id, "{{ config.customNames.file_id if config.customNames.file_id else config.baseVariable + '_file_id' }}", audio_file_id)
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'file_unique_id' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.file_unique_id if config.customNames.file_unique_id else config.baseVariable + '_file_unique_id' }}"] = (message.audio.file_unique_id if message.audio else message.voice.file_unique_id)
+    await update_user_data_in_db(user_id, "{{ config.customNames.file_unique_id if config.customNames.file_unique_id else config.baseVariable + '_file_unique_id' }}", (message.audio.file_unique_id if message.audio else message.voice.file_unique_id))
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'thumbnail' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.thumbnail if config.customNames.thumbnail else config.baseVariable + '_thumbnail' }}"] = message.audio.thumbnail.file_id if message.audio and message.audio.thumbnail else ""
+    await update_user_data_in_db(user_id, "{{ config.customNames.thumbnail if config.customNames.thumbnail else config.baseVariable + '_thumbnail' }}", message.audio.thumbnail.file_id if message.audio and message.audio.thumbnail else "")
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'duration' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.duration if config.customNames.duration else config.baseVariable + '_duration' }}"] = audio_duration
+    await update_user_data_in_db(user_id, "{{ config.customNames.duration if config.customNames.duration else config.baseVariable + '_duration' }}", audio_duration)
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'file_size' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.file_size if config.customNames.file_size else config.baseVariable + '_file_size' }}"] = (message.audio.file_size if message.audio else message.voice.file_size) or 0
+    await update_user_data_in_db(user_id, "{{ config.customNames.file_size if config.customNames.file_size else config.baseVariable + '_file_size' }}", (message.audio.file_size if message.audio else message.voice.file_size) or 0)
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'file_name' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.file_name if config.customNames.file_name else config.baseVariable + '_file_name' }}"] = message.audio.file_name if message.audio else ""
+    await update_user_data_in_db(user_id, "{{ config.customNames.file_name if config.customNames.file_name else config.baseVariable + '_file_name' }}", message.audio.file_name if message.audio else "")
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'title' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.title if config.customNames.title else config.baseVariable + '_title' }}"] = message.audio.title if message.audio else ""
+    await update_user_data_in_db(user_id, "{{ config.customNames.title if config.customNames.title else config.baseVariable + '_title' }}", message.audio.title if message.audio else "")
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'performer' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.performer if config.customNames.performer else config.baseVariable + '_performer' }}"] = message.audio.performer if message.audio else ""
+    await update_user_data_in_db(user_id, "{{ config.customNames.performer if config.customNames.performer else config.baseVariable + '_performer' }}", message.audio.performer if message.audio else "")
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'mime_type' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.mime_type if config.customNames.mime_type else config.baseVariable + '_mime_type' }}"] = (message.audio.mime_type if message.audio else "audio/ogg") or ""
+    await update_user_data_in_db(user_id, "{{ config.customNames.mime_type if config.customNames.mime_type else config.baseVariable + '_mime_type' }}", (message.audio.mime_type if message.audio else "audio/ogg") or "")
+{% endif %}
+{% endif %}
+{% endfor %}
+{% endif %}
+
+    {{ finalize_media_input('audio_variable') }}
+    logging.info(f"🎵 Аудио сохранено: {audio_variable} = {audio_file_id}")
+
+    if next_node_id:
+        logging.info(f"🚀 Переходим к следующему узлу: {next_node_id}")
+        try:
+            user_record = await get_user_from_db(user_id)
+            if user_record and "user_data" in user_record:
+                user_vars = user_record["user_data"]
+            else:
+                user_vars = user_data.get(user_id, {})
+            {{ navigationCode | indent(12) }}
+        except Exception as e:
+            logging.error(f"Ошибка при переходе к следующему узлу {next_node_id}: {e}")
+    return
+{% endif %}
+
+{% if hasDocumentInput %}
+# Обработчик получения GIF/анимации от пользователя (должен быть ВЫШЕ document)
+@dp.message(F.animation)
+async def handle_animation_input(message: types.Message):
+    user_id = message.from_user.id
+    logging.info(f"🎞️ Получена анимация от пользователя {user_id}")
+
+    if user_id not in user_data or "waiting_for_input" not in user_data[user_id]:
+        logging.info(f"Анимация от пользователя {user_id} проигнорирована - не ожидается ввод")
+        return
+
+    waiting_config = user_data[user_id]["waiting_for_input"]
+    waiting_modes = waiting_config.get("modes", []) if isinstance(waiting_config, dict) else []
+    # Принимаем animation если ожидается document, video или явно animation
+    if not (
+        isinstance(waiting_config, dict) and (
+            waiting_config.get("type") in ("document", "video", "animation") or
+            (isinstance(waiting_modes, list) and any(m in waiting_modes for m in ("document", "video", "animation")))
+        )
+    ):
+        logging.info(f"Анимация от пользователя {user_id} проигнорирована - ожидается другой тип ввода")
+        return
+
+    document_variable = waiting_config.get("document_variable") or waiting_config.get("variable") or "user_animation"
+    node_id = waiting_config.get("node_id", "unknown")
+    next_node_id = waiting_config.get("next_node_id")
+
+    anim_file_id = message.animation.file_id
+    logging.info(f"🎞️ Получен file_id анимации: {anim_file_id}")
+
+    # Извлекаем thumbnail если есть
+    anim_thumb = None
+    if message.animation.thumbnail:
+        anim_thumb = {"file_id": message.animation.thumbnail.file_id, "file_unique_id": message.animation.thumbnail.file_unique_id, "width": message.animation.thumbnail.width, "height": message.animation.thumbnail.height}
+
+    saved_msg = await save_message_to_api(
+        user_id=str(user_id),
+        message_type="user",
+        message_text="[GIF ответ]",
+        node_id=node_id,
+        message_data={"animation": {"file_id": anim_file_id, "file_size": message.animation.file_size or 0, "duration": message.animation.duration, "width": message.animation.width, "height": message.animation.height, "file_name": message.animation.file_name, "mime_type": message.animation.mime_type, "file_unique_id": message.animation.file_unique_id, "thumbnail": anim_thumb}, "is_animation_answer": True}
+    )
+
+    media_result = None
+    if saved_msg and "id" in saved_msg:
+        media_result = await save_media_to_db(
+            file_id=anim_file_id,
+            file_type="video",
+            file_name=message.animation.file_name or f"animation_{anim_file_id}",
+            file_size=message.animation.file_size or 0,
+            mime_type=message.animation.mime_type or "video/mp4"
+        )
+        if media_result:
+            await link_media_to_message(
+                message_id=saved_msg["id"],
+                media_id=media_result["id"],
+                media_kind="animation",
+                order_index=0
+            )
+
+    anim_data = {
+        "value": anim_file_id,
+        "type": "animation",
+        "timestamp": datetime.now().isoformat()
+    }
+    user_data[user_id][document_variable] = anim_data
+
+    saved_to_db = await update_user_data_in_db(user_id, document_variable, anim_data)
+    if saved_to_db:
+        logging.info(f"✅ Анимация сохранена в БД: {document_variable} = {anim_file_id} (пользователь {user_id})")
+
+    {{ finalize_media_input('document_variable') }}
+    logging.info(f"Анимация сохранена: {document_variable} = {anim_file_id}")
+
+    if next_node_id:
+        logging.info(f"🚀 Переходим к следующему узлу: {next_node_id}")
+        try:
+            user_record = await get_user_from_db(user_id)
+            if user_record and "user_data" in user_record:
+                user_vars = user_record["user_data"]
+            else:
+                user_vars = user_data.get(user_id, {})
+            {{ navigationCode | indent(12) }}
+        except Exception as e:
+            logging.error(f"Ошибка при переходе к следующему узлу {next_node_id}: {e}")
+    return
+{% endif %}
+
+{% if hasDocumentInput %}
+# Обработчик получения документа от пользователя
+@dp.message(F.document)
+async def handle_document_input(message: types.Message):
+    user_id = message.from_user.id
+    logging.info(f"📄 Получен документ от пользователя {user_id}")
+
+    if user_id not in user_data or "waiting_for_input" not in user_data[user_id]:
+        logging.info(f"Документ от пользователя {user_id} проигнорирован - не ожидается ввод")
+        return
+
+    waiting_config = user_data[user_id]["waiting_for_input"]
+    waiting_modes = waiting_config.get("modes", []) if isinstance(waiting_config, dict) else []
+    if not (
+        isinstance(waiting_config, dict) and (
+            waiting_config.get("type") == "document" or
+            (isinstance(waiting_modes, list) and "document" in waiting_modes)
+        )
+    ):
+        logging.info(f"Документ от пользователя {user_id} проигнорирован - ожидается другой тип ввода")
+        return
+
+    document_variable = waiting_config.get("document_variable") or waiting_config.get("variable") or "user_document"
+    node_id = waiting_config.get("node_id", "unknown")
+    next_node_id = waiting_config.get("next_node_id")
+
+    document_file_id = message.document.file_id
+    logging.info(f"📄 Получен file_id документа: {document_file_id}")
+
+    # Извлекаем thumbnail если есть
+    doc_thumb = None
+    if message.document.thumbnail:
+        doc_thumb = {"file_id": message.document.thumbnail.file_id, "file_unique_id": message.document.thumbnail.file_unique_id, "width": message.document.thumbnail.width, "height": message.document.thumbnail.height}
+
+    saved_msg = await save_message_to_api(
+        user_id=str(user_id),
+        message_type="user",
+        message_text="[Документ ответ]",
+        node_id=node_id,
+        message_data={"document": {"file_id": document_file_id, "file_size": message.document.file_size or 0, "file_name": message.document.file_name, "mime_type": message.document.mime_type, "file_unique_id": message.document.file_unique_id, "thumbnail": doc_thumb}, "is_document_answer": True}
+    )
+
+    media_result = None
+    if saved_msg and "id" in saved_msg:
+        media_result = await save_media_to_db(
+            file_id=document_file_id,
+            file_type="document",
+            file_name=f"document_{document_file_id}",
+            file_size=message.document.file_size if message.document.file_size else 0,
+            mime_type=message.document.mime_type or "application/octet-stream"
+        )
+        if media_result:
+            await link_media_to_message(
+                message_id=saved_msg["id"],
+                media_id=media_result["id"],
+                media_kind="document",
+                order_index=0
+            )
+
+    document_data = {
+        "value": document_file_id,
+        "type": "document",
+        "documentUrl": media_result["url"] if media_result else None,
+        "timestamp": datetime.now().isoformat()
+    }
+    user_data[user_id][document_variable] = document_data
+
+    saved_to_db = await update_user_data_in_db(user_id, document_variable, document_data)
+    if saved_to_db:
+        logging.info(f"✅ Документ сохранен в БД: {document_variable} = {document_file_id} (пользователь {user_id})")
+    else:
+        logging.warning(f"⚠️ Не удалось сохранить документ в БД, данные сохранены локально")
+{% if mediaMetadataConfigs %}
+{% for config in mediaMetadataConfigs %}
+{% if config.mediaType == 'document' %}
+
+    # Сохранение метаданных документа
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'file_id' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.file_id if config.customNames.file_id else config.baseVariable + '_file_id' }}"] = message.document.file_id
+    await update_user_data_in_db(user_id, "{{ config.customNames.file_id if config.customNames.file_id else config.baseVariable + '_file_id' }}", message.document.file_id)
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'file_unique_id' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.file_unique_id if config.customNames.file_unique_id else config.baseVariable + '_file_unique_id' }}"] = message.document.file_unique_id
+    await update_user_data_in_db(user_id, "{{ config.customNames.file_unique_id if config.customNames.file_unique_id else config.baseVariable + '_file_unique_id' }}", message.document.file_unique_id)
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'thumbnail' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.thumbnail if config.customNames.thumbnail else config.baseVariable + '_thumbnail' }}"] = message.document.thumbnail.file_id if message.document.thumbnail else ""
+    await update_user_data_in_db(user_id, "{{ config.customNames.thumbnail if config.customNames.thumbnail else config.baseVariable + '_thumbnail' }}", message.document.thumbnail.file_id if message.document.thumbnail else "")
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'file_name' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.file_name if config.customNames.file_name else config.baseVariable + '_file_name' }}"] = message.document.file_name or ""
+    await update_user_data_in_db(user_id, "{{ config.customNames.file_name if config.customNames.file_name else config.baseVariable + '_file_name' }}", message.document.file_name or "")
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'file_size' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.file_size if config.customNames.file_size else config.baseVariable + '_file_size' }}"] = message.document.file_size or 0
+    await update_user_data_in_db(user_id, "{{ config.customNames.file_size if config.customNames.file_size else config.baseVariable + '_file_size' }}", message.document.file_size or 0)
+{% endif %}
+{% if not config.enabledSuffixes or config.enabledSuffixes.length == 0 or 'mime_type' in config.enabledSuffixes %}
+    user_data[user_id]["{{ config.customNames.mime_type if config.customNames.mime_type else config.baseVariable + '_mime_type' }}"] = message.document.mime_type or ""
+    await update_user_data_in_db(user_id, "{{ config.customNames.mime_type if config.customNames.mime_type else config.baseVariable + '_mime_type' }}", message.document.mime_type or "")
+{% endif %}
+{% endif %}
+{% endfor %}
+{% endif %}
+
+    {{ finalize_media_input('document_variable') }}
+    logging.info(f"📄 Документ сохранен: {document_variable} = {document_file_id}")
+
+    if next_node_id:
+        logging.info(f"🚀 Переходим к следующему узлу: {next_node_id}")
+        try:
+            user_record = await get_user_from_db(user_id)
+            if user_record and "user_data" in user_record:
+                user_vars = user_record["user_data"]
+            else:
+                user_vars = user_data.get(user_id, {})
+            {{ navigationCode | indent(12) }}
+        except Exception as e:
+            logging.error(f"Ошибка при переходе к следующему узлу {next_node_id}: {e}")
+    return
+{% endif %}
+
+{% if hasLocationInput %}
+# Обработчик получения геолокации от пользователя
+@dp.message(F.location)
+async def handle_location_input(message: types.Message):
+    user_id = message.from_user.id
+    logging.info(f"📍 Получена геолокация от пользователя {user_id}")
+
+    if user_id not in user_data or "waiting_for_input" not in user_data[user_id]:
+        logging.info(f"Геолокация от пользователя {user_id} проигнорирована - не ожидается ввод")
+        return
+
+    waiting_config = user_data[user_id]["waiting_for_input"]
+    waiting_modes = waiting_config.get("modes", []) if isinstance(waiting_config, dict) else []
+    if not (
+        isinstance(waiting_config, dict) and (
+            waiting_config.get("type") == "location" or
+            (isinstance(waiting_modes, list) and "location" in waiting_modes)
+        )
+    ):
+        logging.info(f"Геолокация от пользователя {user_id} проигнорирована - ожидается другой тип ввода")
+        return
+
+    location_variable = waiting_config.get("location_variable") or waiting_config.get("variable") or "user_location"
+    node_id = waiting_config.get("node_id", "unknown")
+    next_node_id = waiting_config.get("next_node_id")
+
+    location_data = {
+        "latitude": message.location.latitude,
+        "longitude": message.location.longitude,
+        "type": "location",
+        "timestamp": datetime.now().isoformat()
+    }
+
+    await save_message_to_api(
+        user_id=str(user_id),
+        message_type="user",
+        message_text="[Геолокация ответ]",
+        node_id=node_id,
+        message_data={"location": location_data, "is_location_answer": True}
+    )
+
+    user_data[user_id][location_variable] = location_data
+
+    saved_to_db = await update_user_data_in_db(user_id, location_variable, location_data)
+    if saved_to_db:
+        logging.info(f"✅ Геолокация сохранена в БД: {location_variable} (пользователь {user_id})")
+    else:
+        logging.warning("⚠️ Не удалось сохранить геолокацию в БД, данные сохранены локально")
+
+    {{ finalize_media_input('location_variable') }}
+    logging.info(f"📍 Геолокация сохранена: {location_variable}")
+
+    if next_node_id:
+        logging.info(f"🚀 Переходим к следующему узлу: {next_node_id}")
+        try:
+            user_record = await get_user_from_db(user_id)
+            if user_record and "user_data" in user_record:
+                user_vars = user_record["user_data"]
+            else:
+                user_vars = user_data.get(user_id, {})
+            {{ navigationCode | indent(12) }}
+        except Exception as e:
+            logging.error(f"Ошибка при переходе к следующему узлу {next_node_id}: {e}")
+    return
+{% endif %}
+
+{% if hasContactInput %}
+# Обработчик получения контакта от пользователя
+@dp.message(F.contact)
+async def handle_contact_input(message: types.Message):
+    user_id = message.from_user.id
+    logging.info(f"👤 Получен контакт от пользователя {user_id}")
+
+    if user_id not in user_data or "waiting_for_input" not in user_data[user_id]:
+        logging.info(f"Контакт от пользователя {user_id} проигнорирован - не ожидается ввод")
+        return
+
+    waiting_config = user_data[user_id]["waiting_for_input"]
+    waiting_modes = waiting_config.get("modes", []) if isinstance(waiting_config, dict) else []
+    if not (
+        isinstance(waiting_config, dict) and (
+            waiting_config.get("type") == "contact" or
+            (isinstance(waiting_modes, list) and "contact" in waiting_modes)
+        )
+    ):
+        logging.info(f"Контакт от пользователя {user_id} проигнорирован - ожидается другой тип ввода")
+        return
+
+    contact_variable = waiting_config.get("contact_variable") or waiting_config.get("variable") or "user_contact"
+    node_id = waiting_config.get("node_id", "unknown")
+    next_node_id = waiting_config.get("next_node_id")
+
+    contact_data = {
+        "phone_number": message.contact.phone_number,
+        "first_name": message.contact.first_name,
+        "last_name": message.contact.last_name,
+        "user_id": message.contact.user_id,
+        "vcard": message.contact.vcard,
+        "type": "contact",
+        "timestamp": datetime.now().isoformat()
+    }
+
+    await save_message_to_api(
+        user_id=str(user_id),
+        message_type="user",
+        message_text="[Контакт ответ]",
+        node_id=node_id,
+        message_data={"contact": contact_data, "is_contact_answer": True}
+    )
+
+    user_data[user_id][contact_variable] = contact_data
+
+    saved_to_db = await update_user_data_in_db(user_id, contact_variable, contact_data)
+    if saved_to_db:
+        logging.info(f"✅ Контакт сохранен в БД: {contact_variable} (пользователь {user_id})")
+    else:
+        logging.warning("⚠️ Не удалось сохранить контакт в БД, данные сохранены локально")
+
+    {{ finalize_media_input('contact_variable') }}
+    logging.info(f"👤 Контакт сохранен: {contact_variable}")
+
+    if next_node_id:
+        logging.info(f"🚀 Переходим к следующему узлу: {next_node_id}")
+        try:
+            user_record = await get_user_from_db(user_id)
+            if user_record and "user_data" in user_record:
+                user_vars = user_record["user_data"]
+            else:
+                user_vars = user_data.get(user_id, {})
+            {{ navigationCode | indent(12) }}
+        except Exception as e:
+            logging.error(f"Ошибка при переходе к следующему узлу {next_node_id}: {e}")
+    return
+{% endif %}

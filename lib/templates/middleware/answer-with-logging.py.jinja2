@@ -1,0 +1,11 @@
+{#
+  Заглушка — логирование исходящих покрыто _wrap_bot_send_message и _wrap_bot_send_photo
+  BotOutgoingLoggingMiddleware оставлена для совместимости регистрации в main()
+#}
+
+class BotOutgoingLoggingMiddleware(BaseMiddleware):
+    """Pass-through middleware — логирование исходящих через _wrap_bot_send_message/_wrap_bot_send_photo"""
+
+    async def __call__(self, handler, event: types.Message, data: dict):
+        return await handler(event, data)
+

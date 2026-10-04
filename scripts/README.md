@@ -1,0 +1,34 @@
+# 🛠️ Скрипты проекта
+
+## 📁 Структура
+
+### `/setup` - Скрипты настройки
+- `setup.bat` - Основной скрипт настройки проекта
+- `create-env.bat` - Создание файла окружения
+
+### `/utils` - Утилиты и вспомогательные скрипты
+- `update_bot_project_data.py` - Обновление данных проекта бота
+- `update_next_nodes.js` - Обновление следующих узлов
+- `update_next_node_fix.js` - Исправление узлов
+- `update-project.js` - Обновление проекта
+- `update-templates-conditional.js` - Обновление условных шаблонов
+- `force_recreate_templates.ts` - Принудительное пересоздание шаблонов
+- `validate.py` - Валидация данных
+- `sync-to-github.sh` - Синхронизация с GitHub
+
+### Корневые скрипты
+- `start-dev.bat` - Запуск в режиме разработки
+- `start-prod.bat` - Запуск в продакшене
+
+## 🚀 Использование
+
+```bash
+# Настройка проекта
+scripts/setup/setup.bat
+
+# Запуск разработки
+scripts/start-dev.bat
+
+# Запуск продакшена
+scripts/start-prod.bat
+```

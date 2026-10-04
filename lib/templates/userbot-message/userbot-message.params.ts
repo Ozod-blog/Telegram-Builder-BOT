@@ -1,0 +1,42 @@
+/**
+ * @fileoverview Параметры для шаблона userbot_message
+ * @module templates/userbot-message/userbot-message.params
+ */
+
+/** Параметры для генерации обработчика userbot-сообщения */
+export interface UserbotMessageTemplateParams {
+  /** ID узла */
+  nodeId: string;
+  /** Текст сообщения */
+  messageText?: string;
+  /** Режим форматирования: 'html', 'markdown', 'none' */
+  formatMode?: 'html' | 'markdown' | 'none';
+  /** Отключить превью ссылок */
+  disableLinkPreview?: boolean;
+  /** Entity получателя (@username, ID, {переменная}) — основной (обратная совместимость) */
+  userbotEntity?: string;
+  /** Список получателей (если несколько) */
+  userbotRecipients?: string[];
+  /** Прикреплённые медиафайлы (пути /uploads/ или URL) */
+  attachedMedia?: string[];
+  /** Имя переменной для сохранения ID отправленного сообщения */
+  saveMessageIdTo?: string;
+  /** Имя переменной для сохранения ID ответа от получателя */
+  saveResponseIdTo?: string;
+  /** Имя переменной для сохранения текста ответа от получателя */
+  saveResponseTextTo?: string;
+  /** Переменная для сохранения кнопок ответа (JSON) */
+  saveButtonsTo?: string;
+  /** Время ожидания ответа в секундах (по умолчанию 3) */
+  responseWaitSeconds?: number;
+  /** Стратегия выбора ответа: 'first' | 'longest' | 'regex_match' | 'last' */
+  responseStrategy?: 'first' | 'longest' | 'regex_match' | 'last';
+  /** Regex для фильтрации ответа (только при strategy=regex_match) */
+  responseFilterRegex?: string;
+  /** ID сообщения бота с которого ждём ответ (включая edit того же msg) */
+  responseFloorMessageIdVar?: string;
+  /** ID узла для автоперехода */
+  autoTransitionTo?: string;
+  /** ID проекта (для get_content) */
+  projectId?: number | null;
+}

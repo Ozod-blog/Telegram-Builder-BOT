@@ -1,0 +1,348 @@
+/**
+ * @fileoverview Тесты для шаблона запуска бота
+ * @module templates/main/main.test
+ */
+
+import { describe, it } from 'node:test';
+import assert from 'node:assert';
+import { generateMain } from './main.renderer';
+import {
+  validParamsEnabled,
+  validParamsDisabled,
+  invalidParamsWrongType,
+  expectedOutputEnabled,
+  expectedOutputDisabled,
+} from './main.fixture';
+import { mainParamsSchema } from './main.schema';
+
+describe('main.py.jinja2 шаблон', () => {
+  describe('generateMain()', () => {
+    describe('Валидные данные', () => {
+      it('должен генерировать main() с init_database()', () => {
+        const result = generateMain(validParamsEnabled);
+
+        assert.ok(result.includes('async def main()'));
+        assert.ok(result.includes('await init_database()'));
+      });
+
+      it('должен генерировать main() без init_database()', () => {
+        const result = generateMain(validParamsDisabled);
+
+        assert.ok(result.includes('async def main()'));
+        assert.ok(!result.includes('await init_database()'));
+      });
+
+      it('должен включать set_bot_commands() при наличии команд', () => {
+        const result = generateMain({
+          userDatabaseEnabled: false,
+          menuCommands: [{ command: 'start', description: 'Запустить бота' }],
+        });
+
+        assert.ok(result.includes('async def set_bot_commands()'));
+      });
+
+      it('set_bot_commands включает retry при Telegram flood', () => {
+        const result = generateMain({
+          userDatabaseEnabled: false,
+          menuCommands: [{ command: 'start', description: 'Запустить бота' }],
+        });
+
+        assert.ok(result.includes('TelegramRetryAfter'));
+        assert.ok(result.includes('for _attempt in range(1, 4)'));
+        assert.ok(result.includes('await bot.set_my_commands(commands)'));
+      });
+
+      it('main() пробрасывает необработанные ошибки (raise)', () => {
+        const result = generateMain(validParamsEnabled);
+        const exceptIdx = result.indexOf('except Exception as e:');
+
+        assert.ok(exceptIdx !== -1);
+        assert.ok(result.indexOf('raise', exceptIdx) !== -1);
+      });
+
+      it('не должен включать set_bot_commands() без команд', () => {
+        const result = generateMain({ userDatabaseEnabled: false, menuCommands: [] });
+
+        assert.ok(!result.includes('async def set_bot_commands()'));
+      });
+
+      it('должен включать middleware при БД', () => {
+        const result = generateMain(validParamsEnabled);
+
+        assert.ok(result.includes('dp.message.middleware(message_logging_middleware)'));
+      });
+
+      it('должен включать обработку сигналов', () => {
+        const result = generateMain(validParamsDisabled);
+
+        assert.ok(result.includes('signal.signal(signal.SIGTERM'));
+        assert.ok(result.includes('signal.signal(signal.SIGINT'));
+      });
+
+      it('должен генерировать main с обработкой ошибок', () => {
+        const result = generateMain(validParamsEnabled);
+
+        assert.ok(result.includes('logging.error'));
+      });
+    });
+
+    describe('Невалидные данные', () => {
+      it('должен отклонять параметры с неправильным типом', () => {
+        assert.throws(() => {
+          // @ts-expect-error
+          generateMain(invalidParamsWrongType);
+        });
+      });
+
+      it('должен использовать значения по умолчанию', () => {
+        const result = mainParamsSchema.safeParse({});
+
+        assert.ok(result.success);
+        if (result.success) {
+          assert.strictEqual(result.data.userDatabaseEnabled, false);
+        }
+      });
+
+      it('должен отклонять string вместо boolean', () => {
+        const result = mainParamsSchema.safeParse({
+          userDatabaseEnabled: 'true',
+        });
+        assert.ok(!result.success);
+      });
+
+      it('должен отклонять null', () => {
+        const result = mainParamsSchema.safeParse({
+          userDatabaseEnabled: null,
+        });
+        assert.ok(!result.success);
+      });
+    });
+
+    describe('Граничные случаи', () => {
+      it('должен включать finally блок', () => {
+        const result = generateMain(validParamsDisabled);
+
+        assert.ok(result.includes('finally:'));
+      });
+
+      it('должен включать bot.session.close()', () => {
+        const result = generateMain(validParamsDisabled);
+
+        assert.ok(result.includes('await bot.session.close()'));
+      });
+
+      it('должен включать db_pool.close() при БД', () => {
+        const result = generateMain(validParamsEnabled);
+
+        assert.ok(result.includes('await db_pool.close()'));
+      });
+
+      it('должен включать asyncio.run(main())', () => {
+        const result = generateMain(validParamsDisabled);
+
+        assert.ok(result.includes('asyncio.run(main())'));
+      });
+
+      it('должен включать if __name__ == "__main__"', () => {
+        const result = generateMain(validParamsDisabled);
+
+        assert.ok(result.includes('if __name__ == "__main__":'));
+      });
+
+      // ─── Проверка дублирования (проблема #4) ───────────────────────────────
+
+      it('set_bot_commands определяется ровно один раз', () => {
+        const result = generateMain(validParamsDisabled);
+        const count = (result.match(/async def set_bot_commands\(\)/g) || []).length;
+        assert.strictEqual(count, 1, `set_bot_commands определена ${count} раз(а), ожидалось 1`);
+      });
+
+      it('if __name__ == "__main__" встречается ровно один раз', () => {
+        const result = generateMain(validParamsDisabled);
+        const count = (result.match(/if __name__ == "__main__":/g) || []).length;
+        assert.strictEqual(count, 1, `if __name__ == "__main__" встречается ${count} раз(а), ожидалось 1`);
+      });
+
+      it('asyncio.run(main()) вызывается ровно один раз', () => {
+        const result = generateMain(validParamsDisabled);
+        const count = (result.match(/asyncio\.run\(main\(\)\)/g) || []).length;
+        assert.strictEqual(count, 1, `asyncio.run(main()) вызван ${count} раз(а), ожидалось 1`);
+      });
+    });
+
+    describe('Производительность', () => {
+      it('должен генерировать код быстрее 10ms', () => {
+        const start = Date.now();
+        generateMain(validParamsEnabled);
+        const duration = Date.now() - start;
+
+        assert.ok(duration < 10, `Генерация заняла ${duration}ms`);
+      });
+
+      it('должен генерировать код 1000 раз быстрее 100ms', () => {
+        const start = Date.now();
+        for (let i = 0; i < 1000; i++) {
+          generateMain(validParamsEnabled);
+        }
+        const duration = Date.now() - start;
+
+        assert.ok(duration < 100, `1000 генераций заняли ${duration}ms`);
+      });
+    });
+  });
+
+  describe('mainParamsSchema', () => {
+    describe('Валидация типов', () => {
+      it('должен принимать boolean поле', () => {
+        const result = mainParamsSchema.safeParse(validParamsEnabled);
+        assert.ok(result.success);
+      });
+
+      it('должен отклонять string вместо boolean', () => {
+        const result = mainParamsSchema.safeParse({
+          userDatabaseEnabled: 'true',
+        });
+        assert.ok(!result.success);
+      });
+
+      it('должен отклонять number вместо boolean', () => {
+        const result = mainParamsSchema.safeParse({
+          userDatabaseEnabled: 1,
+        });
+        assert.ok(!result.success);
+      });
+
+      it('должен отклонять null', () => {
+        const result = mainParamsSchema.safeParse({
+          userDatabaseEnabled: null,
+        });
+        assert.ok(!result.success);
+      });
+    });
+
+    describe('Значения по умолчанию', () => {
+      it('должен принимать false по умолчанию', () => {
+        const result = mainParamsSchema.safeParse({});
+
+        assert.ok(result.success);
+        if (result.success) {
+          assert.strictEqual(result.data.userDatabaseEnabled, false);
+        }
+      });
+    });
+
+    describe('Структура схемы', () => {
+      it('должен иметь 13 полей', () => {
+        const shape = mainParamsSchema.shape;
+        assert.strictEqual(Object.keys(shape).length, 13);
+      });
+
+      it('должен содержать ключевые поля схемы', () => {
+        const shape = mainParamsSchema.shape;
+        const expectedKeys = [
+          'userDatabaseEnabled',
+          'hasInlineButtons',
+          'menuCommands',
+          'autoRegisterUsers',
+          'incomingMessageTriggerMiddlewares',
+          'managedBotUpdatedTriggerMiddlewares',
+          'webhookUrl',
+          'hasScheduleTrigger',
+          'webhookPort',
+          'tokenId',
+          'projectId',
+          'hasUserbotNodes',
+          'contentCache',
+        ];
+        for (const key of expectedKeys) {
+          assert.ok(key in shape, `Поле ${key} отсутствует в схеме`);
+        }
+      });
+
+      it('должен использовать ZodOptional', () => {
+        const shape = mainParamsSchema.shape;
+        assert.ok(shape.userDatabaseEnabled.isOptional());
+        assert.ok(shape.hasInlineButtons.isOptional());
+        assert.ok(shape.menuCommands.isOptional());
+      });
+
+      it('должен регистрировать managedBotUpdatedTrigger middleware через dp.message.middleware', () => {
+        const result = generateMain({
+          userDatabaseEnabled: false,
+          managedBotUpdatedTriggerMiddlewares: ['managed_bot_updated_trigger_mbu_1_middleware'],
+        });
+        assert.ok(result.includes('dp.message.middleware(managed_bot_updated_trigger_mbu_1_middleware)'));
+      });
+
+      it('не должен регистрировать managedBotUpdatedTrigger middleware при пустом массиве', () => {
+        const result = generateMain({
+          userDatabaseEnabled: false,
+          managedBotUpdatedTriggerMiddlewares: [],
+        });
+        assert.ok(!result.includes('managed_bot_updated_trigger'));
+      });
+
+      it('должен регистрировать stale_update_filter_middleware', () => {
+        const result = generateMain({ userDatabaseEnabled: false });
+        assert.ok(result.includes('stale_update_filter_middleware'));
+      });
+
+      it('должен регистрировать dp.message.middleware(stale_update_filter_middleware)', () => {
+        const result = generateMain({ userDatabaseEnabled: false });
+        assert.ok(result.includes('dp.message.middleware(stale_update_filter_middleware)'));
+      });
+
+      it('не должен содержать drop_pending_updates', () => {
+        const result = generateMain({ userDatabaseEnabled: false });
+        assert.ok(!result.includes('drop_pending_updates'));
+      });
+
+      it('должен содержать distributed lock через Redis', () => {
+        const result = generateMain({ userDatabaseEnabled: false });
+        assert.ok(result.includes('bot:lock:'), 'Redis lock ключ не найден');
+        assert.ok(result.includes('_lock_acquired'), '_lock_acquired не найден');
+        assert.ok(result.includes('nx=True'), 'nx=True (атомарный SET NX) не найден');
+      });
+
+      it('не должен пересоздавать Dispatcher при переключении на Redis storage', () => {
+        const result = generateMain({ userDatabaseEnabled: false });
+        assert.ok(!result.includes('dp = Dispatcher(storage=RedisStorage(_redis_client))'));
+        assert.ok(!result.includes('dp.storage = RedisStorage(_redis_client)'));
+        assert.ok(result.includes('dp.fsm.storage = RedisStorage(_redis_client, TOKEN_ID)'));
+      });
+
+      it('должен инициализировать _lock_acquired до try, чтобы finally не падал', () => {
+        const result = generateMain({ userDatabaseEnabled: false });
+        assert.ok(result.includes('_lock_acquired = False'));
+        assert.ok(result.indexOf('_lock_acquired = False') < result.indexOf('try:'));
+      });
+
+      it('должен освобождать lock в finally', () => {
+        const result = generateMain({ userDatabaseEnabled: false });
+        assert.ok(result.includes('_lock_acquired'), 'освобождение lock не найдено');
+        assert.ok(result.includes('_redis_client.delete'), '_redis_client.delete не найден в finally');
+      });
+
+      it('должен обновлять lock TTL через _refresh_lock', () => {
+        const result = generateMain({ userDatabaseEnabled: false });
+        assert.ok(result.includes('_refresh_lock'), 'фоновая задача _refresh_lock не найдена');
+        assert.ok(result.includes('expire'), 'expire для обновления TTL не найден');
+      });
+
+      it('lock не блокирует запуск если Redis недоступен', () => {
+        const result = generateMain({ userDatabaseEnabled: false });
+        assert.ok(result.includes('if _redis_connected and _redis_client is not None'), 'проверка доступности Redis не найдена');
+      });
+
+      it('CancelledError из воркера должен re-raise (статус stopped в worker)', () => {
+        const result = generateMain({ userDatabaseEnabled: false });
+        const idx = result.indexOf('except asyncio.CancelledError:');
+        assert.ok(idx >= 0, 'except asyncio.CancelledError не найден');
+        const snippet = result.slice(idx, idx + 500);
+        const nextExcept = snippet.indexOf('except ', 10);
+        const block = nextExcept > 0 ? snippet.slice(0, nextExcept) : snippet;
+        assert.ok(/\n\s+raise\b/.test(block), 'CancelledError должен пробрасываться (raise)');
+      });
+    });
+  });
+});

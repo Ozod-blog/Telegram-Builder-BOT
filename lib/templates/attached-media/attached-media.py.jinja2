@@ -1,0 +1,73 @@
+{#
+  Шаблон отправки медиафайлов (attachedMedia + imageUrl/videoUrl/audioUrl/documentUrl)
+
+  @fileoverview Генерирует Python код для отправки медиафайлов.
+  Используется внутри message.py.jinja2 через include + filter indent(4).
+  Поэтому строки здесь БЕЗ начального отступа — indent(4) добавит его сам.
+
+  @param {string}  nodeId       — ID узла
+  @param {string}  imageUrl     — URL изображения
+  @param {string}  videoUrl     — URL видео
+  @param {string}  audioUrl     — URL аудио
+  @param {string}  documentUrl  — URL документа
+  @param {array}   attachedMedia — массив имён медиа-переменных
+  @param {string}  formatMode   — режим форматирования: 'html', 'markdown', 'none'
+  @param {string}  keyboardType — тип клавиатуры
+  @param {boolean} hasHideAfterClickIncoming — скрыть клавиатуру предыдущего сообщения
+#}
+{%- set effectiveKeyboard = 'ReplyKeyboardRemove()' if (hasHideAfterClickIncoming and keyboardType == 'none') else 'keyboard' %}
+{%- set parse_mode_arg = ', parse_mode="HTML"' if formatMode == 'html' else (', parse_mode="Markdown"' if formatMode == 'markdown' else '') %}
+{%- if imageUrl and imageUrl != 'undefined' %}
+{%- if isLocalImageUrl %}
+image_path = get_upload_file_path("{{ imageUrl }}")
+if not os.path.exists(image_path):
+    logging.error(f"❌ Медиафайл не найден: {image_path} (узел {{ nodeId }})")
+    sent_message = await callback_query.message.answer(text{{ parse_mode_arg }}, reply_markup={{ effectiveKeyboard }}, node_id="{{ nodeId }}")
+else:
+    image_file = FSInputFile(image_path)
+    sent_message = await callback_query.message.answer_photo(image_file, caption=text{{ parse_mode_arg }}, reply_markup={{ effectiveKeyboard }}, node_id="{{ nodeId }}")
+{%- else %}
+sent_message = await callback_query.message.answer_photo("{{ imageUrl }}", caption=text{{ parse_mode_arg }}, reply_markup={{ effectiveKeyboard }}, node_id="{{ nodeId }}")
+{%- endif %}
+{%- elif videoUrl %}
+{%- if isLocalVideoUrl %}
+video_path = get_upload_file_path("{{ videoUrl }}")
+if not os.path.exists(video_path):
+    logging.error(f"❌ Медиафайл не найден: {video_path} (узел {{ nodeId }})")
+    sent_message = await callback_query.message.answer(text{{ parse_mode_arg }}, reply_markup={{ effectiveKeyboard }}, node_id="{{ nodeId }}")
+else:
+    video_file = FSInputFile(video_path)
+    sent_message = await callback_query.message.answer_video(video_file, caption=text{{ parse_mode_arg }}, reply_markup={{ effectiveKeyboard }}, node_id="{{ nodeId }}")
+{%- else %}
+sent_message = await callback_query.message.answer_video("{{ videoUrl }}", caption=text{{ parse_mode_arg }}, reply_markup={{ effectiveKeyboard }}, node_id="{{ nodeId }}")
+{%- endif %}
+{%- elif audioUrl %}
+{%- if isLocalAudioUrl %}
+audio_path = get_upload_file_path("{{ audioUrl }}")
+if not os.path.exists(audio_path):
+    logging.error(f"❌ Медиафайл не найден: {audio_path} (узел {{ nodeId }})")
+    sent_message = await callback_query.message.answer(text{{ parse_mode_arg }}, reply_markup={{ effectiveKeyboard }}, node_id="{{ nodeId }}")
+else:
+    audio_file = FSInputFile(audio_path)
+    sent_message = await callback_query.message.answer_audio(audio_file, caption=text{{ parse_mode_arg }}, reply_markup={{ effectiveKeyboard }}, node_id="{{ nodeId }}")
+{%- else %}
+sent_message = await callback_query.message.answer_audio("{{ audioUrl }}", caption=text{{ parse_mode_arg }}, reply_markup={{ effectiveKeyboard }}, node_id="{{ nodeId }}")
+{%- endif %}
+{%- elif documentUrl %}
+{%- if isLocalDocumentUrl %}
+doc_path = get_upload_file_path("{{ documentUrl }}")
+if not os.path.exists(doc_path):
+    logging.error(f"❌ Медиафайл не найден: {doc_path} (узел {{ nodeId }})")
+    sent_message = await callback_query.message.answer(text{{ parse_mode_arg }}, reply_markup={{ effectiveKeyboard }}, node_id="{{ nodeId }}")
+else:
+    import re as _re
+    _raw_doc_name = os.path.basename(doc_path)
+    _clean_doc_name = _re.sub(r'^\d+-\d+-', '', _raw_doc_name)
+    doc_file = FSInputFile(doc_path, filename=_clean_doc_name)
+    sent_message = await callback_query.message.answer_document(doc_file, caption=text{{ parse_mode_arg }}, reply_markup={{ effectiveKeyboard }}, node_id="{{ nodeId }}")
+{%- else %}
+sent_message = await callback_query.message.answer_document("{{ documentUrl }}", caption=text{{ parse_mode_arg }}, reply_markup={{ effectiveKeyboard }}, node_id="{{ nodeId }}")
+{%- endif %}
+{%- else %}
+sent_message = await callback_query.message.answer(text{{ parse_mode_arg }}, reply_markup={{ effectiveKeyboard }}, node_id="{{ nodeId }}")
+{%- endif %}

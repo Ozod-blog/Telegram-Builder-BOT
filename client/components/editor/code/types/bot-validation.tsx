@@ -1,0 +1,72 @@
+/**
+ * @fileoverview Компонент для проверки структуры бота
+ * Предоставляет функциональность для валидации и отображения ошибок структуры
+ */
+
+import { BotData } from '@shared/schema';
+import { useState, useEffect } from 'react';
+
+/**
+ * Свойства компонента валидации бота
+ */
+interface BotValidationProps {
+  /** Данные бота для валидации */
+  botData: BotData;
+}
+
+/**
+ * Компонент для проверки и отображения валидации структуры бота
+ * @param props - Свойства компонента
+ * @returns JSX элемент или null если структура корректна
+ */
+export function BotValidation({ botData }: BotValidationProps) {
+  const [validationResult, setValidationResult] = useState<{ isValid: boolean; errors: string[] }>({
+    isValid: true,
+    errors: [],
+  });
+
+  useEffect(() => {
+    const errors: string[] = [];
+    const data = botData as any;
+    let nodes: any[] = [];
+
+    if (Array.isArray(data?.nodes)) {
+      nodes = data.nodes;
+    } else if (Array.isArray(data?.sheets)) {
+      data.sheets.forEach((sheet: any) => {
+        if (Array.isArray(sheet.nodes)) nodes.push(...sheet.nodes);
+      });
+    }
+
+    const hasStart = nodes.some(
+      (n: any) =>
+        n.type === 'command_trigger' &&
+        (n.data?.command === '/start' || n.data?.command === 'start'),
+    );
+
+    if (!hasStart) errors.push('Отсутствует стартовый триггер команды (/start)');
+    setValidationResult({ isValid: errors.length === 0, errors });
+  }, [botData]);
+
+  if (validationResult.isValid) return null;
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2 text-red-600 dark:text-red-400 p-3 bg-red-50 dark:bg-red-950/30 rounded-lg border border-red-200 dark:border-red-800/40">
+        <i className="fas fa-exclamation-triangle"></i>
+        <span className="font-medium text-sm">Найдены ошибки в структуре:</span>
+      </div>
+      <div className="space-y-1.5">
+        {validationResult.errors.map((error: string, index: number) => (
+          <div
+            key={index}
+            className="flex items-start gap-2 p-2 bg-red-50 dark:bg-red-950/20 rounded border-l-4 border-red-200 dark:border-red-800/60"
+          >
+            <i className="fas fa-times-circle text-red-500 dark:text-red-400 mt-0.5 text-xs"></i>
+            <span className="text-xs text-red-700 dark:text-red-300">{error}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}

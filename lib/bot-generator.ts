@@ -1,0 +1,800 @@
+// Внешние зависимости
+import { BotData, BotGroup, Node } from '@shared/schema';
+
+// Ядро: контекст и состояние
+import { createGenerationContext } from './bot-generator/core/create-generation-context';
+import type { GenerationContext } from './bot-generator/core/generation-context';
+import type { GenerationOptions } from './bot-generator/core/generation-options.types';
+
+// Ядро: логирование
+import { generatorLogger } from './bot-generator/core/generator-logger';
+
+// Флаги возможностей
+import { computeFeatureFlags, ALREADY_HANDLED_TYPES } from './bot-generator/core/feature-flags';
+import type { FeatureFlags } from './bot-generator/core/feature-flags';
+
+// Типы
+import { logFlowAnalysis } from './bot-generator/core';
+import { NODE_TYPES } from './bot-generator/types';
+// Внутренние модули - использование экспорта бочек
+import { generateBotFatherCommands } from './commands';
+
+import { generateDatabaseCode } from './templates/database/database-code.renderer';
+import { generateSafeEditOrSend, generateHeader, generateUniversalHandlers, generateMain, generateImports, generateConfig, generateUtils } from './templates/typed-renderer';
+import { generateNodeHandlers } from './templates/node-handlers/node-handlers.dispatcher';
+import { filterInlineNodes, hasInlineButtons, identifyNodesRequiringMultiSelectLogic } from './templates/keyboard/keyboard.renderer';
+import { resolveSelectionMarkSymbols } from './templates/keyboard/selection-mark-symbols';
+import { generateButtonResponse, generateMultiSelectCallback, generateMultiSelectDone, generateMultiSelectReply, generateReplyButtonHandlers, generateCommandCallbackHandler } from './templates/keyboard-handlers/handlers';
+import { generateInteractiveCallbackHandlers } from './templates/keyboard-handlers/interactive-callback-handlers';
+import { generateGroupHandlers } from './templates/group-handlers/group-handlers.renderer';
+import { generateMediaFunctions } from './templates/media-functions/media-functions.renderer';
+import { generateContentCode } from './templates/content';
+import { generateMediaInputHandlers } from './templates/media-input-handlers';
+import type { MediaMetadataConfig } from './templates/media-input-handlers';
+import { generateMessageLoggingCode } from './templates/middleware/middleware.renderer';
+import type { NodeItem } from './templates/handle-user-input/handle-user-input.params';
+import { generateDockerfile, generateReadme, generateRequirementsTxt, generateEnvFile } from './scaffolding';
+import { addAutoTransitionNodes } from './bot-generator/core/add-auto-transition-nodes';
+import { addInputTargetNodes } from './bot-generator/core/add-input-target-nodes';
+import { collectInputTargetNodes } from './bot-generator/core/collect-input-target-nodes';
+import { assertValidPython } from './bot-generator/validation';
+import { collectAllCommandCallbacksFromNodes } from './bot-generator/core/command-utils';
+import { emitOnce, COMPONENT_NAMES } from './bot-generator/core/generation-state';
+import { hasInputCollection } from './templates/filters';
+import { collectConditionEntries } from './templates/condition/condition.renderer';
+
+function collectCommandSourceNodes(nodes: Node[], menuOnly: boolean = false): Node[] {
+  const matchesMenuVisibility = (node: Node) => !menuOnly || node.data?.showInMenu !== false;
+  const result: Node[] = [];
+  const seen = new Set<string>();
+
+  const push = (node: Node) => {
+    const command = (node.data?.command || '').trim().toLowerCase();
+    if (!command || seen.has(command) || !matchesMenuVisibility(node)) {
+      return;
+    }
+    seen.add(command);
+    result.push(node);
+  };
+
+  nodes.filter(node => node.type === 'command_trigger' && node.data?.command).forEach(push);
+
+  return result;
+}
+
+/**
+ * Собирает конфигурации метаданных медиа из input-нод с saveMediaMetadata=true
+ * @param nodes - Все узлы проекта
+ * @returns Массив конфигураций для передачи в шаблон
+ */
+function collectMediaMetadataConfigs(nodes: Node[]): MediaMetadataConfig[] {
+  const configs: MediaMetadataConfig[] = [];
+  for (const node of nodes) {
+    if (node.type !== 'input') continue;
+    const data = node.data as any;
+    if (!data.saveMediaMetadata) continue;
+    const mediaType = data.inputType as string;
+    if (!['photo', 'video', 'audio', 'document'].includes(mediaType)) continue;
+    const baseVariable = data.inputVariable || `user_${mediaType}`;
+    configs.push({
+      mediaType,
+      baseVariable,
+      enabledSuffixes: data.mediaMetadataSuffixes || [],
+      customNames: data.mediaMetadataCustomNames || {},
+    });
+  }
+  return configs;
+}
+
+function hasSkipDataCollectionButtonsInProject(nodes: Node[]): boolean {
+  const hasSkip = (buttons: any[] | undefined) =>
+    Array.isArray(buttons) && buttons.some((button: any) => button?.skipDataCollection === true && !!button?.target);
+
+  return (nodes || []).some(node =>
+    hasSkip(node.data?.buttons) ||
+    hasSkip((node.data as any)?.replyButtons) ||
+    hasSkip((node.data as any)?.inlineButtons) ||
+    ((node.data as any)?.conditionalMessages ?? []).some((message: any) => hasSkip(message?.buttons))
+  );
+}
+
+/**
+ * Приводит узел графа к формату, который ожидают шаблоны универсальных обработчиков.
+ * @param node - Исходный узел графа
+ * @returns Узел в формате NodeItem
+ */
+function toTemplateNodeItem(node: Node): NodeItem {
+  return {
+    id: node.id,
+    safeName: node.id.replace(/[^a-zA-Z0-9_]/g, '_'),
+    type: node.type,
+    data: node.data as NodeItem['data'],
+  };
+}
+
+/**
+ * Опции для генерации Python-кода бота
+ */
+export interface GeneratePythonCodeOptions {
+  /** Имя бота */
+  botName?: string;
+  /** Группы бота */
+  groups?: BotGroup[];
+  /** Включить базу данных пользователей */
+  userDatabaseEnabled?: boolean;
+  /** ID проекта */
+  projectId?: number | null;
+  /** Включить логирование */
+  enableLogging?: boolean;
+  /** Включить обработчики групп */
+  enableGroupHandlers?: boolean;
+  /** Автоматически регистрировать пользователей при первом обращении */
+  autoRegisterUsers?: boolean;
+  /** URL вебхука для webhook режима */
+  webhookUrl?: string | null;
+  /** Порт aiohttp сервера */
+  webhookPort?: number | null;
+  /** Сохранять входящие фото от пользователей в БД */
+  saveIncomingMedia?: boolean;
+  /** Генерировать catch-all обработчики (по умолчанию true) */
+  catchAllHandlers?: boolean;
+  /** Защита контента от копирования/пересылки (по умолчанию false) */
+  protectContent?: boolean;
+  /** Живое обновление контента из _content (по умолчанию true) */
+  contentCache?: boolean;
+  /**
+   * Словарь кэшированных Telegram file_id для медиафайлов проекта.
+   * Ключ — URL файла (/uploads/...), значение — Telegram file_id.
+   * Передаётся в генератор узлов для статического вшивания в код.
+   */
+  telegramFileIds?: Record<string, string>;
+  /**
+   * Словарь обложек видео: ключ — URL видео, значение — Telegram file_id обложки.
+   * Передаётся как thumbnail= в send_video / answer_video.
+   */
+  thumbnailFileIds?: Record<string, string>;
+  /**
+   * Словарь прямых URL обложек видео: ключ — URL видео, значение — URL обложки.
+   */
+  thumbnailUrls?: Record<string, string>;
+}
+
+// ---------------------------------------------------------------------------
+// Типы pipeline
+// ---------------------------------------------------------------------------
+
+/** Секции сгенерированного кода */
+interface CodeSections {
+  header: string;
+  imports: string;
+  safeEditOrSend: string;
+  config: string;
+  loggingCode: string;
+  databaseCode: string;
+  utils: string;
+  mediaFunctions: string;
+  contentCode: string;
+  nodeHandlers: string;
+  interactiveCallbackHandlers: string;
+  replyButtonHandlers: string;
+  buttonResponseHandlers: string;
+  commandCallbackHandlers: string;
+  groupHandlers: string;
+  mediaInputHandlers: string;
+  universalHandlers: string;
+  main: string;
+  multiSelectHandlers: string;
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline шаг 1: buildGenerationContext
+// ---------------------------------------------------------------------------
+
+/**
+ * Создаёт контекст генерации из данных бота и опций
+ */
+function buildGenerationContext(
+  botData: BotData,
+  options: GeneratePythonCodeOptions
+): { context: GenerationContext; genOptions: GenerationOptions } {
+  const {
+    botName = 'MyBot',
+    groups = [],
+    userDatabaseEnabled = false,
+    projectId = null,
+    enableLogging = false,
+    enableGroupHandlers = false,
+    autoRegisterUsers = false,
+    webhookUrl = null,
+    webhookPort = null,
+    saveIncomingMedia = false,
+    catchAllHandlers = true,
+    protectContent = false,
+    contentCache = false,
+    telegramFileIds = {},
+    thumbnailFileIds = {},
+    thumbnailUrls = {},
+  } = options;
+
+  const genOptions: GenerationOptions = {
+    enableLogging,
+    userDatabaseEnabled,
+    enableGroupHandlers,
+    projectId,
+    autoRegisterUsers,
+    webhookUrl,
+    webhookPort,
+    saveIncomingMedia,
+    catchAllHandlers,
+    protectContent,
+    contentCache,
+    telegramFileIds,
+    thumbnailFileIds,
+    thumbnailUrls,
+  };
+
+  const context = createGenerationContext(botData, botName, groups, genOptions);
+  return { context, genOptions };
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline шаг 3: generateCodeSections
+// ---------------------------------------------------------------------------
+
+/**
+ * Генерирует все секции кода
+ */
+function generateCodeSections(
+  context: GenerationContext,
+  flags: FeatureFlags
+): CodeSections {
+  const nodes = context.nodes || [];
+  const userDatabaseEnabled = !!context.options.userDatabaseEnabled;
+  const state = context.state;
+
+  // --- imports ---
+  const imports = emitOnce(state, COMPONENT_NAMES.IMPORTS, () =>
+    generateImports({
+      userDatabaseEnabled,
+      hasInlineButtons: flags.hasInlineButtonsResult,
+      hasAutoTransitions: flags.hasAutoTransitionsResult,
+      hasMediaNodes: flags.hasMediaNodesResult,
+      hasUploadImages: flags.hasUploadImagesResult,
+      hasParseModeNodes: flags.hasParseModeNodesResult,
+      hasMediaGroups: flags.hasMediaGroupsResult,
+      hasUrlImages: flags.hasUrlImagesResult,
+      hasDatetimeNodes: flags.hasDatetimeNodesResult,
+      hasTimezoneNodes: flags.hasTimezoneNodesResult,
+      hasReplyKeyboard: flags.hasReplyKeyboardResult,
+      hasLocalMediaFiles: flags.hasLocalMediaFilesResult,
+      hasBotCommands: flags.hasBotCommandsResult,
+      hasDeepLinkTriggers: flags.hasDeepLinkTriggersResult,
+      hasUserbotNodes: flags.hasUserbotNodesResult,
+      hasRateCounterNodes: flags.hasRateCounterNodesResult,
+      hasSendInvoiceNodes: flags.hasSendInvoiceNodesResult,
+      hasInputTimeoutNodes: flags.hasInputTimeoutNodesResult,
+    })
+  );
+
+  // --- safeEditOrSend ---
+  const safeEditOrSend = emitOnce(state, COMPONENT_NAMES.SAFE_EDIT_OR_SEND, () =>
+    generateSafeEditOrSend({
+      hasInlineButtonsOrSpecialNodes:
+        flags.hasInlineButtonsResult ||
+        flags.hasNodesRequiringSafeEditOrSendResult ||
+        userDatabaseEnabled,
+      hasAutoTransitions: flags.hasAutoTransitionsResult || userDatabaseEnabled,
+    })
+  );
+
+  // --- config ---
+  const config = emitOnce(state, COMPONENT_NAMES.CONFIG, () =>
+    generateConfig({
+      userDatabaseEnabled,
+      projectId: context.projectId,
+      webhookUrl: context.options.webhookUrl ?? null,
+      webhookPort: context.options.webhookPort ?? null,
+      hasUserbotNodes: flags.hasUserbotNodesResult,
+      protectContent: !!context.options.protectContent,
+      hasRateCounterNodes: flags.hasRateCounterNodesResult,
+      hasInputTimeoutNodes: flags.hasInputTimeoutNodesResult,
+    })
+  );
+
+  // --- logging middleware (включает save_message_to_api) ---
+  // Генерируем всегда: middleware.py.jinja2 содержит stale_update_filter_middleware,
+  // который main() регистрирует безусловно. DB- и autoRegister-зависимые части
+  // (message_logging_middleware, register_user_middleware, save_message_to_api)
+  // гейтятся внутри шаблона/рендерера, поэтому при выключенной БД отдаётся
+  // только всегда-нужный фильтр устаревших апдейтов.
+  const autoRegisterUsers = !!context.options.autoRegisterUsers;
+  const loggingCode = emitOnce(state, COMPONENT_NAMES.MIDDLEWARE, () =>
+    generateMessageLoggingCode(
+      userDatabaseEnabled,
+      hasInlineButtons(nodes),
+      context.projectId,
+      autoRegisterUsers,
+      !!context.options.saveIncomingMedia
+    )
+  );
+
+  // --- database ---
+  const databaseCode = emitOnce(state, COMPONENT_NAMES.DATABASE, () =>
+    generateDatabaseCode(userDatabaseEnabled, nodes)
+  );
+
+  // --- utils (содержит save_message_to_api-заглушку при userDatabaseEnabled=false) ---
+  const utils = emitOnce(state, COMPONENT_NAMES.UTILS, () => {
+    const adminOnly = nodes.some(n => n.data?.adminOnly);
+    const requiresAuth = nodes.some(n => n.data?.requiresAuth);
+    return generateUtils({
+      userDatabaseEnabled,
+      adminOnly,
+      requiresAuth,
+      hasInputTimeoutNodes: flags.hasInputTimeoutNodesResult,
+    });
+  });
+
+  // --- media functions ---
+  const mediaFunctions = emitOnce(state, COMPONENT_NAMES.MEDIA_FUNCTIONS, () =>
+    userDatabaseEnabled || flags.hasMediaNodesResult || flags.hasUploadImagesResult
+      ? generateMediaFunctions()
+      : ''
+  );
+
+  // --- content (загрузка из _content) ---
+  const contentCode = emitOnce(state, 'content', () =>
+    context.projectId
+      ? generateContentCode({ projectId: context.projectId, reloadIntervalSeconds: 60, contentCache: flags.generateContentResult })
+      : ''
+  );
+
+  // --- node handlers ---
+  const nodeHandlers = generateNodeHandlers(
+    nodes,
+    userDatabaseEnabled,
+    context.options.telegramFileIds || {},
+    context.options.thumbnailFileIds || {},
+    context.options.thumbnailUrls || {},
+    context.projectId ?? null,
+  );
+
+  // --- allReferencedNodeIds (теперь часть контекста секции) ---
+  const inputTargetNodeIds = collectInputTargetNodes(nodes);
+  let allReferencedNodeIds = new Set<string>();
+  addInputTargetNodes(inputTargetNodeIds, allReferencedNodeIds);
+  addAutoTransitionNodes(nodes, allReferencedNodeIds);
+
+  nodes.forEach(node => {
+    if (!ALREADY_HANDLED_TYPES.has(node.type)) {
+      allReferencedNodeIds.add(node.id);
+    }
+  });
+
+  // Фильтрация: только реально существующие узлы, не обрабатываемые отдельно в nodeHandlers
+  const existingNodeIds = new Set(nodes.map(node => node.id));
+  const nodeTypeById = new Map(nodes.map(node => [node.id, node.type]));
+  const filteredReferencedNodeIds = new Set<string>();
+  allReferencedNodeIds.forEach(nodeId => {
+    if (!existingNodeIds.has(nodeId)) {
+      generatorLogger.debug(`Удалён узел из allReferencedNodeIds: ${nodeId} (не найден в текущих узлах)`);
+      return;
+    }
+    const nodeType = nodeTypeById.get(nodeId);
+    if (nodeType && ALREADY_HANDLED_TYPES.has(nodeType)) {
+      generatorLogger.debug(`Удалён узел из allReferencedNodeIds: ${nodeId} (тип ${nodeType} уже обрабатывается в nodeHandlers)`);
+      return;
+    }
+    filteredReferencedNodeIds.add(nodeId);
+  });
+  allReferencedNodeIds = filteredReferencedNodeIds;
+
+  const inlineNodes = filterInlineNodes(nodes);
+  const allConditionalButtons = new Set<string>();
+
+  // --- interactive callback handlers ---
+  const interactiveCallbackHandlers = generateInteractiveCallbackHandlers({
+    inlineNodes,
+    allReferencedNodeIds,
+    allConditionalButtons,
+    nodes,
+    allNodeIds: context.allNodeIds,
+    connections: [],
+    userDatabaseEnabled,
+    mediaVariablesMap: new Map(),
+    processNodeButtonsAndGenerateHandlers: (_processedCallbacks) => {
+      // TODO: implement — должен генерировать обработчики для inline-кнопок inlineNodes
+      // и добавлять их ID в processedCallbacks, чтобы они не дублировались
+      // в цикле allReferencedNodeIds внутри generateInteractiveCallbackHandlers.
+    },
+  });
+
+  // --- reply button handlers ---
+  const replyButtonHandlers = generateReplyButtonHandlers({ nodes, indentLevel: '' });
+
+  // --- button response handlers for user input collection ---
+  const userInputNodes = nodes.filter(node =>
+    node.type === NODE_TYPES.MESSAGE &&
+    node.data.responseType === 'buttons' &&
+    Array.isArray(node.data.responseOptions) &&
+    node.data.responseOptions.length > 0
+  );
+
+  let buttonResponseHandlers = '';
+  if (userInputNodes.length > 0) {
+    buttonResponseHandlers += '\n# Обработчики кнопочных ответов для сбора пользовательского ввода\n';
+    buttonResponseHandlers += generateButtonResponse({
+      userInputNodes: userInputNodes.map(node => ({
+        id: node.id,
+        responseOptions: node.data.responseOptions,
+        allowSkip: node.data.allowSkip,
+      })),
+      allNodes: nodes,
+      indentLevel: '',
+    });
+  }
+
+  // --- command callback handlers ---
+  const commandButtons = collectAllCommandCallbacksFromNodes(nodes);
+  generatorLogger.info(`Найдено кнопок команд: ${commandButtons.size}`);
+  generatorLogger.debug('Список кнопок команд', Array.from(commandButtons));
+
+  let commandCallbackHandlers = '';
+  if (commandButtons.size > 0) {
+    commandCallbackHandlers += '\n# Обработчики для кнопок команд\n';
+    commandCallbackHandlers += `# Найдено ${commandButtons.size} кнопок команд: ${Array.from(commandButtons).join(', ')}\n`;
+
+    commandButtons.forEach(commandCallback => {
+      const command = commandCallback.replace('cmd_', '');
+
+      commandCallbackHandlers += generateCommandCallbackHandler({
+        callbackData: commandCallback,
+        button: {
+          action: 'command',
+          id: `btn_${command}`,
+          target: command,
+          text: `Команда /${command}`,
+        },
+        indentLevel: '',
+        commandNode: '',
+        command: command,
+      });
+    });
+  }
+
+  // --- group handlers ---
+  const groupHandlers = emitOnce(state, COMPONENT_NAMES.GROUP_HANDLERS, () =>
+    !!context.options.enableGroupHandlers
+      ? '\n' + generateGroupHandlers(context.groups)
+      : ''
+  );
+
+  const validConditionNodeIds = new Set(
+    collectConditionEntries(nodes).map(entry => entry.nodeId)
+  );
+
+  const nodesForHandlers: NodeItem[] = nodes
+    .filter(node =>
+      node.type !== 'command_trigger' &&
+      node.type !== 'text_trigger' &&
+      node.type !== 'incoming_message_trigger' &&
+      (node.type !== 'condition' || validConditionNodeIds.has(node.id))
+    )
+    .map(toTemplateNodeItem);
+
+  const inputCollection = hasInputCollection(nodes);
+  const mediaInputNavigationCode = nodesForHandlers.length > 0
+    ? `${nodesForHandlers.map((node, index) => `${index === 0 ? 'if' : 'elif'} next_node_id == "${node.id}":\n    await handle_callback_${node.safeName}(types.CallbackQuery(id="media_nav", from_user=message.from_user, chat_instance="", data=next_node_id, message=message))`).join('\n')}\nelse:\n    logging.warning(f"Неизвестный следующий узел: {next_node_id}")`
+    : 'logging.warning(f"Нет доступных узлов для навигации к {next_node_id}")';
+  const mediaInputHandlers = emitOnce(state, 'media_input_handlers', () =>
+    generateMediaInputHandlers({
+      hasPhotoInput: inputCollection.hasPhotoInput,
+      hasVideoInput: inputCollection.hasVideoInput,
+      hasAudioInput: inputCollection.hasAudioInput,
+      hasDocumentInput: inputCollection.hasDocumentInput,
+      hasLocationInput: inputCollection.hasLocationInput,
+      hasContactInput: inputCollection.hasContactInput,
+      navigationCode: mediaInputNavigationCode,
+      mediaMetadataConfigs: collectMediaMetadataConfigs(nodes),
+      hasInputTimeoutNodes: flags.hasInputTimeoutNodesResult,
+    })
+  );
+
+  // --- universal handlers ---
+  const commandNodes: NodeItem[] = collectCommandSourceNodes(nodes).map(toTemplateNodeItem);
+
+  const hasUrlButtonsFlag = nodes.some(node =>
+    Array.isArray(node.data?.buttons) &&
+    node.data.buttons.some((b: any) => b.action === 'url' || b.url)
+  );
+  const hasSkipDataCollectionButtonsFlag = hasSkipDataCollectionButtonsInProject(nodes);
+
+  const universalHandlers = emitOnce(state, COMPONENT_NAMES.UNIVERSAL_HANDLERS, () =>
+    generateUniversalHandlers({
+      userDatabaseEnabled,
+      nodes: nodesForHandlers,
+      commandNodes,
+      hasUrlButtons: hasUrlButtonsFlag,
+      hasSkipDataCollectionButtons: hasSkipDataCollectionButtonsFlag,
+      allNodeIds: context.allNodeIds,
+      generateCatchAll: flags.generateCatchAllResult,
+      hasInputCollection: inputCollection.hasCollectInput,
+      hasInputTimeoutNodes: flags.hasInputTimeoutNodesResult,
+    })
+  );
+
+  // --- main ---
+  const menuCommands = collectCommandSourceNodes(nodes, true).filter(node =>
+    node.data.command
+  );
+
+  const main = emitOnce(state, COMPONENT_NAMES.MAIN, () =>
+    generateMain({
+      userDatabaseEnabled,
+      hasInlineButtons: hasInlineButtons(nodes),
+      menuCommands: menuCommands.map(node => ({
+        command: (node.data.command || '').replace('/', ''),
+        description: (node.data.description || 'Команда бота')
+          .replace(/\\/g, '\\\\')
+          .replace(/"/g, '\\"')
+          .replace(/\n/g, '\\n')
+          .replace(/\r/g, ''),
+      })),
+      autoRegisterUsers: !!context.options.autoRegisterUsers,
+      incomingMessageTriggerMiddlewares: nodes
+        .filter(n => n.type === 'incoming_message_trigger' && n.data?.autoTransitionTo)
+        .map(n => `incoming_message_trigger_${n.id.replace(/[^a-zA-Z0-9_]/g, '_')}_middleware`),
+      managedBotUpdatedTriggerMiddlewares: nodes
+        .filter(n => n.type === 'managed_bot_updated_trigger' && n.data?.autoTransitionTo)
+        .map(n => `managed_bot_updated_trigger_${n.id.replace(/[^a-zA-Z0-9_]/g, '_')}_middleware`),
+      groupMessageTriggerHandlers: nodes
+        .filter(n => n.type === 'group_message_trigger' && n.data?.autoTransitionTo)
+        .map(n => `group_message_trigger_${n.id.replace(/[^a-zA-Z0-9_]/g, '_')}_handler`),
+      hasScheduleTrigger: nodes.some(n => (n.type as string) === 'schedule_trigger' && n.data?.autoTransitionTo),
+      hasApiTrigger: nodes.some(n => (n.type as string) === 'api_trigger' && n.data?.autoTransitionTo),
+      webhookUrl: context.options.webhookUrl ?? null,
+      webhookPort: context.options.webhookPort ?? null,
+      projectId: context.projectId ?? null,
+      hasUserbotNodes: flags.hasUserbotNodesResult,
+      contentCache: flags.generateContentResult,
+    })
+  );
+
+  // --- multiselect handlers ---
+  const multiSelectNodes = identifyNodesRequiringMultiSelectLogic(nodes);
+  const multiSelectNodesWithLayout = multiSelectNodes.map((node: any) => {
+    const layout = node.data?.keyboardLayout;
+    const hasKeyboardLayout = !!(layout && (layout.rows?.length > 0 || layout.autoLayout));
+    const keyboardLayoutAuto = !!(layout?.autoLayout);
+    let adjustCode: string | undefined;
+    if (hasKeyboardLayout && !keyboardLayoutAuto && layout.rows?.length > 0) {
+      adjustCode = layout.rows.map((r: any) => r.buttonIds?.length ?? 1).join(', ');
+    } else if (hasKeyboardLayout && keyboardLayoutAuto && layout.columns) {
+      adjustCode = String(layout.columns);
+    }
+
+    // Вычисляем shortNodeId и кнопки для generateMultiSelectCallback
+    const shortNodeId = String(node.id).slice(-10).replace(/^_+/, '');
+    const allButtons: any[] = node.data?.buttons ?? [];
+    const selectionButtons = allButtons
+      .filter((b: any) => b.action === 'selection')
+      .map((b: any) => {
+        // Как в keyboard.py.jinja2: target || id (без обрезки — иначе рассинхрон с первой отрисовкой)
+        const value = String(b.target || b.id || 'btn');
+        const valueTruncated = value.slice(-8);
+        const groupRaw = typeof b.selectionGroup === 'string' ? b.selectionGroup.trim() : '';
+        return {
+          id: b.id,
+          text: b.text,
+          action: b.action,
+          target: b.target,
+          value,
+          valueTruncated,
+          escapedText: b.text.replace(/"/g, '\\"'),
+          callbackData: `ms_${shortNodeId}_${value}`,
+          selectionGroup: groupRaw || undefined,
+        };
+      });
+    const regularButtons = allButtons
+      .filter((b: any) => b.action !== 'selection' && b.action !== 'complete')
+      .map((b: any) => ({ id: b.id, text: b.text, action: b.action, target: b.target }));
+    const gotoButtons = allButtons
+      .filter((b: any) => b.action === 'goto' && b.target)
+      .map((b: any) => ({ id: b.id, text: b.text, action: b.action, target: b.target }));
+    const completeBtn = allButtons.find((b: any) => b.action === 'complete');
+    const continueButtonTarget =
+      (typeof node.data?.continueButtonTarget === 'string' && node.data.continueButtonTarget.trim()) ||
+      (completeBtn?.target ? String(completeBtn.target) : '') ||
+      '';
+    const targetNode = continueButtonTarget
+      ? nodes.find((n: any) => n.id === continueButtonTarget)
+      : undefined;
+
+    const marks = resolveSelectionMarkSymbols(node.data);
+    return {
+      ...node,
+      hasKeyboardLayout,
+      keyboardLayoutAuto,
+      adjustCode,
+      shortNodeId,
+      selectionButtons,
+      regularButtons,
+      gotoButtons,
+      completeButton: completeBtn
+        ? {
+            text: completeBtn.text,
+            target: completeBtn.target,
+            style:
+              completeBtn.style === 'primary' ||
+              completeBtn.style === 'success' ||
+              completeBtn.style === 'danger'
+                ? completeBtn.style
+                : undefined,
+          }
+        : undefined,
+      doneCallbackData: `done_${shortNodeId}`,
+      totalButtonsCount: allButtons.length,
+      variableName: node.data?.multiSelectVariable || `multi_select_${node.id}`,
+      checkmarkSymbol: marks.checkmarkSymbol,
+      radioSelectedSymbol: marks.radioSelectedSymbol,
+      radioUnselectedSymbol: marks.radioUnselectedSymbol,
+      continueButtonTarget: continueButtonTarget || undefined,
+      targetNode: targetNode
+        ? {
+            id: targetNode.id,
+            type: targetNode.type,
+            data: targetNode.data || {},
+            shortId: String(targetNode.id).slice(-10).replace(/^_+/, ''),
+          }
+        : undefined,
+    };
+  });
+
+  let multiSelectHandlers = '';
+  if (multiSelectNodes && multiSelectNodes.length > 0) {
+    multiSelectHandlers += generateMultiSelectCallback({
+      multiSelectNodes: multiSelectNodesWithLayout as any[],
+      allNodeIds: context.allNodeIds,
+      indentLevel: '    ',
+    });
+    multiSelectHandlers += generateMultiSelectDone({
+      allNodes: nodes as any[],
+      multiSelectNodes: multiSelectNodesWithLayout as any[],
+      allNodeIds: context.allNodeIds,
+    });
+    multiSelectHandlers += generateMultiSelectReply({
+      allNodes: nodes as any[],
+      multiSelectNodes: multiSelectNodesWithLayout as any[],
+      allNodeIds: context.allNodeIds,
+    });
+  }
+
+  return {
+    header: emitOnce(state, COMPONENT_NAMES.HEADER, () => generateHeader({})),
+    imports,
+    safeEditOrSend,
+    config,
+    loggingCode,
+    databaseCode,
+    utils,
+    mediaFunctions,
+    contentCode,
+    nodeHandlers,
+    interactiveCallbackHandlers,
+    replyButtonHandlers,
+    buttonResponseHandlers,
+    commandCallbackHandlers,
+    groupHandlers,
+    mediaInputHandlers,
+    universalHandlers,
+    main,
+    multiSelectHandlers,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline шаг 4: assembleAndValidate
+// ---------------------------------------------------------------------------
+
+/**
+ * Собирает секции в финальный код и валидирует результат
+ */
+function assembleAndValidate(
+  sections: CodeSections,
+  context: GenerationContext
+): string {
+  const nodes = context.nodes || [];
+  const botFatherCommands = generateBotFatherCommands(nodes);
+
+  // Экранируем содержимое docstring: тройные кавычки, одиночные кавычки и обратные слеши
+  const sanitizeDocstring = (s: string) =>
+    s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+
+  let code = '"""\n';
+  code += `${sanitizeDocstring(context.botName)} - Telegram Bot\n`;
+  code += 'Сгенерировано с помощью TelegramBot Builder\n';
+
+  if (botFatherCommands) {
+    code += '\nКоманды для @BotFather:\n';
+    code += sanitizeDocstring(botFatherCommands);
+  }
+
+  code += '"""\n\n';
+
+  // Собираем секции, фильтруя пустые и нормализуя пробелы
+  const sectionList = [
+    sections.header,
+    sections.imports,
+    sections.safeEditOrSend,
+    sections.config,
+    sections.loggingCode,
+    sections.databaseCode,
+    sections.utils,
+    sections.mediaFunctions,
+    sections.contentCode,
+    sections.nodeHandlers,
+    sections.interactiveCallbackHandlers,
+    sections.replyButtonHandlers,
+    sections.buttonResponseHandlers,
+    sections.commandCallbackHandlers,
+    sections.groupHandlers,
+    sections.mediaInputHandlers,
+    // multi-select (ms_/done_) до catch-all @dp.callback_query()
+    sections.multiSelectHandlers,
+    sections.universalHandlers,
+    sections.main,
+  ];
+
+  // Объединяем непустые секции с одним переносом строки между ними
+  const nonEmpty = sectionList.filter(s => s && s.trim().length > 0);
+  // Нормализуем начало каждой секции — убираем ведущие пустые строки
+  const trimmedSections = nonEmpty.map(s => s.replace(/^[\r\n]+/, ''));
+  code += trimmedSections.join('\n\n');
+
+  // Нормализуем: не более 2 пустых строк подряд (PEP8: 2 пустые строки между top-level функциями)
+  code = code.replace(/\r\n/g, '\n');
+  code = code.replace(/\n[ \t]+\n/g, '\n\n');  // строки только с пробелами → пустые строки
+  code = code.replace(/\n{4,}/g, '\n\n\n');
+  // Внутри функций (строки с отступом) — не более 1 пустой строки
+  code = code.replace(/([ \t]+[^\n]+\n)\n{2,}([ \t])/g, '$1\n$2');
+
+  assertValidPython(code);
+
+  return code;
+}
+
+// ---------------------------------------------------------------------------
+// Публичный API
+// ---------------------------------------------------------------------------
+
+/**
+ * Генерирует Python-код для Telegram бота
+ *
+ * @param botData - Данные бота
+ * @param options - Опции генерации
+ * @returns Python код бота
+ *
+ * @example
+ * const code = generatePythonCode(botData, { botName: 'MyBot', enableLogging: true });
+ */
+export function generatePythonCode(
+  botData: BotData,
+  options: GeneratePythonCodeOptions = {}
+): string {
+  const { context } = buildGenerationContext(botData, options);
+
+  logFlowAnalysis(context.nodes);
+
+  const flags = computeFeatureFlags(context);
+  const sections = generateCodeSections(context, flags);
+
+  return assembleAndValidate(sections, context);
+}
+
+// Реэкспорт типов и функций для обратной совместимости
+export type { Button } from './bot-generator/types';
+export type { ResponseOption } from './bot-generator/types';
+export { isLoggingEnabled } from './bot-generator/core';
+
+// Повторный экспорт функций каркаса
+export { generateDockerfile, generateReadme, generateRequirementsTxt, generateEnvFile };

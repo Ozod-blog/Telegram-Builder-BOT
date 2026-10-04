@@ -1,0 +1,224 @@
+/**
+ * Модуль для выполнения системных команд
+ * @external child_process
+ */
+import { execSync } from "node:child_process";
+import { workerManager } from './botWorkerManager';
+
+/**
+ * Глобальная коллекция активных процессов ботов
+ * @external botProcesses
+ * @see {@link ./routes}
+ */
+import { botProcesses } from "../routes/routes";
+
+/**
+ * Хранилище cleanup-функций для удаления слушателей stdout/stderr
+ * @external processCleanups
+ * @see {@link ../terminal/setupBotProcessListeners}
+ */
+import { processCleanups } from "../terminal/setupBotProcessListeners";
+
+/**
+ * Модуль для взаимодействия с хранилищем данных
+ * @external storage
+ * @see {@link ./storage}
+ */
+import { storage } from '../storages/storage';
+import { flushBuffer } from '../terminal/botLogsBuffer';
+import { broadcastProjectEvent } from '../terminal/broadcastProjectEvent';
+import { clearActiveLaunchId } from '../terminal/activeLaunchIds';
+import { clearBotRedisLockByTokenId } from './clearBotRedisLock';
+import { POST_STOP_COOLDOWN_MS, sleepMs } from './restartTiming';
+import { markExpectedStop, clearExpectedStop } from './expectedStops';
+
+/**
+ * Останавливает запущенный экземпляр Telegram-бота по идентификатору проекта и токена
+ *
+ * @param {number} projectId - Идентификатор проекта, к которому относится бот
+ * @param {number} tokenId - Идентификатор токена, используемого для запуска бота
+ *
+ * @returns {Promise<{ success: boolean; error?: string; }>} Объект с результатом операции:
+ *   - success: true если бот успешно остановлен, false в случае ошибки
+ *   - error: строка с описанием ошибки, если она произошла
+ *
+ * @description
+ * Функция выполняет следующие действия:
+ * 1. Формирует ключ в формате "projectId_tokenId" для поиска соответствующего процесса
+ * 2. Проверяет наличие процесса бота в глобальной коллекции botProcesses
+ * 3. Убивает все Python-процессы, связанные с этим проектом (включая зависшие)
+ * 4. Мягко завершает процесс бота, если он найден в памяти (сигнал SIGTERM)
+ * 5. При необходимости принудительно завершает процесс (сигнал SIGKILL) спустя 2 секунды
+ * 6. Удаляет все процессы, связанные с проектом, из коллекции botProcesses
+ * 7. Останавливает экземпляр бота в хранилище
+ *
+ * @example
+ * ```typescript
+ * const result = await stopBot(123, 456);
+ * if (result.success) {
+ *   console.log('Бот успешно остановлен');
+ * } else {
+ *   console.error('Ошибка при остановке бота:', result.error);
+ * }
+ * ```
+ */
+export async function stopBot(projectId: number, tokenId: number): Promise<{ success: boolean; error?: string; }> {
+  // Чтобы WorkerPool не принял stop за OOM и не автоперезапустил
+  markExpectedStop(tokenId);
+  try {
+    // ─── Режим воркера: остановка бота через worker pool ───
+    if (process.env.USE_WORKER_POOL !== 'false') {
+      const confirmed = await workerManager.stopBot(projectId, tokenId);
+      if (!confirmed) {
+        console.error(
+          `[stopBot] Таймаут подтверждения остановки project=${projectId} token=${tokenId}`,
+        );
+        // Orphan: снимаем Redis lock чтобы не блокировать следующий старт навсегда
+        await clearBotRedisLockByTokenId((id) => storage.getBotToken(id), tokenId);
+        return {
+          success: false,
+          error: 'Таймаут остановки бота в воркере — процесс мог не завершиться',
+        };
+      }
+
+      await storage.closeAllRunningLaunchHistory(tokenId, {
+        status: 'stopped',
+        stoppedAt: new Date(),
+        errorMessage: null,
+      });
+      clearActiveLaunchId(tokenId);
+      await storage.stopBotInstanceByToken(tokenId);
+      // Lock чистит finally в main; Node — safety после cooldown
+      void (async () => {
+        await sleepMs(POST_STOP_COOLDOWN_MS);
+        await clearBotRedisLockByTokenId((id) => storage.getBotToken(id), tokenId);
+      })();
+
+      void broadcastProjectEvent(projectId, {
+        type: 'bot-stopped',
+        projectId,
+        tokenId,
+        timestamp: new Date().toISOString(),
+      });
+
+      return { success: true };
+    }
+
+    const processKey = `${projectId}_${tokenId}`;
+    const botProcess = botProcesses.get(processKey);
+
+    // При webhook режиме — снимаем webhook с Telegram перед остановкой процесса
+    // В polling режиме этот шаг пропускается
+    if (process.env.WEBHOOK_URL) {
+      try {
+        const tokenRecord = await storage.getBotToken(tokenId);
+        if (tokenRecord?.token) {
+          const deleteUrl = `https://api.telegram.org/bot${tokenRecord.token}/deleteWebhook`;
+          await fetch(deleteUrl, { signal: AbortSignal.timeout(5000) });
+          console.log(`🔗 Webhook удалён для токена ${tokenId}`);
+        }
+      } catch (webhookError) {
+        console.log(`⚠️ Не удалось удалить webhook для токена ${tokenId}:`, webhookError);
+      }
+    }
+
+    // Убиваем ТОЛЬКО Python процесс для этого токена
+    try {
+      // Находим процессы с этим projectId и tokenId
+      try {
+        const psCommand = global.process.platform === 'win32'
+          ? `tasklist /FI "IMAGENAME eq python.exe" /FO CSV`
+          : `ps aux | grep python`;
+        const allPythonProcesses = execSync(psCommand, { encoding: 'utf8' }).trim();
+
+        if (allPythonProcesses) {
+          // Фильтруем только процессы с этим projectId И tokenId
+          const lines = allPythonProcesses.split('\n').filter((line: string) => {
+            const hasProjectId = line.includes(`PROJECT_ID=${projectId}`);
+            const hasTokenId = line.includes(`TOKEN_ID=${tokenId}`);
+            return line.trim() && hasProjectId && hasTokenId;
+          });
+          
+          for (const line of lines) {
+            const parts = line.trim().split(/\s+/);
+            const pid = parseInt(parts[1]);
+            if (pid && !isNaN(pid)) {
+              try {
+                console.log(`Убиваем процесс ${pid} для бота ${projectId} (токен ${tokenId})`);
+                execSync(`kill -TERM ${pid}`, { encoding: 'utf8' });
+              } catch (killError) {
+                console.log(`Процесс ${pid} уже завершен или недоступен`);
+              }
+            }
+          }
+        }
+      } catch (grepError) {
+        // Процессы не найдены - это нормально
+        console.log(`Процессы для бота ${projectId} (токен ${tokenId}) не найдены`);
+      }
+    } catch (error) {
+      console.log(`Ошибка при поиске процессов для бота ${projectId} (токен ${tokenId}):`, error);
+    }
+
+    // Если процесс был в памяти - завершаем его мягко
+    if (botProcess) {
+      try {
+        // Сначала пытаемся мягко завершить
+        botProcess.kill('SIGTERM');
+
+        // Даем время на корректное завершение
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // Если процесс все еще работает, принудительно завершаем
+        try {
+          botProcess.kill('SIGKILL');
+        } catch (e) {
+          // Процесс уже завершен
+        }
+      } catch (e) {
+        // Процесс уже завершен
+      }
+      // Удаляем слушатели процесса перед удалением из памяти
+      const cleanup = processCleanups.get(processKey);
+      if (cleanup) {
+        cleanup();
+        processCleanups.delete(processKey);
+      }
+      botProcesses.delete(processKey);
+    }
+
+    // Удаляем ТОЛЬКО процесс для этого токена из памяти
+    botProcesses.delete(processKey);
+
+    await flushBuffer(processKey);
+
+    // Закрываем все незавершённые запуски для этого токена
+    await storage.closeAllRunningLaunchHistory(tokenId, {
+      status: 'stopped',
+      stoppedAt: new Date(),
+      errorMessage: null,
+    });
+    clearActiveLaunchId(tokenId);
+
+    await storage.stopBotInstanceByToken(tokenId);
+
+    // Удаляем Redis lock чтобы следующий запуск не блокировался
+    // (finally в Python может не выполниться при SIGKILL)
+    await clearBotRedisLockByTokenId((id) => storage.getBotToken(id), tokenId);
+
+    // Рассылаем событие об остановке бота всем клиентам проекта
+    void broadcastProjectEvent(projectId, {
+      type: 'bot-stopped',
+      projectId,
+      tokenId,
+      timestamp: new Date().toISOString(),
+    });
+
+    return { success: true };
+  } catch (error) {
+    console.error('Ошибка остановки бота:', error);
+    return { success: false, error: error instanceof Error ? error.message : 'Неизвестная ошибка' };
+  } finally {
+    clearExpectedStop(tokenId);
+  }
+}

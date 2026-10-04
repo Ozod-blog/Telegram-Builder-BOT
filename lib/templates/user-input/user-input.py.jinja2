@@ -1,0 +1,118 @@
+{#
+  Шаблон блока waiting_for_input для сбора пользовательского ввода
+
+  @fileoverview Генерирует Python-код установки состояния ожидания ввода
+  @param {string} nodeId              — ID узла
+  @param {string} safeName            — безопасное имя (safe_name от nodeId)
+  @param {string} inputVariable       — имя переменной для сохранения ответа
+  @param {bool}   appendVariable      — режим добавления (не перезаписывать)
+  @param {string} inputTargetNodeId   — ID следующего узла после ввода
+  @param {bool}   enableTextInput     — принимать текстовый ввод
+  @param {bool}   enablePhotoInput    — принимать фото
+  @param {string} photoInputVariable  — переменная для фото
+  @param {bool}   enableVideoInput    — принимать видео
+  @param {string} videoInputVariable  — переменная для видео
+  @param {bool}   enableAudioInput    — принимать аудио
+  @param {string} audioInputVariable  — переменная для аудио
+  @param {bool}   enableDocumentInput — принимать документы
+  @param {string} documentInputVariable — переменная для документов
+  @param {string} validationType      — тип валидации: none | email | phone | number
+  @param {number} minLength           — минимальная длина текста (0 = без ограничений)
+  @param {number} maxLength           — максимальная длина текста (0 = без ограничений)
+  @param {string} retryMessage        — сообщение при ошибке валидации
+  @param {string} successMessage      — сообщение при успешном сохранении
+  @param {number} inputTimeout        — таймаут ожидания ввода в секундах
+  @param {string} inputTimeoutMessage — сообщение при истечении таймаута
+  @param {bool}   saveToDatabase      — сохранять в базу данных
+#}
+
+{# ── modes передаётся готовым массивом из renderer ── #}
+{% set firstMode = modes[0] if modes else "text" %}
+{%- if 'callback' in modes %}
+    # Прямая обработка callback: если вызван с реальным нажатием (не fake) — сразу сохраняем и переходим
+    # Также обрабатываем fake-вызов от callback_trigger если button_text уже сохранён триггером
+    _is_fake_cb = getattr(callback_query, '_is_fake', False)
+    _trigger_btn_text = user_data.get(user_id, {}).get("button_text", "") if _is_fake_cb else ""
+    if _trigger_btn_text:
+        # Триггер уже извлёк текст кнопки — используем его напрямую
+        await set_user_var(user_id, "{{ inputVariable }}", _trigger_btn_text)
+        logging.info(f"✅ Callback input (от триггера): {{ inputVariable }} = {_trigger_btn_text}")
+        user_data.get(user_id, {}).pop("button_text", None)
+        {%- if inputTargetNodeId %}
+        _trigger_fake = SimpleNamespace(
+            id="trigger_cb_nav",
+            from_user=callback_query.from_user,
+            chat_instance="",
+            data="{{ inputTargetNodeId }}",
+            message=callback_query.message,
+            _is_fake=True,
+            answer=lambda *_a, **_kw: asyncio.sleep(0)
+        )
+        await handle_callback_{{ inputTargetNodeId | safe_name }}(_trigger_fake, state=state)
+        {%- endif %}
+        return
+    if not _is_fake_cb and hasattr(callback_query, 'message') and callback_query.message:
+        # Читаем текст нажатой кнопки из reply_markup по уникальному тексту
+        _direct_btn_text = ""
+        try:
+            _rm = callback_query.message.reply_markup
+            if _rm and hasattr(_rm, "inline_keyboard"):
+                for _row in _rm.inline_keyboard:
+                    for _btn in _row:
+                        if getattr(_btn, "callback_data", None) == (callback_query.data or ""):
+                            _direct_btn_text = _btn.text or ""
+                            break
+                    if _direct_btn_text:
+                        break
+        except Exception:
+            pass
+        # Сохраняем текст кнопки (или callback_data если текст не найден)
+        _direct_value = _direct_btn_text if _direct_btn_text else (callback_query.data or "")
+        await set_user_var(user_id, "{{ inputVariable }}", _direct_value)
+        logging.info(f"✅ Callback input (прямой): {{ inputVariable }} = {_direct_value}")
+        {%- if inputTargetNodeId %}
+        # Переходим к следующему узлу через fake-callback с флагом _is_fake=True
+        _direct_fake = SimpleNamespace(
+            id="direct_cb_nav",
+            from_user=callback_query.from_user,
+            chat_instance="",
+            data="{{ inputTargetNodeId }}",
+            message=callback_query.message,
+            _is_fake=True,
+            answer=lambda *_a, **_kw: asyncio.sleep(0)
+        )
+        await handle_callback_{{ inputTargetNodeId | safe_name }}(_direct_fake, state=state)
+        {%- endif %}
+        return
+{%- endif %}
+
+    # Устанавливаем состояние ожидания ввода для узла {{ nodeId }}
+    user_data[user_id] = user_data.get(user_id, {})
+    user_data[user_id]["waiting_for_input"] = {
+        "type": "{{ firstMode }}",
+        "modes": {{ modes | dump }},
+        "variable": "{{ inputVariable }}",
+        "save_to_database": {{ saveToDatabase | default(true) | to_python_boolean }},
+        "node_id": "{{ nodeId }}",
+        "next_node_id": "{{ inputTargetNodeId | default('') }}",
+        "appendVariable": {{ appendVariable | default(false) | to_python_boolean }},
+        "min_length": {{ minLength | default(0) }},
+        "max_length": {{ maxLength | default(0) }},
+        "validation_type": "{{ validationType | default('none') }}",
+        "retry_message": {{ retryMessage | default('Пожалуйста, попробуйте еще раз.') | escape_python_string }},
+        "success_message": {{ successMessage | default("") | escape_python_string }}{% if inputTimeout and inputTimeout > 0 %},
+        "timeout_seconds": {{ inputTimeout }},
+        "timeout_message": {{ inputTimeoutMessage | default('Время ожидания истекло.') | escape_python_string }}{% endif %}{% if enablePhotoInput and photoInputVariable %},
+        "photo_variable": "{{ photoInputVariable }}"{% endif %}{% if enableVideoInput and videoInputVariable %},
+        "video_variable": "{{ videoInputVariable }}"{% endif %}{% if enableAudioInput and audioInputVariable %},
+        "audio_variable": "{{ audioInputVariable }}"{% endif %}{% if enableDocumentInput and documentInputVariable %},
+        "document_variable": "{{ documentInputVariable }}"{% endif %}{% if enableLocationInput and locationInputVariable %},
+        "location_variable": "{{ locationInputVariable }}"{% endif %}{% if enableContactInput and contactInputVariable %},
+        "contact_variable": "{{ contactInputVariable }}"{% endif %}{% if skipButtons and skipButtons.length %},
+        "skip_buttons": {{ skipButtons | dump }}{% endif %}
+
+    }
+    logging.info(f'✅ Состояние ожидания настроено: modes={{ modes | dump }} для переменной {{ inputVariable }} (узел {{ nodeId }})')
+{%- if inputTimeout and inputTimeout > 0 %}
+    await _schedule_input_timeout(user_id, {{ inputTimeout }}, {{ inputTimeoutMessage | default('Время ожидания истекло.') | escape_python_string }})
+{%- endif %}

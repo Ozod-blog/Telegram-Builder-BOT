@@ -1,0 +1,157 @@
+/**
+ * @fileoverview Хук универсальной панели изменений редактора
+ * Объединяет состояния canvas и JSON режимов в единый интерфейс
+ */
+
+import { useMemo, useCallback } from 'react';
+import type { ActionHistoryItem } from '@/pages/editor/types/action-history-item';
+import type { CanvasActor } from '@shared/canvas-sync/canvas-actor';
+
+/** Вариант отображения панели */
+export type StagingVariant = 'canvas' | 'json-dirty' | 'json-error';
+
+/** Параметры хука useStagingBar */
+export interface UseStagingBarOptions {
+  // --- Canvas режим ---
+  /** Есть ли локальные несохранённые изменения на холсте */
+  hasLocalChanges: boolean;
+  /** История действий пользователя */
+  actionHistory: ActionHistoryItem[];
+  /** Колбэк сохранения изменений холста */
+  onSave: () => void;
+  /** Колбэк сохранения с перезапуском ботов сценария */
+  onSaveAndRestart: () => void;
+  /** Колбэк сохранения с заметкой — создаёт постоянный ручной чекпоинт */
+  onSaveWithNote: (note: string) => void;
+  /** Колбэк сброса изменений холста */
+  onDiscard: () => void;
+  /** Идёт ли сохранение в данный момент */
+  isSaving: boolean;
+  /** Последний актор удалённой синхронизации холста */
+  remoteSyncActor?: CanvasActor | null;
+  // --- JSON режим ---
+  /** Есть ли несохранённые изменения в JSON-редакторе */
+  isDirty: boolean;
+  /** Текст ошибки валидации JSON или null */
+  jsonError: string | null;
+  /** Колбэк применения JSON */
+  onApplyJson: () => void;
+  /** Колбэк сброса JSON к исходному состоянию */
+  onResetJson: () => void;
+  // --- Общее ---
+  /** Текущий активный режим редактора */
+  mode: 'canvas' | 'json';
+}
+
+/** Результат хука useStagingBar */
+export interface UseStagingBarResult {
+  /** Показывать ли панель */
+  isVisible: boolean;
+  /** Вариант отображения панели */
+  variant: StagingVariant;
+  /** Количество действий в истории */
+  changesCount: number;
+  /** Колбэк сохранения (canvas) */
+  onSave: () => void;
+  /** Колбэк сохранения с перезапуском ботов сценария */
+  onSaveAndRestart: () => void;
+  /** Колбэк сохранения с заметкой — создаёт постоянный ручной чекпоинт */
+  onSaveWithNote: (note: string) => void;
+  /** Колбэк сброса (canvas) */
+  onDiscard: () => void;
+  /** Идёт ли сохранение */
+  isSaving: boolean;
+  /** Колбэк применения JSON */
+  onApplyJson: () => void;
+  /** Колбэк сброса JSON */
+  onResetJson: () => void;
+  /** Текст ошибки JSON */
+  jsonError: string | null;
+  /** Текущий режим редактора */
+  mode: 'canvas' | 'json';
+  /** Есть ли несохранённые изменения на холсте (для предупреждения о конфликте) */
+  hasLocalChanges: boolean;
+  /** Есть ли несохранённые изменения в JSON (для предупреждения о конфликте) */
+  isDirty: boolean;
+  /** Актор последней удалённой синхронизации холста */
+  remoteSyncActor?: CanvasActor | null;
+}
+
+/**
+ * Хук универсальной панели изменений
+ * Вычисляет видимость, вариант и колбэки для StagingBar
+ * @param options - Параметры обоих режимов редактора
+ * @returns Единое состояние для отображения панели
+ */
+export function useStagingBar(options: UseStagingBarOptions): UseStagingBarResult {
+  const {
+    hasLocalChanges, actionHistory, onSave, onSaveAndRestart, onDiscard, isSaving,
+    isDirty, jsonError, onApplyJson, onResetJson, mode, remoteSyncActor, onSaveWithNote,
+  } = options;
+
+  const variant = useMemo<StagingVariant>(() => {
+    if (mode === 'json') {
+      if (jsonError) return 'json-error';
+      if (isDirty) return 'json-dirty';
+      return 'canvas'; // hasLocalChanges из холста
+    }
+    return 'canvas';
+  }, [mode, jsonError, isDirty]);
+
+  const isVisible = useMemo(() => {
+    if (remoteSyncActor) return true;
+    if (mode === 'canvas') return hasLocalChanges;
+    return isDirty || !!jsonError || hasLocalChanges;
+  }, [mode, hasLocalChanges, isDirty, jsonError, remoteSyncActor]);
+
+  /**
+   * В json-dirty режиме сначала применяет JSON, затем сохраняет.
+   * В canvas режиме — просто сохраняет.
+   */
+  const handleSave = useCallback(() => {
+    if (mode === 'json' && isDirty) {
+      onApplyJson();
+    }
+    onSave();
+  }, [mode, isDirty, onApplyJson, onSave]);
+
+  /**
+   * В json-dirty режиме сначала применяет JSON, затем сохраняет и перезапускает.
+   * В canvas режиме — просто сохраняет и перезапускает.
+   */
+  const handleSaveAndRestart = useCallback(() => {
+    if (mode === 'json' && isDirty) {
+      onApplyJson();
+    }
+    onSaveAndRestart();
+  }, [mode, isDirty, onApplyJson, onSaveAndRestart]);
+
+  /**
+   * В json-dirty режиме сначала применяет JSON, затем сохраняет с заметкой.
+   * В canvas режиме — просто сохраняет с заметкой (постоянный ручной чекпоинт).
+   */
+  const handleSaveWithNote = useCallback((note: string) => {
+    if (mode === 'json' && isDirty) {
+      onApplyJson();
+    }
+    onSaveWithNote(note);
+  }, [mode, isDirty, onApplyJson, onSaveWithNote]);
+
+  return {
+    isVisible,
+    variant,
+    changesCount: actionHistory.length,
+    onSave: handleSave,
+    onSaveAndRestart: handleSaveAndRestart,
+    onSaveWithNote: handleSaveWithNote,
+    onDiscard,
+    isSaving,
+    onApplyJson,
+    onResetJson,
+    jsonError,
+    mode,
+    hasLocalChanges,
+    isDirty,
+    remoteSyncActor,
+  };
+}

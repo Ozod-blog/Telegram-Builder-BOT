@@ -1,0 +1,305 @@
+{#
+  Middleware для логирования сообщений
+
+  @param {boolean} userDatabaseEnabled - Включена ли база данных
+  @param {boolean} hasInlineButtons - Есть ли inline кнопки (для callback middleware)
+  @param {boolean} autoRegisterUsers - Автоматически регистрировать пользователей
+#}
+
+# Middleware для фильтрации устаревших апдейтов
+# Игнорирует сообщения старше MAX_UPDATE_AGE_SECONDS секунд (накопились пока бот был остановлен)
+MAX_UPDATE_AGE_SECONDS = int(os.getenv("MAX_UPDATE_AGE_SECONDS", "300"))
+
+async def stale_update_filter_middleware(handler, event: types.Message, data: dict):
+    """Пропускает сообщения старше MAX_UPDATE_AGE_SECONDS секунд."""
+    import time
+    try:
+        if event.date and (time.time() - event.date.timestamp()) > MAX_UPDATE_AGE_SECONDS:
+            logging.info(
+                f"⏭️ Пропущен устаревший апдейт от {event.from_user.id if event.from_user else '?'} "
+                f"(возраст {int(time.time() - event.date.timestamp())}с > {MAX_UPDATE_AGE_SECONDS}с)"
+            )
+            return  # не передаём дальше
+    except Exception:
+        pass
+    return await handler(event, data)
+
+{% if autoRegisterUsers %}
+# Middleware для автоматической регистрации пользователей
+async def register_user_middleware(handler, event: types.Message, data: dict):
+    """Автоматически инициализирует user_data при первом обращении пользователя"""
+    try:
+        user = event.from_user
+        if user:
+            user_id = user.id
+            if user_id not in user_data:
+                user_data[user_id] = {
+                    'username': user.username or '',
+                    'first_name': user.first_name or '',
+                    'last_name': user.last_name or '',
+                    'user_name': user.username or user.first_name or str(user_id),
+                    'user_id': user_id,
+                    'language_code': user.language_code or '',
+                    'is_premium': user.is_premium or False,
+                    'is_bot': user.is_bot or False,
+                }
+                logging.info(f"Новый пользователь зарегистрирован: {user_id}")
+    except Exception as e:
+        logging.error(f"Ошибка в register_user_middleware: {e}")
+
+    return await handler(event, data)
+
+{% endif %}
+
+{% if userDatabaseEnabled %}
+# Middleware для сохранения входящих сообщений
+async def message_logging_middleware(handler, event: types.Message, data: dict):
+    """Middleware для автоматического сохранения входящих сообщений от пользователей"""
+    try:
+        # Сохраняем входящее сообщение от пользователя
+        user_id = str(event.from_user.id)
+        message_text = event.text or event.caption or "[медиа]"
+        message_data = {"message_id": event.message_id}
+
+        # Для групповых сообщений сохраняем данные отправителя
+        if hasattr(event, 'from_user') and event.from_user:
+            message_data["from_user"] = {
+                "id": event.from_user.id,
+                "username": event.from_user.username or "",
+                "first_name": event.from_user.first_name or "",
+                "last_name": event.from_user.last_name or "",
+            }
+
+        # Проверяем наличие фото
+        photo_file_id = None
+        if event.photo:
+            # Берем фото наибольшего размера (последнее в списке)
+            largest_photo = event.photo[-1]
+            photo_file_id = largest_photo.file_id
+            message_data["photo"] = {
+                "file_id": largest_photo.file_id,
+                "file_unique_id": largest_photo.file_unique_id,
+                "width": largest_photo.width,
+                "height": largest_photo.height,
+                "file_size": largest_photo.file_size if hasattr(largest_photo, "file_size") else None
+            }
+            if not message_text or message_text == "[медиа]":
+                message_text = "[Фото]"
+
+        # Проверяем наличие видео
+        elif event.video:
+            _video_thumb = None
+            if event.video.thumbnail:
+                _video_thumb = {"file_id": event.video.thumbnail.file_id, "file_unique_id": event.video.thumbnail.file_unique_id, "width": event.video.thumbnail.width, "height": event.video.thumbnail.height}
+            message_data["video"] = {
+                "file_id": event.video.file_id,
+                "file_unique_id": event.video.file_unique_id,
+                "file_name": event.video.file_name if hasattr(event.video, "file_name") else None,
+                "width": event.video.width,
+                "height": event.video.height,
+                "duration": event.video.duration,
+                "file_size": event.video.file_size if hasattr(event.video, "file_size") else None,
+                "mime_type": event.video.mime_type if hasattr(event.video, "mime_type") else None,
+                "thumbnail": _video_thumb,
+            }
+            if not message_text or message_text == "[медиа]":
+                message_text = "[Видео]"
+
+        # Проверяем наличие анимации (GIF)
+        elif event.animation:
+            _anim_thumb = None
+            if event.animation.thumbnail:
+                _anim_thumb = {"file_id": event.animation.thumbnail.file_id, "file_unique_id": event.animation.thumbnail.file_unique_id, "width": event.animation.thumbnail.width, "height": event.animation.thumbnail.height}
+            message_data["animation"] = {
+                "file_id": event.animation.file_id,
+                "file_unique_id": event.animation.file_unique_id,
+                "file_name": event.animation.file_name if hasattr(event.animation, "file_name") else None,
+                "width": event.animation.width,
+                "height": event.animation.height,
+                "duration": event.animation.duration,
+                "file_size": event.animation.file_size if hasattr(event.animation, "file_size") else None,
+                "mime_type": event.animation.mime_type if hasattr(event.animation, "mime_type") else None,
+                "thumbnail": _anim_thumb,
+            }
+            if not message_text or message_text == "[медиа]":
+                message_text = "[GIF]"
+
+        # Проверяем наличие видеокружка
+        elif event.video_note:
+            _vnote_thumb = None
+            if event.video_note.thumbnail:
+                _vnote_thumb = {"file_id": event.video_note.thumbnail.file_id, "file_unique_id": event.video_note.thumbnail.file_unique_id, "width": event.video_note.thumbnail.width, "height": event.video_note.thumbnail.height}
+            message_data["video_note"] = {
+                "file_id": event.video_note.file_id,
+                "file_unique_id": event.video_note.file_unique_id,
+                "length": event.video_note.length,
+                "duration": event.video_note.duration,
+                "file_size": event.video_note.file_size if hasattr(event.video_note, "file_size") else None,
+                "thumbnail": _vnote_thumb,
+            }
+            if not message_text or message_text == "[медиа]":
+                message_text = "[Кружок]"
+
+        # Проверяем наличие аудио
+        elif event.audio:
+            _audio_thumb = None
+            if event.audio.thumbnail:
+                _audio_thumb = {"file_id": event.audio.thumbnail.file_id, "file_unique_id": event.audio.thumbnail.file_unique_id}
+            message_data["audio"] = {
+                "file_id": event.audio.file_id,
+                "file_unique_id": event.audio.file_unique_id,
+                "duration": event.audio.duration,
+                "file_size": event.audio.file_size if hasattr(event.audio, "file_size") else None,
+                "mime_type": event.audio.mime_type if hasattr(event.audio, "mime_type") else None,
+                "title": event.audio.title if hasattr(event.audio, "title") else None,
+                "performer": event.audio.performer if hasattr(event.audio, "performer") else None,
+                "thumbnail": _audio_thumb,
+            }
+            if not message_text or message_text == "[медиа]":
+                message_text = "[Аудио]"
+
+        # Проверяем наличие голосового сообщения
+        elif event.voice:
+            message_data["voice"] = {
+                "file_id": event.voice.file_id,
+                "file_unique_id": event.voice.file_unique_id,
+                "duration": event.voice.duration,
+                "file_size": event.voice.file_size if hasattr(event.voice, "file_size") else None,
+                "mime_type": event.voice.mime_type if hasattr(event.voice, "mime_type") else None,
+            }
+            if not message_text or message_text == "[медиа]":
+                message_text = "[Голосовое]"
+
+        # Проверяем наличие документа
+        elif event.document:
+            _doc_thumb = None
+            if event.document.thumbnail:
+                _doc_thumb = {"file_id": event.document.thumbnail.file_id, "file_unique_id": event.document.thumbnail.file_unique_id, "width": event.document.thumbnail.width, "height": event.document.thumbnail.height}
+            message_data["document"] = {
+                "file_id": event.document.file_id,
+                "file_unique_id": event.document.file_unique_id,
+                "file_name": event.document.file_name if hasattr(event.document, "file_name") else None,
+                "file_size": event.document.file_size if hasattr(event.document, "file_size") else None,
+                "mime_type": event.document.mime_type if hasattr(event.document, "mime_type") else None,
+                "thumbnail": _doc_thumb,
+            }
+            if not message_text or message_text == "[медиа]":
+                message_text = "[Документ]"
+
+        # Проверяем наличие стикера
+        elif event.sticker:
+            _sticker_thumb = None
+            if event.sticker.thumbnail:
+                _sticker_thumb = {"file_id": event.sticker.thumbnail.file_id, "file_unique_id": event.sticker.thumbnail.file_unique_id, "width": event.sticker.thumbnail.width, "height": event.sticker.thumbnail.height}
+            message_data["sticker"] = {
+                "file_id": event.sticker.file_id,
+                "file_unique_id": event.sticker.file_unique_id,
+                "width": event.sticker.width,
+                "height": event.sticker.height,
+                "is_animated": event.sticker.is_animated if hasattr(event.sticker, "is_animated") else False,
+                "is_video": event.sticker.is_video if hasattr(event.sticker, "is_video") else False,
+                "emoji": event.sticker.emoji if hasattr(event.sticker, "emoji") else None,
+                "set_name": event.sticker.set_name if hasattr(event.sticker, "set_name") else None,
+                "thumbnail": _sticker_thumb,
+            }
+            if not message_text or message_text == "[медиа]":
+                message_text = "[Стикер]"
+
+        # Определяем тип и id чата
+        _evt_chat_type = event.chat.type if hasattr(event, 'chat') and event.chat else 'private'
+        _evt_chat_id = str(event.chat.id) if hasattr(event, 'chat') and event.chat and event.chat.type in ['group', 'supergroup', 'channel'] else None
+
+        # Сохраняем сообщение в базу данных асинхронно (fire-and-forget)
+        _fire_save_message(
+            user_id=user_id,
+            message_type="user",
+            message_text=message_text,
+            message_data=message_data,
+            chat_type=_evt_chat_type,
+            chat_id=_evt_chat_id,
+        )
+
+{% if saveIncomingMedia %}
+        # Если включено сохранение фото — скачиваем и сохраняем в фоне (fire-and-forget)
+        if photo_file_id:
+            asyncio.create_task(_save_incoming_photo_to_db(photo_file_id, message_data.get("photo", {})))
+{% endif %}
+
+    except Exception as e:
+        logging.error(f"Ошибка в middleware сохранения сообщений: {e}")
+
+    # Сначала handler (/start, deep link) — потом профиль в БД с актуальным источником
+    result = await handler(event, data)
+
+    try:
+        if event.from_user:
+            _uid = int(event.from_user.id)
+            _ud = user_data.get(_uid, {})
+            asyncio.create_task(save_user_to_db(
+                _uid,
+                event.from_user.username,
+                event.from_user.first_name,
+                event.from_user.last_name,
+                is_premium=getattr(event.from_user, 'is_premium', None) or False,
+                is_bot=getattr(event.from_user, 'is_bot', None) or False,
+                language_code=getattr(event.from_user, 'language_code', None) or None,
+                # После handler: метка из /start или "direct" если источник не задан
+                deep_link_param=_ud.get("deep_link_param") or "direct",
+                referrer_id=_ud.get("referrer_id"),
+            ))
+    except Exception as e:
+        logging.error(f"Ошибка обновления профиля пользователя в middleware: {e}")
+
+    return result
+
+{% endif %}
+
+{% if userDatabaseEnabled and hasInlineButtons %}
+# Middleware для сохранения нажатий на кнопки
+async def callback_query_logging_middleware(handler, event: types.CallbackQuery, data: dict):
+    """Middleware для автоматического сохранения нажатий на кнопки"""
+    try:
+        user_id = str(event.from_user.id)
+        callback_data = event.data or ""
+
+        # Пытаемся найти текст кнопки из сообщения
+        button_text = None
+        if event.message and hasattr(event.message, "reply_markup"):
+            reply_markup = event.message.reply_markup
+            if hasattr(reply_markup, "inline_keyboard"):
+                for row in reply_markup.inline_keyboard:
+                    for btn in row:
+                        if hasattr(btn, "callback_data") and btn.callback_data == callback_data:
+                            button_text = btn.text
+                            break
+                    if button_text:
+                        break
+
+        message_text_to_save = f"[Нажата кнопка: {button_text}]" if button_text else "[Нажата кнопка]"
+        # Сохраняем нажатие кнопки асинхронно (fire-and-forget)
+        _fire_save_message(
+            user_id=user_id,
+            message_type="user",
+            message_text=message_text_to_save,
+            message_data={
+                "button_clicked": True,
+                "button_text": button_text,
+                "callback_data": callback_data
+            },
+            chat_type=event.message.chat.type if event.message and event.message.chat else 'private',
+            chat_id=str(event.message.chat.id) if event.message and event.message.chat and event.message.chat.type in ['group', 'supergroup', 'channel'] else None,
+        )
+    except Exception as e:
+        logging.error(f"Ошибка в middleware сохранения нажатий кнопок: {e}")
+
+    # Закрываем анимацию загрузки на кнопке (обязательный квиток Telegram)
+    # Если не вызвать — кнопка крутит анимацию ~30 секунд
+    try:
+        await event.answer()
+    except Exception:
+        pass
+
+    # Продолжаем обработку callback query
+    return await handler(event, data)
+
+{% endif %}

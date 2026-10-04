@@ -1,0 +1,71 @@
+/**
+ * @fileoverview Компонент навигации по вкладкам
+ * @description Отображает кнопки переключения между разделами редактора
+ */
+
+import { cn } from '@/utils/utils';
+import type { HeaderTab } from '../types';
+
+/**
+ * Свойства компонента навигации
+ */
+export interface NavigationProps {
+  /** Текущая активная вкладка */
+  currentTab: HeaderTab;
+  /** Обработчик изменения вкладки */
+  onTabChange: (tab: HeaderTab) => void;
+  /** Вертикальное расположение */
+  isVertical?: boolean;
+  /** Компактный режим */
+  isCompact?: boolean;
+  /** Дополнительные CSS-классы */
+  className?: string;
+}
+
+/** Элемент навигации */
+interface NavItem {
+  /** Ключ вкладки */
+  key: HeaderTab;
+  /** Отображаемое название */
+  label: string;
+}
+
+/** Элементы навигации в шапке */
+const NAV_ITEMS: NavItem[] = [
+  { key: 'editor', label: 'Редактор' },
+  { key: 'bot', label: 'Бот' },
+  { key: 'terminal', label: 'Терминал' },
+  { key: 'users', label: 'Пользователи' },
+  { key: 'agent', label: 'Агент' },
+];
+
+/**
+ * Навигация по вкладкам редактора
+ */
+export function Navigation({ currentTab, onTabChange, isVertical, isCompact, className }: NavigationProps) {
+  return (
+    <nav
+      className={cn(
+        isVertical ? 'flex flex-col space-y-1 px-2' : 'hidden shrink-0 flex-nowrap items-center gap-0.5 md:flex xl:gap-1',
+        className
+      )}
+    >
+      {NAV_ITEMS.map((tab) => (
+        <button
+          key={tab.key}
+          onClick={() => onTabChange(tab.key)}
+          className={cn(
+            'whitespace-nowrap rounded-lg px-2 py-1 text-xs font-semibold transition-all duration-200 md:px-2.5 md:text-sm xl:px-3',
+            currentTab === tab.key
+              ? 'text-white bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-700 hover:to-blue-600 shadow-md shadow-blue-500/20'
+              : 'text-muted-foreground hover:text-foreground hover:bg-muted/60 dark:hover:bg-slate-800/50',
+            isVertical ? 'w-full text-left' : '',
+            isVertical && isCompact && 'truncate'
+          )}
+        >
+          {isVertical && isCompact ? tab.label.substring(0, 3) : tab.label}
+        </button>
+      ))}
+    </nav>
+  );
+}

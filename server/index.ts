@@ -1,0 +1,298 @@
+import dotenv from "dotenv";
+import express, { NextFunction, type Request, Response } from "express";
+import { createServer } from "http";
+import { startFileMonitoring } from "./files/file-monitoring";
+import { restoreRunningBots } from "./bots/restoreRunningBots";
+import { scheduleRestoreSweep } from "./bots/restoreSweep";
+import { reconcileOrphanLaunchHistories } from "./bots/reconcileLaunchHistory";
+import { workerManager } from "./bots/botWorkerManager";
+import { findActiveProcessForToken } from "./utils/findActiveProcessForToken";
+import { apiNotFoundHandler } from "./middleware/apiNotFoundHandler";
+import { registerRoutes } from "./routes/routes";
+import { log, serveStatic, setupVite } from "./routes/vite";
+import { storage } from "./storages/storage";
+import { initializeTerminalWebSocket } from './terminal/initializeTerminalWebSocket';
+import { initializeCanvasWebSocket } from './canvas/initializeCanvasWebSocket';
+import { registerWebSocketUpgrade } from './websocket/registerWebSocketUpgrade';
+import { initRedisPlatformSubscriber } from './redis/redisPlatformSubscriber';
+import { initRedisLogsSubscriber } from './redis/redisLogsSubscriber';
+import { initRedisProjectEventBridge } from './redis/redisProjectEventBridge';
+import { stopCleanup } from "./utils/cache";
+import { shutdownAllBots } from "./utils/graceful-shutdown";
+import { runMigrations } from "./database/runMigrations";
+import { isRedisAvailable, waitForRedisInit } from "./redis/redisClient";
+
+// Настраиваем прокси для Telegram API ДО всех импортов
+dotenv.config({ debug: false });
+if (process.env.TELEGRAM_PROXY_URL && process.env.TELEGRAM_PROXY_URL.trim() !== '') {
+  process.env.HTTP_PROXY = process.env.TELEGRAM_PROXY_URL;
+  process.env.HTTPS_PROXY = process.env.TELEGRAM_PROXY_URL;
+  
+  // Активируем global-agent для перехвата всех HTTP/HTTPS запросов
+  try {
+    const { bootstrap } = await import('global-agent');
+    bootstrap();
+    console.log(`[Proxy] global-agent activated: HTTP_PROXY=${process.env.HTTP_PROXY}`);
+    console.log(`[Proxy] global-agent activated: HTTPS_PROXY=${process.env.HTTPS_PROXY}`);
+  } catch (e) {
+    console.warn('[Proxy] global-agent not available, using environment variables only');
+  }
+}
+
+/**
+ * Основное приложение Express
+ *
+ * @description
+ * Создает экземпляр приложения Express и настраивает основные middleware:
+ * - парсинг JSON с лимитом 50MB
+ * - парсинг URL-encoded данных с лимитом 50MB
+ */
+const app = express();
+// Railway и другие reverse proxy передают X-Forwarded-Proto
+// Без этого Express не знает что запрос пришёл через HTTPS и не ставит secure куки
+app.set('trust proxy', 1);
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: false, limit: '50mb' }));
+/** Парсер для тела запроса с Content-Type: text/plain — используется при импорте проекта через Telegram-бота */
+app.use(express.text({ limit: '50mb', type: 'text/plain' }));
+
+/**
+ * Middleware для логирования запросов к API
+ *
+ * @description
+ * Этот middleware записывает информацию о каждом запросе к API,
+ * включая метод, путь, код ответа и время выполнения.
+ * Также захватывает JSON-ответы для логирования.
+ *
+ * @param req - Объект запроса Express
+ * @param res - Объект ответа Express
+ * @param next - Функция перехода к следующему middleware
+ */
+app.use((req, res, next) => {
+  const start = Date.now();
+  const path = req.path;
+  let capturedJsonResponse: Record<string, any> | undefined = undefined;
+
+  const originalResJson = res.json;
+  res.json = function (bodyJson, ...args) {
+    capturedJsonResponse = bodyJson;
+    return originalResJson.apply(res, [bodyJson, ...args]);
+  };
+
+  res.on("finish", () => {
+    const duration = Date.now() - start;
+    if (path.startsWith("/api")) {
+      // Пропускаем логирование частых HEAD-запросов к /api и /api/health для уменьшения шума
+      if (req.method === "HEAD" && path === "/api/health") {
+        return;
+      }
+
+      let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
+      if (capturedJsonResponse) {
+        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
+      }
+
+      // Ошибки — целиком (иначе «Не удалось получить…» без причины).
+      // Успешные ответы режем мягче, чтобы не забивать консоль огромными JSON.
+      const maxLen = res.statusCode >= 400 ? 4000 : 500;
+      if (logLine.length > maxLen) {
+        logLine = logLine.slice(0, maxLen - 1) + "…";
+      }
+
+      log(logLine);
+    }
+  });
+
+  next();
+});
+
+/**
+ * Основной асинхронный блок инициализации сервера
+ *
+ * @description
+ * Этот блок регистрирует маршруты, настраивает Vite в режиме разработки,
+ * устанавливает обработчик ошибок и запускает сервер на порту 5000.
+ * Также настраивает корректное завершение работы сервера при получении сигнала SIGTERM.
+ */
+(async () => {
+  const httpServer = createServer(app);
+  await runMigrations();
+  await registerRoutes(app, httpServer);
+
+  // Несуществующие /api/* → JSON 404, не SPA index.html (до Vite/static catch-all)
+  app.use("/api", apiNotFoundHandler);
+
+  /**
+   * Глобальный обработчик ошибок
+   *
+   * @description
+   * Обрабатывает все ошибки, возникающие в приложении.
+   * Отправляет клиенту JSON-ответ с кодом состояния и сообщением об ошибке.
+   *
+   * @param err - Объект ошибки
+   * @param _req - Объект запроса (не используется)
+   * @param res - Объект ответа
+   * @param _next - Функция перехода (не используется)
+   */
+  app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+    const status = err.status || err.statusCode || 500;
+    const message = err.message || "Внутренняя ошибка сервера";
+
+    if (!res.headersSent) {
+      res.status(status).json({ message });
+    }
+    throw err;
+  });
+
+  // Инициализируем WebSocket-серверы в режиме noServer (без привязки к upgrade).
+  // Маршрутизацию upgrade по пути выполняет единый registerWebSocketUpgrade —
+  // это устраняет конфликт нескольких ws-серверов ("Invalid frame header").
+  const terminalWss = initializeTerminalWebSocket();
+  const canvasWss = initializeCanvasWebSocket();
+  registerWebSocketUpgrade(httpServer, {
+    "/api/terminal": terminalWss,
+    "/api/canvas": canvasWss,
+  });
+  // Подписываемся на Redis Pub/Sub события платформы
+  initRedisPlatformSubscriber();
+  // Fan-out ProjectEvent между репликами Node (настройки токена и пр.)
+  initRedisProjectEventBridge();
+  // Подписываемся на Redis Pub/Sub логи ботов (дополнительный канал к stdout)
+  initRedisLogsSubscriber();
+
+  // Важно настраивать Vite только в режиме разработки и после
+  // настройки всех остальных маршрутов, чтобы маршрут catch-all
+  // не мешал работе других маршрутов
+  if (app.get("env") === "development") {
+    await setupVite(app, httpServer);
+  } else {
+    serveStatic(app);
+  }
+
+  // Запускаем мониторинг файлов
+  startFileMonitoring(storage).then(stopMonitoring => {
+    log('Мониторинг файлов запущен');
+
+    // Функция остановки мониторинга при завершении работы
+    const stopMonitoringOnExit = async () => {
+      log('Остановка мониторинга файлов...');
+      stopMonitoring();
+    };
+
+    process.on('SIGTERM', async () => {
+      await stopMonitoringOnExit();
+      log('получен сигнал SIGTERM: закрытие HTTP-сервера');
+      await shutdownAllBots();
+      stopCleanup();
+      httpServer.close(() => {
+        log('HTTP-сервер закрыт');
+      });
+    });
+
+    process.on('SIGINT', async () => {
+      await stopMonitoringOnExit();
+      log('получен сигнал SIGINT (Ctrl+C): закрытие HTTP-сервера');
+      await shutdownAllBots();
+      stopCleanup();
+      httpServer.close(() => {
+        log('HTTP-сервер закрыт');
+        process.exit(0);
+      });
+    });
+
+    // Обработка SIGHUP (часто используется в терминалах)
+    process.on('SIGHUP', async () => {
+      await stopMonitoringOnExit();
+      log('получен сигнал SIGHUP: закрытие HTTP-сервера');
+      await shutdownAllBots();
+      stopCleanup();
+      httpServer.close(() => {
+        log('HTTP-сервер закрыт');
+        process.exit(0);
+      });
+    });
+  }).catch(error => {
+    log(`Ошибка при запуске мониторинга файлов: ${error.message}`);
+  });
+
+  // ВСЕГДА запускаем приложение на порту 5000
+  // это обслуживает как API, так и клиент.
+  // Это единственный порт, который не заблокирован брандмауэром.
+  const port = process.env.PORT || 5000;
+  // На Windows 'localhost' резолвится в ::1 (IPv6), а браузер коннектится к 127.0.0.1 (IPv4).
+  // Используем 0.0.0.0 в dev чтобы слушать на всех интерфейсах включая IPv4.
+  const host = process.env.NODE_ENV === 'production' ? '0.0.0.0' : '0.0.0.0';
+  httpServer.listen(Number(port), host, () => {
+    // Отображаем localhost в логах даже при привязке к 0.0.0.0 для внешних подключений
+    const displayHost = host === '0.0.0.0' ? 'localhost' : host;
+    log(`сервер запущен на http://${displayHost}:${port}`);
+    log(`Admin panel: http://${displayHost}:${port}/admin`);
+    if (process.env.NODE_ENV !== "production") {
+      log(`OpenAPI docs (dev): http://${displayHost}:${port}/docs`);
+    }
+
+    // Восстанавливаем боты после готовности Redis (боты используют Redis для FSM/lock/pubsub)
+    void (async () => {
+      try {
+        if (process.env.REDIS_URL?.trim()) {
+          await waitForRedisInit();
+          log(
+            isRedisAvailable()
+              ? "Redis готов — восстанавливаем боты"
+              : "Redis недоступен — восстанавливаем боты (fallback)",
+          );
+        }
+
+        const restoreResult = await restoreRunningBots();
+        const closed = await reconcileOrphanLaunchHistories(async (tokenId) => {
+          const token = await storage.getBotToken(tokenId);
+          if (!token) return false;
+          if (process.env.USE_WORKER_POOL !== 'false'
+            && workerManager.isBotRunning(token.projectId, tokenId)) {
+            return true;
+          }
+          return !!findActiveProcessForToken(token.projectId, tokenId);
+        });
+        if (closed > 0) {
+          log(`Закрыто сиротских launch-history записей: ${closed}`);
+        }
+        // Через минуту добить тех, кто не встал или числится running без воркера
+        scheduleRestoreSweep(restoreResult.failedTokenIds);
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        log(`Ошибка при восстановлении ботов: ${message}`);
+      }
+    })();
+  });
+
+  // Корректное завершение работы
+  process.on('SIGTERM', async () => {
+    log('получен сигнал SIGTERM: закрытие HTTP-сервера');
+    await shutdownAllBots();
+    stopCleanup();
+    httpServer.close(() => {
+      log('HTTP-сервер закрыт');
+    });
+  });
+
+  process.on('SIGINT', async () => {
+    log('получен сигнал SIGINT (Ctrl+C): закрытие HTTP-сервера');
+    await shutdownAllBots();
+    stopCleanup();
+    httpServer.close(() => {
+      log('HTTP-сервер закрыт');
+      process.exit(0);
+    });
+  });
+
+  // Обработка SIGHUP (часто используется в терминалах)
+  process.on('SIGHUP', async () => {
+    log('получен сигнал SIGHUP: закрытие HTTP-сервера');
+    await shutdownAllBots();
+    stopCleanup();
+    httpServer.close(() => {
+      log('HTTP-сервер закрыт');
+      process.exit(0);
+    });
+  });
+})();

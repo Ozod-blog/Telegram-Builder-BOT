@@ -1,0 +1,681 @@
+/**
+ * @fileoverview Утилита для генерации обработчиков узлов Telegram-бота
+ *
+ * Этот модуль предоставляет функции для генерации Python-кода,
+ * реализующего обработчики для различных типов узлов в графе
+ * Telegram-бота. Поддерживает команды, медиа-сообщения, действия
+ * с пользователями и сообщениями.
+ *
+ * @module generateNodeHandlers
+ */
+
+import { Node } from '@shared/schema';
+import { generateBroadcastHandler, generateStickerHandler, generateVoiceHandler, resolveMediaUrls, isLocalUploadPath } from './node-handlers.renderer';
+import { sortButtonsByLayout } from '../keyboard/keyboard.renderer';
+import { generateMessage } from '../message/message.renderer';
+import { generateContactHandler, generateLocationHandler } from './contact-location.renderer';
+import { generateMessageHandlerFromNode } from '../message-handler';
+/** Генератор callback-обработчика для узла пересылки сообщений */
+import { generateForwardMessageFromNode } from '../forward-message';
+/** Генератор callback-обработчика для узла создания топика в форуме */
+import { generateCreateForumTopicFromNode } from '../create-forum-topic';
+/** Генератор callback-обработчика для узла HTTP запроса */
+import { generateHttpRequestFromNode } from '../http-request';
+import { generateUserHandlerFromNode } from '../user-handler';
+import { generateAnimationHandler } from '../animation-handler/animation-handler.renderer';
+import { generateAdminRightsFromNode } from '../admin-rights/admin-rights.renderer';
+import { collectSynonymEntries } from '../synonyms/synonyms.renderer';
+import { generateCommandTriggerHandlers } from '../command-trigger/command-trigger.renderer';
+import { generateTextTriggerHandlers } from '../text-trigger/text-trigger.renderer';
+import { generateCallbackTriggerHandlers } from '../callback-trigger/callback-trigger.renderer';
+import { generateIncomingMessageTriggerHandlers } from '../incoming-message-trigger/incoming-message-trigger.renderer';
+import { generateIncomingCallbackTriggerHandlers } from '../incoming-callback-trigger/incoming-callback-trigger.renderer';
+import { generateOutgoingMessageTriggerHandlers } from '../outgoing-message-trigger/outgoing-message-trigger.renderer';
+import { generateManagedBotUpdatedTriggerHandlers } from '../managed-bot-updated-trigger/managed-bot-updated-trigger.renderer';
+import { generateMemberTriggerHandlers } from '../member-trigger/member-trigger.renderer';
+import { generateScheduleTriggerHandlers } from '../schedule-trigger/schedule-trigger.renderer';
+import { generateApiTriggerHandlers } from '../api-trigger/api-trigger.renderer';
+import { generateApiResponseHandlers } from '../api-response/api-response.renderer';
+import { generateAnswerCallbackQuery, generateAnswerCallbackQueryHandlers } from '../answer-callback-query/answer-callback-query.renderer';
+import { generateEditMessageHandlers } from '../edit-message';
+import { generateDeleteMessageHandlers } from '../delete-message';
+import { generateKickUserHandlers } from '../kick-user/kick-user.renderer';
+import { generateSetVariableHandlers } from '../set-variable/set-variable.renderer';
+import { generatePsqlQueryHandlers } from '../psql-query/psql-query.renderer';
+import { generateBotTableHandlers } from '../bot-table';
+import { generateConvertFileHandlers } from '../convert-file/convert-file.renderer';
+import { generateLoopHandlers } from '../loop';
+import { generateParallelSplitHandlers } from '../parallel-split';
+import { generateDelayHandlers } from '../delay/delay.renderer';
+import { generateSendInvoiceHandlers } from '../send-invoice/send-invoice.renderer';
+import { generateRefundStarsHandlers } from '../refund-stars/refund-stars.renderer';
+import { generateEditStarSubscriptionHandlers } from '../edit-star-subscription/edit-star-subscription.renderer';
+import { generateGetStarBalanceHandlers } from '../get-star-balance/get-star-balance.renderer';
+import { generateStopProcessingHandlers } from '../stop-processing/stop-processing.renderer';
+import { generateRateCounterHandlers } from '../rate-counter/rate-counter.renderer';
+import { generateCodeHandlers } from '../code/code.renderer';
+import { generateGetManagedBotToken } from '../get-managed-bot-token/get-managed-bot-token.renderer';
+import { generateGroupMessageTriggerHandlers } from '../group-message-trigger';
+import { generateConditionHandlers } from '../condition/condition.renderer';
+import { generateMediaNode } from '../media-node';
+import { generateUserInputNodeHandler } from '../user-input';
+import { generateUserbotMessageHandlers } from '../userbot-message/userbot-message.renderer';
+import { generateUserbotClickButtonHandlers } from '../userbot-click-button/userbot-click-button.renderer';
+import { generateUserbotInlineQueryHandlers } from '../userbot-inline-query/userbot-inline-query.renderer';
+import { generateUserbotEditTriggerHandlers } from '../userbot-edit-trigger/userbot-edit-trigger.renderer';
+import type { KeyboardLayout } from '../types/keyboard-layout';
+import type { DynamicButtonsConfig } from '../keyboard/dynamic-buttons';
+import type { MessageTemplateParams } from '../message/message.params';
+
+/**
+ * Ищет customCallbackData среди кнопок всех узлов, ведущих к указанному nodeId.
+ * Применяется для кнопок с action === 'goto' или action === 'command'.
+ *
+ * @param nodeId - ID целевого узла
+ * @param nodes - Массив всех узлов проекта
+ * @returns Кастомный callback_data или undefined
+ */
+function findCustomCallbackDataForNode(nodeId: string, nodes: Node[]): string | undefined {
+  for (const node of nodes) {
+    const buttons: any[] = node.data?.buttons || [];
+    for (const btn of buttons) {
+      if (
+        btn.target === nodeId &&
+        (btn.action === 'goto' || btn.action === 'command') &&
+        btn.customCallbackData
+      ) {
+        return btn.customCallbackData as string;
+      }
+    }
+  }
+  return undefined;
+}
+
+function getSafeAutoTransitionParams(node: Node, nodes: Node[]): {
+  enableAutoTransition: boolean;
+  autoTransitionTo?: string;
+} {
+  const explicitAutoTransitionTo = typeof node.data?.autoTransitionTo === 'string'
+    ? node.data.autoTransitionTo.trim()
+    : '';
+
+  if (node.data?.enableAutoTransition && explicitAutoTransitionTo) {
+    // Проверяем что целевой узел существует в проекте
+    const targetExists = nodes.some(n => n != null && n.id === explicitAutoTransitionTo);
+    if (targetExists) {
+      return {
+        enableAutoTransition: true,
+        autoTransitionTo: explicitAutoTransitionTo,
+      };
+    }
+  }
+
+  const linkedForwardNode = nodes.find((candidate) =>
+    candidate.type === 'forward_message' &&
+    typeof candidate.data?.sourceMessageNodeId === 'string' &&
+    candidate.data.sourceMessageNodeId.trim() === node.id
+  );
+
+  if (linkedForwardNode) {
+    return {
+      enableAutoTransition: true,
+      autoTransitionTo: linkedForwardNode.id,
+    };
+  }
+
+  return {
+    enableAutoTransition: false,
+    autoTransitionTo: undefined,
+  };
+}
+
+/**
+ * Генерирует обработчик для keyboard-ноды.
+ * При вызове обновляет inline-кнопки текущего сообщения (editMessageReplyMarkup).
+ *
+ * @param node - Узел keyboard
+ * @param nodes - Все узлы проекта (для resolving targets)
+ * @returns Python-код обработчика keyboard-ноды
+ */
+function generateKeyboardHandler(node: Node, nodes?: Node[]): string {
+  const safeName = node.id.replace(/[^a-zA-Z0-9_]/g, '_');
+  const buttons: any[] = node.data?.buttons || [];
+
+  // Если нет кнопок — генерируем no-op
+  if (buttons.length === 0) {
+    return [
+      `@dp.callback_query(lambda c: c.data == "${node.id}")`,
+      `async def handle_callback_${safeName}(callback_query: types.CallbackQuery, state: FSMContext = None):`,
+      `    """Обработчик keyboard-ноды ${node.id} (пустая клавиатура)."""`,
+      `    try:`,
+      `        await callback_query.answer()`,
+      `        await callback_query.message.edit_reply_markup(reply_markup=None)`,
+      `    except Exception as e:`,
+      `        logging.error(f"❌ Ошибка в keyboard node ${node.id}: {e}")`,
+    ].join('\n');
+  }
+
+  // Строим кнопки и обновляем reply_markup
+  const lines: string[] = [
+    `@dp.callback_query(lambda c: c.data == "${node.id}")`,
+    `async def handle_callback_${safeName}(callback_query: types.CallbackQuery, state: FSMContext = None):`,
+    `    """Обработчик keyboard-ноды ${node.id} — обновляет inline-кнопки сообщения."""`,
+    `    try:`,
+    `        user_id = callback_query.from_user.id`,
+    `        logging.info(f"⌨️ Keyboard node ${node.id}: обновляем кнопки для {user_id}")`,
+    `        await callback_query.answer()`,
+    `        all_user_vars = await init_all_user_vars(user_id)`,
+    `        builder = InlineKeyboardBuilder()`,
+  ];
+
+  for (const btn of buttons) {
+    const textExpr = `replace_variables_in_text(${JSON.stringify(btn.text || 'Кнопка')}, all_user_vars, {})`;
+    if (btn.action === 'url' && btn.url) {
+      lines.push(`        builder.add(InlineKeyboardButton(text=${textExpr}, url="${btn.url}"))`);
+    } else if (btn.action === 'goto' || btn.action === 'complete') {
+      const cbData = btn.customCallbackData || btn.target || btn.id || 'no_action';
+      lines.push(`        builder.add(InlineKeyboardButton(text=${textExpr}, callback_data="${cbData}"))`);
+    } else {
+      const cbData = btn.id || btn.target || 'btn';
+      lines.push(`        builder.add(InlineKeyboardButton(text=${textExpr}, callback_data="${cbData}"))`);
+    }
+  }
+
+  // Раскладка кнопок
+  const layout = node.data?.keyboardLayout;
+  if (node.data?.shuffleButtons) {
+    lines.push(`        # Перемешиваем кнопки`);
+    lines.push(`        import random as _rnd`);
+    lines.push(`        _btns_flat = [btn for row in builder._markup for btn in row]`);
+    lines.push(`        _rnd.shuffle(_btns_flat)`);
+    lines.push(`        builder = InlineKeyboardBuilder()`);
+    lines.push(`        for _btn in _btns_flat:`);
+    lines.push(`            builder.add(_btn)`);
+  }
+  if (layout && !layout.autoLayout && layout.rows?.length > 0) {
+    const counts = layout.rows.map((r: any) => (r.buttonIds || []).length).filter((n: number) => n > 0);
+    if (counts.length > 0) {
+      lines.push(`        builder.adjust(${counts.join(', ')})`);
+    }
+  } else {
+    const cols = layout?.columns || (buttons.length >= 6 ? 2 : 1);
+    lines.push(`        builder.adjust(${cols})`);
+  }
+
+  lines.push(
+    `        await callback_query.message.edit_reply_markup(reply_markup=builder.as_markup())`,
+    `    except Exception as e:`,
+    `        logging.error(f"❌ Ошибка в keyboard node ${node.id}: {e}")`,
+  );
+
+  return lines.join('\n');
+}
+
+function generateCommandEntryHandler(node: Node, callbackHandlerCode: string): string {
+  const safeName = node.id.replace(/[^a-zA-Z0-9_]/g, '_');
+  const rawCommand = String(node.data?.command || '').trim();
+  const commandName = rawCommand.replace(/^\//, '') || safeName;
+  const entryHandlerName = node.type === 'start' ? 'start_handler' : `${commandName}_handler`;
+
+  return [
+    callbackHandlerCode,
+    '',
+    `@dp.message(Command("${commandName}"))`,
+    `async def ${entryHandlerName}(message: types.Message):`,
+    `    """Точка входа для команды /${commandName}, перенаправляет в callback-обработчик узла ${node.id}."""`,
+    `    await capture_message_context(message.from_user.id, message)`,
+    '    class FakeCallbackQuery:',
+    '        def __init__(self, message: types.Message, data: str):',
+    '            self.from_user = message.from_user',
+    '            self.message = message',
+    '            self.data = data',
+    '            self.chat = message.chat',
+    '            self.date = message.date',
+    '            self.message_id = message.message_id',
+    '',
+    '        async def answer(self, *args, **kwargs):',
+    '            return None',
+    '',
+    `    fake_callback = FakeCallbackQuery(message, "${node.id}")`,
+    `    await handle_callback_${safeName}(fake_callback)`,
+  ].join('\n');
+}
+
+/**
+ * Генерирует обработчики для каждого узла
+ *
+ * Функция проходит по всем узлам графа и генерирует соответствующие обработчики
+ * на основе типа узла. Поддерживает различные типы узлов: команды, медиа, сообщения,
+ * действия с пользователями и сообщениями.
+ *
+ * @param nodes - Массив узлов для генерации обработчиков
+ * @param userDatabaseEnabled - Флаг, указывающий, включена ли база данных пользователей
+ * @param telegramFileIds - Словарь кэшированных Telegram file_id (ключ — URL, значение — file_id)
+ * @param thumbnailFileIds - Словарь обложек видео (ключ — URL видео, значение — file_id обложки)
+ * @param thumbnailUrls - Словарь прямых URL обложек видео (ключ — URL видео, значение — URL обложки)
+ * @param projectId - ID проекта (для поддержки get_content)
+ * @returns Сгенерированный код обработчиков узлов
+ *
+ * @example
+ * const nodes = [{ id: 'welcome', type: 'message' }, { id: 'help-trigger', type: 'command_trigger' }];
+ * const code = generateNodeHandlers(nodes, true);
+ */
+export function generateNodeHandlers(
+  nodes: Node[],
+  userDatabaseEnabled: boolean,
+  telegramFileIds: Record<string, string> = {},
+  thumbnailFileIds: Record<string, string> = {},
+  thumbnailUrls: Record<string, string> = {},
+  projectId: number | null = null,
+): string {
+  // Собираем код в массив строк
+  const codeLines: string[] = [];
+
+  // Создаем mediaVariablesMap для всех узлов (используется старыми обработчиками)
+
+  // Создаем массив всех ID узлов для генерации коротких ID (используется старыми обработчиками)
+
+  const buildMessageHandlerParams = (node: Node): MessageTemplateParams => {
+      const autoTransition = getSafeAutoTransitionParams(node, nodes);
+      const media = resolveMediaUrls(node.data);
+      return {
+        nodeId: node.id,
+        messageText: node.data?.messageText || '',
+        adminOnly: node.data?.adminOnly || false,
+        requiresAuth: node.data?.requiresAuth || false,
+        userDatabaseEnabled,
+        allowMultipleSelection: node.data?.allowMultipleSelection || false,
+        multiSelectVariable: node.data?.multiSelectVariable,
+        checkmarkSymbol: node.data?.checkmarkSymbol,
+        radioSelectedSymbol: (node.data as any)?.radioSelectedSymbol,
+        radioUnselectedSymbol: (node.data as any)?.radioUnselectedSymbol,
+        buttons: sortButtonsByLayout(node.data?.buttons || [], node.data?.keyboardLayout),
+        keyboardType: node.data?.keyboardType || 'none',
+        keyboardLayout: node.data?.keyboardLayout as KeyboardLayout | undefined,
+        oneTimeKeyboard: node.data?.oneTimeKeyboard ?? false,
+        resizeKeyboard: node.data?.resizeKeyboard ?? true,
+        shuffleButtons: node.data?.shuffleButtons || false,
+        enableAutoTransition: autoTransition.enableAutoTransition,
+        autoTransitionTo: autoTransition.autoTransitionTo,
+        collectUserInput: node.data?.collectUserInput || false,
+        enableTextInput: node.data?.enableTextInput ?? true,
+        enablePhotoInput: node.data?.enablePhotoInput || false,
+        enableVideoInput: node.data?.enableVideoInput || false,
+        enableAudioInput: node.data?.enableAudioInput || false,
+        enableDocumentInput: node.data?.enableDocumentInput || false,
+        inputVariable: node.data?.inputVariable || 'input',
+        inputTargetNodeId: node.data?.inputTargetNodeId || '',
+        minLength: node.data?.minLength ?? 0,
+        maxLength: node.data?.maxLength ?? 0,
+        appendVariable: node.data?.appendVariable ?? false,
+        validationType: (node.data as any)?.validationType || 'none',
+        retryMessage: (node.data as any)?.retryMessage || 'Пожалуйста, попробуйте еще раз.',
+        successMessage: node.data?.successMessage || '',
+        saveToDatabase: node.data?.saveToDatabase ?? true,
+        photoInputVariable: node.data?.photoInputVariable || '',
+        videoInputVariable: node.data?.videoInputVariable || '',
+        audioInputVariable: node.data?.audioInputVariable || '',
+        documentInputVariable: node.data?.documentInputVariable || '',
+        formatMode: (['html', 'markdown', 'none'].includes(node.data?.formatMode)) ? node.data.formatMode : (node.data?.markdown ? 'markdown' : undefined),
+        disableLinkPreview: !!node.data?.disableLinkPreview,
+        imageUrl: media.imageUrl,
+        documentUrl: media.documentUrl,
+        videoUrl: media.videoUrl,
+        audioUrl: media.audioUrl,
+        attachedMedia: media.attachedMediaUrls,
+        isLocalImageUrl: media.isLocalImageUrl,
+        isLocalVideoUrl: media.isLocalVideoUrl,
+        isLocalAudioUrl: media.isLocalAudioUrl,
+        isLocalDocumentUrl: media.isLocalDocumentUrl,
+        enableConditionalMessages: node.data?.enableConditionalMessages || false,
+        conditionalMessages: node.data?.conditionalMessages || [],
+        fallbackMessage: node.data?.fallbackMessage,
+        synonymEntries: collectSynonymEntries([node]),
+        hasHideAfterClickIncoming: nodes.some((n: Node) =>
+          (n.data?.buttons || []).some((btn: any) => btn.hideAfterClick === true && btn.target === node.id)
+        ),
+        // callbackPattern: удалён — виртуальные триггеры теперь генерируются через collectVirtualCallbackTriggerEntries
+        // Если есть customCallbackData среди кнопок, ведущих к этому узлу — используем его как паттерн
+        callbackPattern: findCustomCallbackDataForNode(node.id, nodes),
+        messageSendRecipients: (node.data as any)?.messageSendRecipients || [],
+        saveMessageIdTo: (node.data as any)?.saveMessageIdTo || undefined,
+        enableDynamicButtons: node.data?.enableDynamicButtons ?? false,
+        dynamicButtons: node.data?.dynamicButtons as DynamicButtonsConfig | undefined,
+        telegramFileIds: { ...(telegramFileIds || {}), ...((node.data as any)?.telegramFileIds || {}) },
+        thumbnailFileIds: { ...(thumbnailFileIds || {}), ...((node.data as any)?.thumbnailFileIds || {}) },
+        thumbnailUrls: { ...(thumbnailUrls || {}), ...((node.data as any)?.thumbnailUrls || {}) },
+        projectId,
+      };
+  };
+
+  const nodeHandlers: Record<string, (node: Node) => string> = {
+    message: (node) => generateMessage(buildMessageHandlerParams(node)),
+    start: (node) => generateCommandEntryHandler(node, generateMessage(buildMessageHandlerParams(node))),
+    command: (node) => generateCommandEntryHandler(node, generateMessage(buildMessageHandlerParams(node))),
+    sticker: generateStickerHandler,
+    voice: generateVoiceHandler,
+    animation: (node) => generateAnimationHandler({
+      nodeId: node.id,
+      animationUrl: node.data?.animationUrl || '',
+      isLocalAnimationUrl: isLocalUploadPath(node.data?.animationUrl || ''),
+    }),
+    location: generateLocationHandler,
+    contact: generateContactHandler,
+    pin_message: generateMessageHandlerFromNode,
+    unpin_message: generateMessageHandlerFromNode,
+    /** Обработчик узла пересылки сообщений */
+    forward_message: generateForwardMessageFromNode,
+    /** Обработчик узла создания топика в форуме Telegram */
+    create_forum_topic: (node) => generateCreateForumTopicFromNode(node, { allNodes: nodes }),
+    /** Обработчик узла HTTP запроса */
+    http_request: (node) => generateHttpRequestFromNode(node, { allNodes: nodes }),
+    ban_user: generateUserHandlerFromNode,
+    unban_user: generateUserHandlerFromNode,
+    mute_user: generateUserHandlerFromNode,
+    unmute_user: generateUserHandlerFromNode,
+
+    promote_user: generateUserHandlerFromNode,
+    demote_user: generateUserHandlerFromNode,
+    admin_rights: generateAdminRightsFromNode,
+    broadcast: (node) => generateBroadcastHandler(node, nodes),
+    keyboard: (node) => generateKeyboardHandler(node, nodes),
+    input: generateUserInputNodeHandler,
+    get_managed_bot_token: (node) => {
+      const entry = {
+        nodeId: node.id,
+        targetNodeId: (node.data as any)?.autoTransitionTo || '',
+        targetNodeType: nodes.find(n => n.id === (node.data as any)?.autoTransitionTo)?.type || 'message',
+        botIdSource: (node.data as any)?.botIdSource || 'variable',
+        botIdVariable: (node.data as any)?.botIdVariable || 'bot_id',
+        botIdManual: (node.data as any)?.botIdManual || '',
+        saveTokenTo: (node.data as any)?.saveTokenTo || 'bot_token',
+        saveErrorTo: (node.data as any)?.saveErrorTo || undefined,
+      };
+      return generateGetManagedBotToken({ entries: [entry] });
+    },
+    media: (node) => generateMediaNode({
+      ...getSafeAutoTransitionParams(node, nodes),
+      nodeId: node.id,
+      attachedMedia: node.data?.attachedMedia || [],
+      /** Список получателей медиа-сообщения */
+      messageSendRecipients: (node.data as any)?.messageSendRecipients || [],
+      /** Кэшированные Telegram file_id для медиафайлов узла */
+      telegramFileIds: { ...(telegramFileIds || {}), ...((node.data as any)?.telegramFileIds || {}) },
+      /** Словарь обложек видео для media-ноды */
+      thumbnailFileIds: { ...(thumbnailFileIds || {}), ...((node.data as any)?.thumbnailFileIds || {}) },
+      /** Словарь прямых URL обложек видео для media-ноды */
+      thumbnailUrls: { ...(thumbnailUrls || {}), ...((node.data as any)?.thumbnailUrls || {}) },
+    }),
+  };
+
+  // --- Обработчики командных триггеров ---
+  const commandTriggerCode = generateCommandTriggerHandlers(nodes);
+  if (commandTriggerCode) {
+    codeLines.push('\n# Обработчики командных триггеров');
+    commandTriggerCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики текстовых триггеров ---
+  const textTriggerCode = generateTextTriggerHandlers(nodes);
+  if (textTriggerCode) {
+    codeLines.push('\n# Обработчики текстовых триггеров');
+    textTriggerCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики триггеров inline-кнопок ---
+  const callbackTriggerCode = generateCallbackTriggerHandlers(nodes);
+  if (callbackTriggerCode) {
+    codeLines.push('\n# Обработчики триггеров inline-кнопок');
+    callbackTriggerCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Middleware триггеров входящих сообщений ---
+  const incomingMessageTriggerCode = generateIncomingMessageTriggerHandlers(nodes);
+  if (incomingMessageTriggerCode) {
+    codeLines.push('\n# Middleware триггеров входящих сообщений');
+    incomingMessageTriggerCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Middleware триггеров входящих callback_query ---
+  const incomingCallbackTriggerCode = generateIncomingCallbackTriggerHandlers(nodes);
+  if (incomingCallbackTriggerCode) {
+    codeLines.push('\n# Middleware триггеров входящих callback_query');
+    incomingCallbackTriggerCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики триггеров исходящих сообщений ---
+  const outgoingMessageTriggerCode = generateOutgoingMessageTriggerHandlers(nodes);
+  if (outgoingMessageTriggerCode) {
+    codeLines.push('\n# Обработчики триггеров исходящих сообщений');
+    outgoingMessageTriggerCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Middleware триггеров обновления управляемого бота ---
+  const managedBotUpdatedTriggerCode = generateManagedBotUpdatedTriggerHandlers(nodes);
+  if (managedBotUpdatedTriggerCode) {
+    codeLines.push('\n# Middleware триггеров обновления управляемого бота');
+    managedBotUpdatedTriggerCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики триггеров сообщений в группе ---
+  const groupMessageTriggerCode = generateGroupMessageTriggerHandlers(nodes);
+  if (groupMessageTriggerCode) {
+    codeLines.push('\n# Обработчики триггеров сообщений в группе');
+    groupMessageTriggerCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики триггеров входа/выхода участника ---
+  const memberTriggerCode = generateMemberTriggerHandlers(nodes);
+  if (memberTriggerCode) {
+    codeLines.push('\n# Обработчики триггеров входа/выхода участника');
+    memberTriggerCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики узлов условия ---
+  const conditionCode = generateConditionHandlers(nodes);
+  if (conditionCode) {
+    codeLines.push('\n# Обработчики узлов условия');
+    conditionCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики узлов edit_message ---
+  const editMessageCode = generateEditMessageHandlers(nodes);
+  if (editMessageCode) {
+    codeLines.push('\n# Обработчики узлов edit_message');
+    editMessageCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики узлов delete_message ---
+  const deleteMessageCode = generateDeleteMessageHandlers(nodes);
+  if (deleteMessageCode) {
+    codeLines.push('\n# Обработчики узлов delete_message');
+    deleteMessageCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики узлов kick_user ---
+  const kickUserCode = generateKickUserHandlers(nodes);
+  if (kickUserCode) {
+    codeLines.push('\n# Обработчики узлов kick_user');
+    kickUserCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики узлов set_variable ---
+  const setVariableCode = generateSetVariableHandlers(nodes);
+  if (setVariableCode) {
+    codeLines.push('\n# Обработчики узлов установки переменных');
+    setVariableCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики узлов psql_query ---
+  const psqlQueryCode = generatePsqlQueryHandlers(nodes);
+  if (psqlQueryCode) {
+    codeLines.push('\n# Обработчики узлов SQL-запроса');
+    psqlQueryCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики узлов bot_table (работа с таблицами) ---
+  const botTableCode = generateBotTableHandlers(nodes);
+  if (botTableCode) {
+    codeLines.push('\n# Обработчики узлов bot_table (работа с таблицами)');
+    botTableCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики узлов convert_file ---
+  const convertFileCode = generateConvertFileHandlers(nodes);
+  if (convertFileCode) {
+    codeLines.push('\n# Обработчики узлов конвертации файлов');
+    convertFileCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики циклов (loop) ---
+  const loopCode = generateLoopHandlers(nodes);
+  if (loopCode) {
+    codeLines.push('\n# Обработчики циклов (loop)');
+    loopCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики параллельного запуска веток (parallel_split) ---
+  const parallelSplitCode = generateParallelSplitHandlers(nodes);
+  if (parallelSplitCode) {
+    codeLines.push('\n# Обработчики параллельного запуска веток (parallel_split)');
+    parallelSplitCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики узлов задержки (delay) ---
+  const delayCode = generateDelayHandlers(nodes);
+  if (delayCode) {
+    codeLines.push('\n# Обработчики узлов задержки (delay)');
+    delayCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики счетов в звёздах (send_invoice) ---
+  const sendInvoiceCode = generateSendInvoiceHandlers(nodes);
+  if (sendInvoiceCode) {
+    codeLines.push('\n# Обработчики счетов в звёздах (send_invoice)');
+    sendInvoiceCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики возврата звёзд (refund_stars) ---
+  const refundStarsCode = generateRefundStarsHandlers(nodes);
+  if (refundStarsCode) {
+    codeLines.push('\n# Обработчики возврата звёзд (refund_stars)');
+    refundStarsCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  const editStarSubCode = generateEditStarSubscriptionHandlers(nodes);
+  if (editStarSubCode) {
+    codeLines.push('\n# Управление автопродлением Stars (edit_star_subscription)');
+    editStarSubCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  const getStarBalanceCode = generateGetStarBalanceHandlers(nodes);
+  if (getStarBalanceCode) {
+    codeLines.push('\n# Баланс звёзд бота (get_star_balance)');
+    getStarBalanceCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики узлов stop_processing ---
+  const stopProcessingCode = generateStopProcessingHandlers(nodes);
+  if (stopProcessingCode) {
+    codeLines.push('\n# Обработчики узлов stop_processing');
+    stopProcessingCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики узлов rate_counter ---
+  const rateCounterCode = generateRateCounterHandlers(nodes);
+  if (rateCounterCode) {
+    codeLines.push('\n# Обработчики узлов rate_counter');
+    rateCounterCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики узлов code (Python + Telethon) ---
+  const codeNodeCode = generateCodeHandlers(nodes);
+  if (codeNodeCode) {
+    codeLines.push('\n# Обработчики узлов code');
+    codeNodeCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики узлов answer_callback_query ---
+  const answerCallbackQueryCode = generateAnswerCallbackQueryHandlers(nodes);
+  if (answerCallbackQueryCode) {
+    codeLines.push('\n# Обработчики узлов answer_callback_query');
+    answerCallbackQueryCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Фоновые задачи (Schedule Trigger) ---
+  const scheduleTriggerCode = generateScheduleTriggerHandlers(nodes);
+  if (scheduleTriggerCode) {
+    codeLines.push('\n# ═══ Фоновые задачи (Schedule Trigger) ═══');
+    scheduleTriggerCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- HTTP API Trigger (aiohttp routes) ---
+  const apiTriggerCode = generateApiTriggerHandlers(nodes);
+  if (apiTriggerCode) {
+    codeLines.push('\n# ═══ API Trigger (HTTP hooks) ═══');
+    apiTriggerCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики api_response ---
+  const apiResponseCode = generateApiResponseHandlers(nodes, { allNodes: nodes });
+  if (apiResponseCode) {
+    codeLines.push('\n# Обработчики api_response');
+    apiResponseCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики узлов userbot_message ---
+  const userbotMessageCode = generateUserbotMessageHandlers(nodes, projectId);
+  if (userbotMessageCode) {
+    codeLines.push('\n# Обработчики узлов userbot_message (Telethon)');
+    userbotMessageCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики узлов userbot_click_button ---
+  const userbotClickButtonCode = generateUserbotClickButtonHandlers(nodes, projectId);
+  if (userbotClickButtonCode) {
+    codeLines.push('\n# Обработчики узлов userbot_click_button (Telethon)');
+    userbotClickButtonCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики узлов userbot_inline_query ---
+  const userbotInlineQueryCode = generateUserbotInlineQueryHandlers(nodes, projectId);
+  if (userbotInlineQueryCode) {
+    codeLines.push('\n# Обработчики узлов userbot_inline_query (Telethon)');
+    userbotInlineQueryCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  // --- Обработчики узлов userbot_edit_trigger ---
+  const userbotEditTriggerCode = generateUserbotEditTriggerHandlers(nodes, projectId);
+  if (userbotEditTriggerCode) {
+    codeLines.push('\n# Обработчики узлов userbot_edit_trigger (Telethon)');
+    userbotEditTriggerCode.split('\n').forEach(line => codeLines.push(line));
+  }
+
+  nodes.forEach((node: Node) => {
+    // Пропускаем триггеры — они уже обработаны выше
+    if (node.type === 'command_trigger' || node.type === 'text_trigger' || node.type === 'incoming_message_trigger' || node.type === 'group_message_trigger' || (node.type as any) === 'member_trigger' || (node.type as any) === 'callback_trigger' || (node.type as any) === 'incoming_callback_trigger' || (node.type as any) === 'outgoing_message_trigger' || (node.type as any) === 'managed_bot_updated_trigger' || (node.type as any) === 'successful_payment_trigger' || (node.type as any) === 'edit_message' || (node.type as any) === 'set_variable' || (node.type as any) === 'psql_query' || (node.type as any) === 'bot_table' || (node.type as any) === 'convert_file' || (node.type as any) === 'loop' || (node.type as any) === 'delay' || (node.type as any) === 'send_invoice' || (node.type as any) === 'create_invoice_link' || (node.type as any) === 'refund_stars' || (node.type as any) === 'edit_star_subscription' || (node.type as any) === 'get_star_balance' || (node.type as any) === 'stop_processing' || (node.type as any) === 'rate_counter' || (node.type as any) === 'code' || (node.type as any) === 'schedule_trigger' || (node.type as any) === 'api_trigger' || (node.type as any) === 'api_response' || (node.type as any) === 'answer_callback_query' || (node.type as any) === 'userbot_message' || (node.type as any) === 'userbot_click_button' || (node.type as any) === 'userbot_inline_query' || (node.type as any) === 'userbot_edit_trigger' || (node.type as any) === 'kick_user' || (node.type as any) === 'parallel_split') {
+      return;
+    }
+
+    // Пропускаем condition-узлы — они уже обработаны выше
+    if (node.type === 'condition') return;
+
+    // Пропускаем keyboard-ноды используемые только edit_message — их обработчик уже сгенерирован
+    if (node.type === 'keyboard' && (node.data as any)?._editMessageOnly === true) return;
+
+    codeLines.push(`\n# @@NODE_START:${node.id}@@\n`);
+
+    const handler = nodeHandlers[node.type];
+    if (handler) {
+      const handlerCode = handler(node);
+      // Разбиваем код обработчика на строки и добавляем в codeLines
+      handlerCode.split('\n').forEach(line => codeLines.push(line));
+    } else {
+      codeLines.push(`    # Нет обработчика для узла типа ${node.type}`);
+    }
+
+    codeLines.push(`# @@NODE_END:${node.id}@@`);
+  });
+
+  return codeLines.join('\n');
+}

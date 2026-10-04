@@ -1,0 +1,179 @@
+/**
+ * @fileoverview Главная панель управления рассылками — split layout
+ * @module client/components/editor/broadcast/broadcast-panel
+ */
+
+import { useState, useEffect, useCallback } from 'react';
+import { Plus, Radio } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { ScrollArea } from '@/components/ui/scroll-area';
+import { Skeleton } from '@/components/ui/skeleton';
+import { TabHeader } from '@/components/ui/tab-header';
+import { BroadcastStatsHeader } from './components/broadcast-stats-header';
+import { BroadcastList } from './components/broadcast-list';
+import { BroadcastDetail } from './components/broadcast-detail';
+import { BroadcastPagination } from './components/broadcast-pagination';
+import { NewBroadcastModal } from './wizard/new-broadcast-modal';
+import { useBroadcasts } from './hooks/use-broadcasts';
+import { useBroadcastLiveInvalidate } from './hooks/use-broadcast-live-invalidate';
+import { useProjectTokens } from '@/hooks/use-project-tokens';
+import { useNormalizeSelectedTokenId } from '@/hooks/use-normalize-selected-token';
+import { BotTokenSelector } from '@/components/editor/database/user-database/components/header/bot-token-selector';
+import { ProjectSelector } from '@/components/editor/database/user-database/components/header/project-selector';
+import type { BroadcastPanelProps, Broadcast } from './types';
+
+/** Количество рассылок на одной странице */
+const PAGE_LIMIT = 20;
+
+/**
+ * Главная панель рассылок со split-layout: список слева, детали справа.
+ * @param props - Свойства компонента
+ * @returns JSX элемент панели рассылок
+ */
+export function BroadcastPanel({ projectId, selectedTokenId, onSelectToken, allProjects, onProjectChange }: BroadcastPanelProps) {
+  const [modalOpen, setModalOpen] = useState(false);
+  const [selectedBroadcast, setSelectedBroadcast] = useState<Broadcast | null>(null);
+  const [page, setPage] = useState(1);
+
+  /** Токены проекта для селектора бота */
+  const projectTokensInfo = useProjectTokens([projectId]);
+  const tokens = projectTokensInfo[0]?.tokens ?? [];
+
+  /** null = «Все боты»; сбрасываем только удалённый tokenId */
+  const resetDeletedToken = useCallback(
+    (tokenId: null) => {
+      onSelectToken?.(tokenId);
+    },
+    [onSelectToken],
+  );
+  useNormalizeSelectedTokenId(tokens, selectedTokenId, resetDeletedToken);
+
+  const { broadcasts, total, isLoading, refetch } = useBroadcasts(projectId, selectedTokenId, page);
+  useBroadcastLiveInvalidate({ projectId, selectedTokenId });
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_LIMIT));
+
+  // Синхронизируем selectedBroadcast с актуальными данными из списка после каждого refetch.
+  // Сравниваем по sentCount тоже — чтобы обновить счётчики даже если статус не изменился.
+  useEffect(() => {
+    if (!selectedBroadcast) return;
+    const fresh = broadcasts.find((b) => b.id === selectedBroadcast.id);
+    if (!fresh) return;
+    const statusChanged = fresh.status !== selectedBroadcast.status;
+    const countsChanged = fresh.sentCount !== selectedBroadcast.sentCount
+      || fresh.deliveredCount !== selectedBroadcast.deliveredCount
+      || fresh.failedCount !== selectedBroadcast.failedCount
+      || fresh.blockedCount !== selectedBroadcast.blockedCount
+      || fresh.deletedCount !== selectedBroadcast.deletedCount
+      || fresh.totalCount !== selectedBroadcast.totalCount;
+    if (statusChanged || countsChanged) {
+      setSelectedBroadcast(fresh);
+    }
+  }, [broadcasts]);
+
+  /** Обработчик выбора рассылки — сбрасывает при повторном клике */
+  function handleSelect(broadcast: Broadcast) {
+    setSelectedBroadcast((prev) => (prev?.id === broadcast.id ? null : broadcast));
+  }
+
+  return (
+    <div className="flex flex-col h-full bg-background">
+      {/* Шапка с градиентом */}
+      <TabHeader
+        icon={<Radio className="h-4 w-4 sm:h-5 sm:w-5 text-primary" />}
+        title="Рассылки"
+        actions={
+          <Button size="sm" className="gap-1.5" onClick={() => setModalOpen(true)}>
+            <Plus className="h-4 w-4" />
+            <span className="hidden sm:inline">Новая рассылка</span>
+            <span className="sm:hidden">Новая</span>
+          </Button>
+        }
+      >
+        {allProjects && allProjects.length > 1 && onProjectChange && (
+          <ProjectSelector
+            projects={allProjects}
+            selectedProjectId={projectId}
+            onSelect={(id) => { onSelectToken?.(null); onProjectChange(id); }}
+          />
+        )}
+        {tokens.length > 0 && (
+          <BotTokenSelector
+            projectId={projectId}
+            tokens={tokens}
+            selectedTokenId={selectedTokenId ?? null}
+            onSelect={(id) => onSelectToken?.(id)}
+          />
+        )}
+      </TabHeader>
+
+      {/* Баннер устаревшей вкладки */}
+      <div className="mx-4 sm:mx-6 mt-3 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/30 text-xs text-amber-200">
+        <span className="font-medium">Устаревшая вкладка.</span>{' '}
+        Рассылка теперь доступна в диалоге пользователя как отдельная панель. Функциональность этой вкладки будет перенесена туда.
+      </div>
+
+      {/* Split layout */}
+      <div className="flex flex-1 min-h-0">
+        {/* Левая колонка — список */}
+        <div className={`flex flex-col min-h-0 transition-all ${selectedBroadcast ? 'w-[40%]' : 'w-full'} border-r`}>
+          <ScrollArea className="flex-1">
+            <div className="px-4 py-4 space-y-4">
+              {/* Статистика */}
+              {isLoading ? (
+                <div className="flex gap-3">
+                  {[1, 2, 3].map((i) => <Skeleton key={i} className="h-20 flex-1 rounded-lg" />)}
+                </div>
+              ) : (
+                <BroadcastStatsHeader broadcasts={broadcasts} />
+              )}
+
+              {/* Список рассылок */}
+              <div className="border rounded-lg overflow-hidden">
+                {isLoading ? (
+                  <div className="p-4 space-y-3">
+                    {[1, 2, 3].map((i) => <Skeleton key={i} className="h-16 w-full rounded-md" />)}
+                  </div>
+                ) : (
+                  <BroadcastList
+                    broadcasts={broadcasts}
+                    onSelect={handleSelect}
+                    selectedId={selectedBroadcast?.id}
+                  />
+                )}
+              </div>
+
+              {/* Пагинация */}
+              {totalPages > 1 && (
+                <BroadcastPagination
+                  page={page}
+                  totalPages={totalPages}
+                  onPageChange={setPage}
+                />
+              )}
+            </div>
+          </ScrollArea>
+        </div>
+
+        {/* Правая колонка — детали выбранной рассылки */}
+        {selectedBroadcast && (
+          <div className="w-[60%] min-h-0 flex flex-col">
+            <BroadcastDetail
+              broadcast={selectedBroadcast}
+              projectId={projectId}
+              onClose={() => setSelectedBroadcast(null)}
+              refetch={refetch}
+            />
+          </div>
+        )}
+      </div>
+
+      <NewBroadcastModal
+        open={modalOpen}
+        onClose={() => setModalOpen(false)}
+        projectId={projectId}
+        tokenId={selectedTokenId}
+        refetch={refetch}
+      />
+    </div>
+  );
+}

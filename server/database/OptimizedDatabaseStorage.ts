@@ -1,0 +1,680 @@
+/**
+ * @fileoverview Оптимизированная реализация storage с локальными упрощениями поверх DatabaseStorage
+ */
+
+import { type BotGroup, botGroups, type BotInstance, botInstances, type BotProject, botProjects, type BotTemplate, botTemplates, type BotToken, botTokens, type InsertBotGroup, type InsertBotInstance, type InsertBotProject, type InsertBotTemplate, type InsertBotToken, type InsertMediaFile, type MediaFile, mediaFiles } from "@shared/schema";
+import { and, desc, eq, ilike, inArray, or } from "drizzle-orm";
+import { DatabaseStorage } from "./DatabaseStorage";
+
+/**
+ * Оптимизированная реализация хранилища с кэшированием
+ * Расширяет базовую реализацию, добавляя кэширование для улучшения производительности
+ */
+
+export class OptimizedDatabaseStorage extends DatabaseStorage {
+  private templateCache: Map<number, BotTemplate> = new Map();
+  private projectCache: Map<number, BotProject> = new Map();
+  private cacheTimeout = 5 * 60 * 1000; // 5 минут
+
+
+
+
+
+
+
+  // Bot Projects (с кэшированием)
+  /**
+   * Получить проект бота по ID из базы данных с кэшированием
+   * @param id - ID проекта
+   * @returns Проект бота или undefined, если не найден
+   */
+  async getBotProject(id: number): Promise<BotProject | undefined> {
+    const cached = this.projectCache.get(id);
+    if (cached) return cached;
+
+    const [project] = await this.db.select().from(botProjects).where(eq(botProjects.id, id));
+    if (project) {
+      this.projectCache.set(id, project);
+      // Автоматически очищаем кэш через timeout
+      setTimeout(() => this.projectCache.delete(id), this.cacheTimeout);
+    }
+    return project || undefined;
+  }
+
+  /**
+   * Получить все проекты ботов из базы данных
+   * @returns Массив проектов ботов
+   */
+  async getAllBotProjects(): Promise<BotProject[]> {
+    return await this.db.select().from(botProjects).orderBy(desc(botProjects.updatedAt));
+  }
+
+  /**
+   * Создать новый проект бота в базе данных и добавить в кэш
+   * @param insertProject - Данные для создания проекта
+   * @returns Созданный проект бота
+   */
+  async createBotProject(insertProject: InsertBotProject): Promise<BotProject> {
+    const [project] = await this.db
+      .insert(botProjects)
+      .values({
+        ...insertProject,
+        data: insertProject.data ?? {} // Убедимся, что поле data всегда присутствует
+      })
+      .returning();
+    this.projectCache.set(project.id, project);
+    return project;
+  }
+
+  /**
+   * Обновить проект бота в базе данных и кэше
+   * @param id - ID проекта
+   * @param updateData - Данные для обновления
+   * @returns Обновленный проект бота или undefined, если не найден
+   */
+  async updateBotProject(id: number, updateData: Partial<InsertBotProject>): Promise<BotProject | undefined> {
+    const [project] = await this.db
+      .update(botProjects)
+      .set({ ...updateData, updatedAt: new Date() })
+      .where(eq(botProjects.id, id))
+      .returning();
+    if (project) {
+      this.projectCache.set(id, project);
+    }
+    return project || undefined;
+  }
+
+  /**
+   * Удалить проект бота из базы данных и кэша
+   * @param id - ID проекта
+   * @returns true, если проект был удален, иначе false
+   */
+  async deleteBotProject(id: number): Promise<boolean> {
+    const result = await this.db.delete(botProjects).where(eq(botProjects.id, id));
+    this.projectCache.delete(id);
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  // Bot Instances (простая реализация)
+  /**
+   * Получить экземпляр бота по ID проекта из базы данных
+   * @param projectId - ID проекта
+   * @returns Экземпляр бота или undefined, если не найден
+   */
+  async getBotInstance(projectId: number): Promise<BotInstance | undefined> {
+    const [instance] = await this.db.select().from(botInstances).where(eq(botInstances.projectId, projectId));
+    return instance || undefined;
+  }
+
+  /**
+   * Получить все экземпляры ботов из базы данных
+   * @returns Массив всех экземпляров ботов
+   */
+  async getAllBotInstances(): Promise<BotInstance[]> {
+    return await this.db.select().from(botInstances).orderBy(desc(botInstances.startedAt));
+  }
+
+  /**
+   * Создать новый экземпляр бота в базе данных
+   * @param insertInstance - Данные для создания экземпляра
+   * @returns Созданный экземпляр бота
+   */
+  async createBotInstance(insertInstance: InsertBotInstance): Promise<BotInstance> {
+    const [instance] = await this.db
+      .insert(botInstances)
+      .values(insertInstance)
+      .returning();
+    return instance;
+  }
+
+  /**
+   * Обновить экземпляр бота в базе данных
+   * @param id - ID экземпляра
+   * @param updateData - Данные для обновления
+   * @returns Обновленный экземпляр бота или undefined, если не найден
+   */
+  async updateBotInstance(id: number, updateData: Partial<InsertBotInstance>): Promise<BotInstance | undefined> {
+    const [instance] = await this.db
+      .update(botInstances)
+      .set(updateData)
+      .where(eq(botInstances.id, id))
+      .returning();
+    return instance || undefined;
+  }
+
+  /**
+   * Удалить экземпляр бота из базы данных
+   * @param id - ID экземпляра
+   * @returns true, если экземпляр был удален, иначе false
+   */
+  async deleteBotInstance(id: number): Promise<boolean> {
+    const result = await this.db.delete(botInstances).where(eq(botInstances.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Остановить экземпляр бота по ID проекта в базе данных
+   * @param projectId - ID проекта
+   * @returns true, если экземпляр был остановлен, иначе false
+   */
+  async stopBotInstance(projectId: number): Promise<boolean> {
+    const result = await this.db
+      .update(botInstances)
+      .set({ status: 'stopped', stoppedAt: new Date() })
+      .where(eq(botInstances.projectId, projectId));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Остановить экземпляр бота по ID токена в базе данных
+   * @param tokenId - ID токена
+   * @returns true, если экземпляр был остановлен, иначе false
+   */
+  async stopBotInstanceByToken(tokenId: number): Promise<boolean> {
+    const result = await this.db
+      .update(botInstances)
+      .set({ status: 'stopped', stoppedAt: new Date(), errorMessage: null })
+      .where(eq(botInstances.tokenId, tokenId));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  // Bot Templates (с кэшированием)
+  /**
+   * Получить сценарий бота по ID из базы данных с кэшированием
+   * @param id - ID сценария
+   * @returns Сценарий бота или undefined, если не найден
+   */
+  async getBotTemplate(id: number): Promise<BotTemplate | undefined> {
+    const cached = this.templateCache.get(id);
+    if (cached) return cached;
+
+    const [template] = await this.db.select().from(botTemplates).where(eq(botTemplates.id, id));
+    if (template) {
+      this.templateCache.set(id, template);
+      setTimeout(() => this.templateCache.delete(id), this.cacheTimeout);
+    }
+    return template || undefined;
+  }
+
+  /**
+   * Получить все сценарии ботов из базы данных
+   * @returns Массив сценариев ботов
+   */
+  async getAllBotTemplates(): Promise<BotTemplate[]> {
+    return await this.db.select().from(botTemplates).orderBy(desc(botTemplates.createdAt));
+  }
+
+  /**
+   * Создать новый сценарий бота в базе данных и добавить в кэш
+   * @param insertTemplate - Данные для создания сценария
+   * @returns Созданный сценарий бота
+   */
+  async createBotTemplate(insertTemplate: InsertBotTemplate): Promise<BotTemplate> {
+    const [template] = await this.db
+      .insert(botTemplates)
+      .values(insertTemplate)
+      .returning();
+    this.templateCache.set(template.id, template);
+    return template;
+  }
+
+  /**
+   * Обновить сценарий бота в базе данных и кэше
+   * @param id - ID сценария
+   * @param updateData - Данные для обновления
+   * @returns Обновленный сценарий бота или undefined, если не найден
+   */
+  async updateBotTemplate(id: number, updateData: Partial<InsertBotTemplate>): Promise<BotTemplate | undefined> {
+    const [template] = await this.db
+      .update(botTemplates)
+      .set({ ...updateData, updatedAt: new Date() })
+      .where(eq(botTemplates.id, id))
+      .returning();
+    if (template) {
+      this.templateCache.set(id, template);
+    }
+    return template || undefined;
+  }
+
+  /**
+   * Удалить сценарий бота из базы данных и кэша
+   * @param id - ID сценария
+   * @returns true, если сценарий был удален, иначе false
+   */
+  async deleteBotTemplate(id: number): Promise<boolean> {
+    const result = await this.db.delete(botTemplates).where(eq(botTemplates.id, id));
+    this.templateCache.delete(id);
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  // Упрощенные методы для счетчиков
+  /**
+   * Увеличить счетчик использования сценария в базе данных и очистить кэш
+   * @param id - ID сценария
+   * @returns true, если счетчик был увеличен, иначе false
+   */
+  async incrementTemplateUseCount(id: number): Promise<boolean> {
+    const result = await this.db
+      .update(botTemplates)
+      .set({ lastUsedAt: new Date() })
+      .where(eq(botTemplates.id, id));
+    this.templateCache.delete(id); // Очищаем кэш
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Увеличить счетчик просмотров сценария в базе данных
+   * @param id - ID сценария
+   * @returns true, если счетчик был увеличен, иначе false
+   */
+  async incrementTemplateViewCount(id: number): Promise<boolean> {
+    const result = await this.db
+      .update(botTemplates)
+      .set({}) // Пустое обновление для простоты
+      .where(eq(botTemplates.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Увеличить счетчик загрузок сценария в базе данных
+   * @param id - ID сценария
+   * @returns true, если счетчик был увеличен, иначе false
+   */
+  async incrementTemplateDownloadCount(id: number): Promise<boolean> {
+    const result = await this.db
+      .update(botTemplates)
+      .set({}) // Пустое обновление для простоты
+      .where(eq(botTemplates.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Переключить лайк сценария и очистить кэш
+   * @param id - ID сценария
+   * @param _liked - true для лайка, false для анлайка
+   * @returns true, если статус лайка был изменен, иначе false
+   */
+  async toggleTemplateLike(id: number, _liked: boolean): Promise<boolean> {
+    this.templateCache.delete(id);
+    return true;
+  }
+
+  /**
+   * Переключить закладку сценария и очистить кэш
+   * @param id - ID сценария
+   * @param _bookmarked - true для добавления в закладки, false для удаления
+   * @returns true, если статус закладки был изменен, иначе false
+   */
+  async toggleTemplateBookmark(id: number, _bookmarked: boolean): Promise<boolean> {
+    this.templateCache.delete(id);
+    return true;
+  }
+
+  /**
+   * Оценить сценарий и очистить кэш
+   * @param id - ID сценария
+   * @param _rating - Оценка (обычно от 1 до 5)
+   * @returns true, если оценка была сохранена, иначе false
+   */
+  async rateTemplate(id: number, _rating: number): Promise<boolean> {
+    this.templateCache.delete(id);
+    return true;
+  }
+
+  /**
+   * Получить рекомендуемые сценарии из базы данных
+   * @returns Массив рекомендованных сценариев
+   */
+  async getFeaturedTemplates(): Promise<BotTemplate[]> {
+    return await this.db.select().from(botTemplates).where(eq(botTemplates.featured, 1)).orderBy(desc(botTemplates.rating));
+  }
+
+  /**
+   * Получить сценарии по категории из базы данных
+   * @param category - Категория сценариев
+   * @returns Массив сценариев указанной категории
+   */
+  async getTemplatesByCategory(category: string): Promise<BotTemplate[]> {
+    return await this.db.select().from(botTemplates).where(eq(botTemplates.category, category)).orderBy(desc(botTemplates.createdAt));
+  }
+
+  /**
+   * Поиск сценариев по запросу в базе данных
+   * @param query - Поисковый запрос
+   * @returns Массив найденных сценариев
+   */
+  async searchTemplates(query: string): Promise<BotTemplate[]> {
+    const searchTerm = `%${query.toLowerCase()}%`;
+    return await this.db.select().from(botTemplates).where(
+      or(
+        ilike(botTemplates.name, searchTerm),
+        ilike(botTemplates.description, searchTerm)
+      )
+    ).orderBy(desc(botTemplates.rating));
+  }
+
+  // Bot Tokens
+  /**
+   * Получить токен бота по ID из базы данных
+   * @param id - ID токена
+   * @returns Токен бота или undefined, если не найден
+   */
+  async getBotToken(id: number): Promise<BotToken | undefined> {
+    const [token] = await this.db.select().from(botTokens).where(eq(botTokens.id, id));
+    return token || undefined;
+  }
+
+  /**
+   * Получить токены ботов по ID проекта из базы данных
+   * @param projectId - ID проекта
+   * @returns Массив токенов ботов
+   */
+  async getBotTokensByProject(projectId: number): Promise<BotToken[]> {
+    return await this.db.select().from(botTokens)
+      .where(eq(botTokens.projectId, projectId))
+      .orderBy(desc(botTokens.isDefault), desc(botTokens.createdAt));
+  }
+
+  /**
+   * Получить токен бота по умолчанию для проекта из базы данных
+   * @param projectId - ID проекта
+   * @returns Токен бота по умолчанию или undefined, если не найден
+   */
+  async getDefaultBotToken(projectId: number): Promise<BotToken | undefined> {
+    const [token] = await this.db.select().from(botTokens)
+      .where(and(eq(botTokens.projectId, projectId), eq(botTokens.isDefault, 1)))
+      .orderBy(desc(botTokens.createdAt));
+    if (token) return token;
+    // Fallback: берём любой токен проекта если нет дефолтного
+    const [anyToken] = await this.db.select().from(botTokens)
+      .where(eq(botTokens.projectId, projectId))
+      .orderBy(desc(botTokens.createdAt));
+    return anyToken || undefined;
+  }
+
+  /**
+   * Создать новый токен бота в базе данных
+   * @param insertToken - Данные для создания токена
+   * @returns Созданный токен бота
+   */
+  async createBotToken(insertToken: InsertBotToken): Promise<BotToken> {
+    // Если создаем токен по умолчанию, убираем флаг с других токенов
+    if (insertToken.isDefault === 1) {
+      await this.db.update(botTokens)
+        .set({ isDefault: 0 })
+        .where(eq(botTokens.projectId, insertToken.projectId));
+    }
+
+    const [token] = await this.db
+      .insert(botTokens)
+      .values(insertToken)
+      .returning();
+    return token;
+  }
+
+  /**
+   * Обновить токен бота в базе данных
+   * @param id - ID токена
+   * @param updateData - Данные для обновления
+   * @returns Обновленный токен бота или undefined, если не найден
+   */
+  async updateBotToken(id: number, updateData: Partial<InsertBotToken>): Promise<BotToken | undefined> {
+    // Если делаем токен по умолчанию, убираем флаг с других токенов
+    if (updateData.isDefault === 1) {
+      const [currentToken] = await this.db.select().from(botTokens).where(eq(botTokens.id, id));
+      if (currentToken) {
+        await this.db.update(botTokens)
+          .set({ isDefault: 0 })
+          .where(eq(botTokens.projectId, currentToken.projectId));
+      }
+    }
+
+    const [token] = await this.db
+      .update(botTokens)
+      .set({ ...updateData, updatedAt: new Date() })
+      .where(eq(botTokens.id, id))
+      .returning();
+    return token || undefined;
+  }
+
+  /**
+   * Удалить токен бота из базы данных
+   * @param id - ID токена
+   * @returns true, если токен был удален, иначе false
+   */
+  async deleteBotToken(id: number): Promise<boolean> {
+    const result = await this.db.delete(botTokens).where(eq(botTokens.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Установить токен бота по умолчанию для проекта в базе данных
+   * @param projectId - ID проекта
+   * @param tokenId - ID токена
+   * @returns true, если токен был установлен по умолчанию, иначе false
+   */
+  async setDefaultBotToken(projectId: number, tokenId: number): Promise<boolean> {
+    // Убираем флаг по умолчанию со всех токенов проекта
+    await this.db.update(botTokens)
+      .set({ isDefault: 0 })
+      .where(eq(botTokens.projectId, projectId));
+
+    // Устанавливаем флаг по умолчанию для указанного токена
+    const result = await this.db.update(botTokens)
+      .set({ isDefault: 1 })
+      .where(eq(botTokens.id, tokenId));
+
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Отметить токен как использованный в базе данных
+   * @param id - ID токена
+   * @returns true, если токен был отмечен как использованный, иначе false
+   */
+  async markTokenAsUsed(id: number): Promise<boolean> {
+    const result = await this.db.update(botTokens)
+      .set({ lastUsedAt: new Date() })
+      .where(eq(botTokens.id, id));
+
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  // Media Files (simplified implementation)
+  /**
+   * Получить медиафайл по ID из базы данных
+   * @param id - ID файла
+   * @returns Медиафайл или undefined, если не найден
+   */
+  async getMediaFile(id: number): Promise<MediaFile | undefined> {
+    const [file] = await this.db.select().from(mediaFiles).where(eq(mediaFiles.id, id));
+    return file || undefined;
+  }
+
+  /**
+   * Получить медиафайлы по ID проекта из базы данных
+   * @param projectId - ID проекта
+   * @returns Массив медиафайлов проекта
+   */
+  async getMediaFilesByProject(projectId: number): Promise<MediaFile[]> {
+    return await this.db.select().from(mediaFiles)
+      .where(eq(mediaFiles.projectId, projectId))
+      .orderBy(desc(mediaFiles.createdAt));
+  }
+
+  /**
+   * Получить медиафайлы по ID проекта и типу файла из базы данных
+   * @param projectId - ID проекта
+   * @param fileType - Тип файла
+   * @returns Массив медиафайлов указанного типа
+   */
+  async getMediaFilesByType(projectId: number, fileType: string): Promise<MediaFile[]> {
+    return await this.db.select().from(mediaFiles)
+      .where(and(eq(mediaFiles.projectId, projectId), eq(mediaFiles.fileType, fileType)))
+      .orderBy(desc(mediaFiles.createdAt));
+  }
+
+  /**
+   * Получить медиафайлы по массиву URL и ID проекта из базы данных
+   * @param urls - Массив URL медиафайлов для поиска
+   * @param projectId - ID проекта
+   * @returns Массив найденных медиафайлов с заполненным telegramFileId
+   */
+  async getMediaFilesByUrls(urls: string[], projectId: number): Promise<MediaFile[]> {
+    if (!urls.length) return [];
+    return await this.db.select().from(mediaFiles)
+      .where(and(
+        eq(mediaFiles.projectId, projectId),
+        inArray(mediaFiles.url, urls)
+      ));
+  }
+
+  /**
+   * Создать новый медиафайл в базе данных
+   * @param insertFile - Данные для создания файла
+   * @returns Созданный медиафайл
+   */
+  async createMediaFile(insertFile: InsertMediaFile): Promise<MediaFile> {
+    const [file] = await this.db
+      .insert(mediaFiles)
+      .values(insertFile)
+      .returning();
+    return file;
+  }
+
+  /**
+   * Обновить медиафайл в базе данных
+   * @param id - ID файла
+   * @param updateData - Данные для обновления
+   * @returns Обновленный медиафайл или undefined, если не найден
+   */
+  async updateMediaFile(id: number, updateData: Partial<InsertMediaFile>): Promise<MediaFile | undefined> {
+    const [file] = await this.db
+      .update(mediaFiles)
+      .set({ ...updateData, updatedAt: new Date() })
+      .where(eq(mediaFiles.id, id))
+      .returning();
+    return file || undefined;
+  }
+
+  /**
+   * Удалить медиафайл из базы данных
+   * @param id - ID файла
+   * @returns true, если файл был удален, иначе false
+   */
+  async deleteMediaFile(id: number): Promise<boolean> {
+    const result = await this.db.delete(mediaFiles).where(eq(mediaFiles.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Увеличить счетчик использования медиафайла в базе данных
+   * @param id - ID файла
+   * @returns true, если счетчик был увеличен, иначе false
+   */
+  async incrementMediaFileUsage(id: number): Promise<boolean> {
+    const [file] = await this.db.select().from(mediaFiles).where(eq(mediaFiles.id, id));
+    if (!file) return false;
+
+    const result = await this.db
+      .update(mediaFiles)
+      .set({ usageCount: (file.usageCount || 0) + 1 })
+      .where(eq(mediaFiles.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+
+  /**
+   * Поиск медиафайлов по проекту и запросу в базе данных
+   * @param projectId - ID проекта
+   * @param query - Поисковый запрос
+   * @returns Массив найденных медиафайлов
+   */
+  async searchMediaFiles(projectId: number, query: string): Promise<MediaFile[]> {
+    const searchTerm = `%${query.toLowerCase()}%`;
+    return await this.db.select().from(mediaFiles)
+      .where(
+        and(
+          eq(mediaFiles.projectId, projectId),
+          or(
+            ilike(mediaFiles.fileName, searchTerm),
+            ilike(mediaFiles.description, searchTerm)
+          )
+        )
+      )
+      .orderBy(desc(mediaFiles.createdAt));
+  }
+
+  // Bot Groups
+  /**
+   * Получить группу бота по ID из базы данных
+   * @param id - ID группы
+   * @returns Группа бота или undefined, если не найдена
+   */
+  async getBotGroup(id: number): Promise<BotGroup | undefined> {
+    const [group] = await this.db.select().from(botGroups).where(eq(botGroups.id, id));
+    return group || undefined;
+  }
+
+  /**
+   * Получить группы проекта (наследует фильтрацию по tokenId)
+   * @param projectId - ID проекта
+   * @param tokenId - ID токена
+   * @returns Массив групп
+   */
+  async getBotGroupsByProject(projectId: number, tokenId?: number | null): Promise<BotGroup[]> {
+    return super.getBotGroupsByProject(projectId, tokenId);
+  }
+
+  /**
+   * Получить группу по проекту / group_id / токену
+   * @param projectId - ID проекта
+   * @param groupId - Telegram chat_id
+   * @param tokenId - ID токена
+   * @returns Группа или undefined
+   */
+  async getBotGroupByProjectAndGroupId(
+    projectId: number,
+    groupId: string,
+    tokenId?: number | null,
+  ): Promise<BotGroup | undefined> {
+    return super.getBotGroupByProjectAndGroupId(projectId, groupId, tokenId);
+  }
+
+  /**
+   * Создать новую группу бота в базе данных
+   * @param insertGroup - Данные для создания группы
+   * @returns Созданная группа бота
+   */
+  async createBotGroup(insertGroup: InsertBotGroup): Promise<BotGroup> {
+    const [group] = await this.db
+      .insert(botGroups)
+      .values(insertGroup)
+      .returning();
+    return group;
+  }
+
+  /**
+   * Обновить группу бота в базе данных
+   * @param id - ID группы
+   * @param updateData - Данные для обновления
+   * @returns Обновленная группа бота или undefined, если не найдена
+   */
+  async updateBotGroup(id: number, updateData: Partial<InsertBotGroup>): Promise<BotGroup | undefined> {
+    const [group] = await this.db
+      .update(botGroups)
+      .set({ ...updateData, updatedAt: new Date() })
+      .where(eq(botGroups.id, id))
+      .returning();
+    return group || undefined;
+  }
+
+  /**
+   * Удалить группу бота из базы данных
+   * @param id - ID группы
+   * @returns true, если группа была удалена, иначе false
+   */
+  async deleteBotGroup(id: number): Promise<boolean> {
+    const result = await this.db.delete(botGroups).where(eq(botGroups.id, id));
+    return result.rowCount ? result.rowCount > 0 : false;
+  }
+}

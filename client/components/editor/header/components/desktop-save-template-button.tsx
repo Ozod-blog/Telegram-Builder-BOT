@@ -1,0 +1,42 @@
+/**
+ * @fileoverview Десктопная кнопка сохранения сценария
+ * @description Кнопка для сохранения текущего проекта как сценария в десктопной версии
+ */
+
+import { Button } from '@/components/ui/button';
+import { Bookmark } from 'lucide-react';
+import { cn } from '@/utils/utils';
+
+/**
+ * Свойства десктопной кнопки сохранения сценария
+ */
+export interface DesktopSaveTemplateButtonProps {
+  /** Обработчик клика */
+  onClick?: () => void;
+  /** Вертикальное расположение */
+  isVertical?: boolean;
+}
+
+/**
+ * Десктопная кнопка сохранения сценария
+ */
+export function DesktopSaveTemplateButton({ onClick, isVertical }: DesktopSaveTemplateButtonProps) {
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      onClick={onClick}
+      className={cn(
+        isVertical ? 'w-full justify-center' : 'flex items-center justify-center',
+        'px-2 py-1.5 text-xs font-semibold rounded-lg transition-all shadow-sm hover:shadow-md hover:shadow-amber-500/20 xl:px-3',
+        'bg-gradient-to-r from-amber-500/10 to-amber-400/5 hover:from-amber-600/20 hover:to-amber-500/15',
+        'border border-amber-400/30 dark:border-amber-500/30 hover:border-amber-500/50 dark:hover:border-amber-400/50',
+        'text-amber-700 dark:text-amber-300',
+        'max-sm:px-2 max-sm:py-1 max-sm:min-w-0 max-sm:w-full'
+      )}
+    >
+      <Bookmark className="h-3.5 w-3.5 max-sm:mx-auto" />
+      <span className="ml-1 hidden xl:inline">Сохранить сценарий</span>
+    </Button>
+  );
+}

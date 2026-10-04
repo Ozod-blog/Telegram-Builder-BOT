@@ -1,0 +1,1190 @@
+/**
+ * @fileoverview Панель свойств узлов редактора с нижней секцией linked-input для message.
+ */
+
+import { Node, Button } from '@shared/schema';
+import { getCommandSuggestions, STANDARD_COMMANDS } from '@lib/commands';
+import { useState, useMemo, useEffect, useRef } from 'react';
+import { useConditionalMessagesSync } from '../synonyms/use-conditional-messages-sync';
+import { hasLegacyMessageInput } from '../../utils/linked-input-node';
+
+import { EmptyState } from '../layout/empty-state';
+import { getNodeDefaults } from '../../utils/node-defaults';
+import { collectAllNodesFromSheets } from '../../utils/node-utils';
+import { extractVariables } from '../../utils/variables-utils';
+import { useMediaVariables } from '../../hooks/use-media-variables';
+import { useBotTablesForVariables } from '../../hooks/use-bot-tables-for-variables';
+import { useNodeCommandValidation } from '../../hooks/use-node-command-validation';
+import { formatNodeDisplay } from '../../utils/node-formatters';
+import { isManagementNode, isTriggerNode, isConditionNode } from '../../utils/node-constants';
+import { AdminRightsInfo } from '../configuration/admin-rights-info';
+import { InfoBlock } from '@/components/ui/info-block';
+import { CommandAdvancedSettingsWrapper } from './command-advanced-settings-wrapper';
+import { CommandTriggerConfiguration } from '../trigger/CommandTriggerConfiguration';
+import { TextTriggerConfiguration } from '../trigger/TextTriggerConfiguration';
+import { AnyMessageTriggerConfiguration } from '../trigger/AnyMessageTriggerConfiguration';
+import { GroupMessageTriggerConfiguration } from '../trigger/GroupMessageTriggerConfiguration';
+import { CallbackTriggerConfiguration } from '../trigger/CallbackTriggerConfiguration';
+import { IncomingCallbackTriggerConfiguration } from '../trigger/IncomingCallbackTriggerConfiguration';
+import { OutgoingMessageTriggerConfiguration } from '../trigger/OutgoingMessageTriggerConfiguration';
+import { ManagedBotUpdatedTriggerConfiguration } from '../trigger/ManagedBotUpdatedTriggerConfiguration';
+import { SuccessfulPaymentTriggerConfiguration } from '../trigger/SuccessfulPaymentTriggerConfiguration';
+import { MemberTriggerConfiguration } from '../trigger/MemberTriggerConfiguration';
+import { ScheduleTriggerConfiguration } from '../trigger/ScheduleTriggerConfiguration';
+import { ApiTriggerConfiguration } from '../trigger/ApiTriggerConfiguration';
+import { ConditionNodeConfiguration } from '../condition/ConditionNodeConfiguration';
+import { ParallelSplitConfiguration } from '../parallel-split/ParallelSplitConfiguration';
+import { PropertiesFooterWrapper } from './properties-footer-wrapper';
+import { PropertiesHeader } from '../layout/properties-header';
+import { SectionHeader } from '../layout/section-header';
+import { BasicSettingsSection } from './basic-settings-section';
+import { MessageContentSection } from './message-content-section';
+import { MediaFileSection } from '../media-file/media-file-section';
+import { KeyboardSectionHeader } from '../keyboard/keyboard-section-header';
+import { KeyboardButtonsSection } from '../keyboard/keyboard-buttons-section';
+import { UserInputSettingsSection } from './user-input-settings-section';
+import { KeyboardTypeSelector } from '../keyboard/keyboard-type-selector';
+import { KeyboardLayoutEditor } from '../keyboard/keyboard-layout-editor';
+import { KeyboardNodeProperties } from '../keyboard/keyboard-node-properties';
+import { SaveAnswerProperties } from '../input/save-answer-properties';
+import { MultipleSelectionSettings } from '../questions/multiple-selection-settings';
+import { ButtonCard } from '../button-card/button-card';
+import { generateButtonId } from '@/utils/generate-button-id';
+import { StickerConfiguration } from '../configuration/sticker-configuration';
+import { VoiceConfiguration } from '../configuration/voice-configuration';
+import { AnimationConfiguration } from '../configuration/animation-configuration';
+import { ContactConfiguration } from '../configuration/contact-configuration';
+import { ContentManagementConfiguration } from '../configuration/content-management-configuration';
+import { ForwardMessageConfiguration } from '../configuration/forward-message-configuration';
+import { CreateForumTopicConfiguration } from '../configuration/create-forum-topic-configuration';
+import { UserManagementConfiguration } from '../configuration/user-management-configuration';
+import { LocationCoordinatesSection } from '../configuration/location-coordinates-section';
+import { LocationDetailsSection } from '../configuration/location-details-section';
+import { FoursquareIntegrationSection } from '../configuration/foursquare-integration-section';
+import { MapServicesSection } from '../configuration/map-services-section';
+import { BroadcastNodeProperties } from '../broadcast/broadcast-properties';
+import { ClientAuthProperties } from '../client-auth/client-auth-properties';
+import { MediaNodeProperties } from './media-node-properties';
+import { HttpRequestConfiguration } from '../configuration/http-request-configuration';
+import { ApiResponseConfiguration } from '../configuration/api-response-configuration';
+import { GetManagedBotTokenConfiguration } from '../configuration/get-managed-bot-token-configuration';
+import { AnswerCallbackQueryConfiguration } from '../action/AnswerCallbackQueryConfiguration';
+import { EditMessageConfiguration } from '../action/EditMessageConfiguration';
+import { DeleteMessageConfiguration } from '../action/DeleteMessageConfiguration';
+import { KickUserConfiguration } from '../action/KickUserConfiguration';
+import { SetVariableConfiguration } from '../configuration/set-variable-configuration';
+import { PsqlQueryConfiguration } from '../configuration/psql-query-configuration';
+import { ConvertFileConfiguration } from '../configuration/ConvertFileConfiguration';
+import { BotTableConfiguration } from '../configuration/BotTableConfiguration';
+import { LoopConfiguration } from '../configuration/LoopConfiguration';
+import { DelayConfiguration } from '../configuration/delay-configuration';
+import { SendInvoiceConfiguration } from '../configuration/send-invoice-configuration';
+import { CreateInvoiceLinkConfiguration } from '../configuration/create-invoice-link-configuration';
+import { RefundStarsConfiguration } from '../configuration/refund-stars-configuration';
+import { EditStarSubscriptionConfiguration } from '../configuration/edit-star-subscription-configuration';
+import { GetStarBalanceConfiguration } from '../configuration/get-star-balance-configuration';
+import { StopProcessingConfiguration } from '../configuration/stop-processing-configuration';
+import { RateCounterConfiguration } from '../configuration/rate-counter-configuration';
+import { CodeConfiguration } from '../configuration/code-configuration';
+import { UserbotMessageConfiguration } from '../userbot/UserbotMessageConfiguration';
+import { UserbotClickButtonConfiguration } from '../userbot/UserbotClickButtonConfiguration';
+import { UserbotInlineQueryConfiguration } from '../userbot/UserbotInlineQueryConfiguration';
+import { UserbotEditTriggerConfiguration } from '../trigger/UserbotEditTriggerConfiguration';
+import { CommentConfiguration } from '../configuration/CommentConfiguration';
+import type { Variable } from '../../../inline-rich/types';
+import { useEnvVariablesForNode } from '../../hooks/use-env-variables-for-node';
+import { usePropertiesView } from '../../hooks/use-properties-view';
+import { PropertyCheckbox } from '../common/property-checkbox';
+import { NodeDataJsonEditor } from './node-data-json-editor';
+
+/**
+ * РРЅС‚РµСЂС„РµР№СЃ РїСЂРѕРїСЃРѕРІ РґР»СЏ РїР°РЅРµР»Рё СЃРІРѕР№СЃС‚РІ СѓР·Р»РѕРІ
+ * @interface PropertiesPanelProps
+ */
+interface PropertiesPanelProps {
+  /** ID РїСЂРѕРµРєС‚Р° */
+  projectId: number;
+  /** Р’С‹Р±СЂР°РЅРЅС‹Р№ СѓР·РµР» РґР»СЏ СЂРµРґР°РєС‚РёСЂРѕРІР°РЅРёСЏ */
+  selectedNode: Node | null;
+  /** Р’СЃРµ СѓР·Р»С‹ С‚РµРєСѓС‰РµРіРѕ Р»РёСЃС‚Р° */
+  allNodes?: Node[] | undefined;
+  /** Р¤СѓРЅРєС†РёСЏ РѕР±РЅРѕРІР»РµРЅРёСЏ РґР°РЅРЅС‹С… СѓР·Р»Р° */
+  onNodeUpdate: (nodeId: string, updates: Partial<Node['data']>) => void;
+  /** Полная замена node.data (JSON-режим панели свойств) */
+  onNodeDataReplace: (nodeId: string, newData: Node['data']) => void;
+  /** Р¤СѓРЅРєС†РёСЏ РёР·РјРµРЅРµРЅРёСЏ С‚РёРїР° СѓР·Р»Р° */
+  onNodeTypeChange?: (nodeId: string, newType: Node['type'], newData: Partial<Node['data']>) => void;
+  /** Р¤СѓРЅРєС†РёСЏ РёР·РјРµРЅРµРЅРёСЏ ID СѓР·Р»Р° */
+  onNodeIdChange?: (oldId: string, newId: string) => void;
+  /** Р¤СѓРЅРєС†РёСЏ РґРѕР±Р°РІР»РµРЅРёСЏ РєРЅРѕРїРєРё Рє СѓР·Р»Сѓ */
+  onButtonAdd: (nodeId: string, button: Button) => void;
+  /** Р¤СѓРЅРєС†РёСЏ РѕР±РЅРѕРІР»РµРЅРёСЏ РєРЅРѕРїРєРё СѓР·Р»Р° */
+  onButtonUpdate: (nodeId: string, buttonId: string, updates: Partial<Button>) => void;
+  /** Р¤СѓРЅРєС†РёСЏ СѓРґР°Р»РµРЅРёСЏ РєРЅРѕРїРєРё СѓР·Р»Р° */
+  onButtonDelete: (nodeId: string, buttonId: string) => void;
+  /** Р”РѕР±Р°РІРёС‚СЊ СѓР·РµР» РЅР° С…РѕР»СЃС‚ (РґР»СЏ СЃРёРЅС…СЂРѕРЅРёР·Р°С†РёРё СЃРёРЅРѕРЅРёРјРѕРІ) */
+  onNodeAdd?: (node: Node) => void;
+  /** РЈРґР°Р»РёС‚СЊ СѓР·РµР» СЃ С…РѕР»СЃС‚Р° (РґР»СЏ СЃРёРЅС…СЂРѕРЅРёР·Р°С†РёРё СЃРёРЅРѕРЅРёРјРѕРІ) */
+  onNodeDelete?: (nodeId: string) => void;
+  /** Р’СЃРµ Р»РёСЃС‚С‹ РїСЂРѕРµРєС‚Р° РґР»СЏ РїРѕРґРґРµСЂР¶РєРё РјРµР¶Р»РёСЃС‚РѕРІС‹С… СЃРѕРµРґРёРЅРµРЅРёР№ */
+  allSheets?: any[] | undefined;
+  /** ID С‚РµРєСѓС‰РµРіРѕ Р»РёСЃС‚Р° */
+  currentSheetId?: string | undefined;
+  /** Р¤СѓРЅРєС†РёСЏ Р·Р°РєСЂС‹С‚РёСЏ РїР°РЅРµР»Рё */
+  onClose?: (() => void) | undefined;
+  /** Р¤СѓРЅРєС†РёСЏ Р»РѕРіРёСЂРѕРІР°РЅРёСЏ РґРµР№СЃС‚РІРёР№ */
+  onActionLog?: (type: string, description: string) => void;
+  /** Р¤СѓРЅРєС†РёСЏ СЃРѕС…СЂР°РЅРµРЅРёСЏ РїСЂРѕРµРєС‚Р° */
+  onSaveProject?: () => void;
+  /** ID кнопки для скролла к ней в панели свойств */
+  focusButtonId?: string | null;
+}
+
+/**
+ * РљРѕРјРїРѕРЅРµРЅС‚ РїР°РЅРµР»Рё СЃРІРѕР№СЃС‚РІ РґР»СЏ СЂРµРґР°РєС‚РёСЂРѕРІР°РЅРёСЏ СѓР·Р»РѕРІ Р±РѕС‚Р°
+ * 
+ * РћСЃРЅРѕРІРЅРѕР№ РєРѕРјРїРѕРЅРµРЅС‚ РґР»СЏ РЅР°СЃС‚СЂРѕР№РєРё РІСЃРµС… РїР°СЂР°РјРµС‚СЂРѕРІ СѓР·Р»РѕРІ:
+ * - Р‘Р°Р·РѕРІС‹Рµ РЅР°СЃС‚СЂРѕР№РєРё (С‚РёРї, ID, РєРѕРјР°РЅРґС‹)
+ * - РўРµРєСЃС‚ СЃРѕРѕР±С‰РµРЅРёР№ СЃ РїРѕРґРґРµСЂР¶РєРѕР№ РїРµСЂРµРјРµРЅРЅС‹С…
+ * - РњРµРґРёР°С„Р°Р№Р»С‹ (С„РѕС‚Рѕ, РІРёРґРµРѕ, Р°СѓРґРёРѕ, РґРѕРєСѓРјРµРЅС‚С‹)
+ * - РљР»Р°РІРёР°С‚СѓСЂС‹ (inline Рё reply)
+ * - РЈСЃР»РѕРІРЅС‹Рµ СЃРѕРѕР±С‰РµРЅРёСЏ
+ * - РђРІС‚РѕРїРµСЂРµС…РѕРґС‹ Рё С‚Р°Р№РјРµСЂС‹
+ * - РЎР±РѕСЂ РїРѕР»СЊР·РѕРІР°С‚РµР»СЊСЃРєРёС… РґР°РЅРЅС‹С…
+ * 
+ * РџРѕРґРґРµСЂР¶РёРІР°РµС‚:
+ * - РњРЅРѕРіРѕР»РёСЃС‚РѕРІС‹Рµ РїСЂРѕРµРєС‚С‹
+ * - РњРµР¶Р»РёСЃС‚РѕРІС‹Рµ СЃРѕРµРґРёРЅРµРЅРёСЏ
+ * - Р’Р°Р»РёРґР°С†РёСЋ РґР°РЅРЅС‹С…
+ * - РџСЂРµРґРїСЂРѕСЃРјРѕС‚СЂ РїРµСЂРµРјРµРЅРЅС‹С…
+ * - РђРґР°РїС‚РёРІРЅС‹Р№ РёРЅС‚РµСЂС„РµР№СЃ
+ * 
+ * @param {PropertiesPanelProps} props - РџСЂРѕРїСЃС‹ РєРѕРјРїРѕРЅРµРЅС‚Р°
+ * @returns {JSX.Element} РџР°РЅРµР»СЊ СЃРІРѕР№СЃС‚РІ СѓР·Р»Р°
+ */
+export function PropertiesPanel({
+  projectId,
+  selectedNode,
+  allNodes = [],
+  onNodeUpdate,
+  onNodeDataReplace,
+  onNodeTypeChange,
+  onNodeIdChange,
+  onButtonAdd,
+  onButtonUpdate,
+  onButtonDelete,
+  onNodeAdd,
+  onNodeDelete,
+  allSheets = [],
+  currentSheetId,
+  onClose,
+  onActionLog,
+  onSaveProject,
+  focusButtonId,
+}: PropertiesPanelProps) {
+  const [commandInput, setCommandInput] = useState('');
+  const [showCommandSuggestions, setShowCommandSuggestions] = useState(false);
+  const [isBasicSettingsOpen, setIsBasicSettingsOpen] = useState(false);
+  const [isAdvancedSettingsOpen, setIsAdvancedSettingsOpen] = useState(false);
+  const [isForwardMessageSectionOpen, setIsForwardMessageSectionOpen] = useState(true);
+  const [isMessageTextOpen, setIsMessageTextOpen] = useState(true);
+  const [isMediaSectionOpen, setIsMediaSectionOpen] = useState(false);
+  const [isKeyboardSectionOpen, setIsKeyboardSectionOpen] = useState(false);
+  const [isUserInputSectionOpen, setIsUserInputSectionOpen] = useState(false);
+  const [displayNodeId, setDisplayNodeId] = useState(selectedNode?.id || '');
+  const lastUserInputNodeIdRef = useRef<string | null>(selectedNode?.id || null);
+  const wasUserInputPresentRef = useRef(false);
+
+  /** Env-переменные бота для селектора подключения к БД */
+  const envVariablesForNode = useEnvVariablesForNode(projectId);
+
+  const {
+    view: propertiesView,
+    requestViewChange,
+    jsonDraft,
+    jsonError,
+    handleJsonChange,
+    applyJson,
+  } = usePropertiesView({ selectedNode, onNodeDataReplace });
+
+  /** Общие пропсы заголовка и футера панели */
+  const headerFooterProps = selectedNode ? {
+    propertiesView,
+    onPropertiesViewChange: requestViewChange,
+    jsonError,
+    onJsonApply: applyJson,
+  } : {};
+
+  /** Таблицы проекта для переменных формата {table.имя.колонка} */
+  const botTables = useBotTablesForVariables(projectId);
+
+  // РЎРёРЅС…СЂРѕРЅРёР·РёСЂСѓРµРј displayNodeId СЃ selectedNode.id РїСЂРё РёР·РјРµРЅРµРЅРёРё СѓР·Р»Р°
+  useEffect(() => {
+    if (selectedNode?.id) {
+      setDisplayNodeId(selectedNode.id);
+    }
+  }, [selectedNode?.id]);
+
+  // Раскрываем секцию клавиатуры при наличии focusButtonId
+  useEffect(() => {
+    if (focusButtonId) setIsKeyboardSectionOpen(true);
+  }, [focusButtonId]);
+
+  // Скроллим к нужной кнопке при изменении focusButtonId
+  useEffect(() => {
+    if (!focusButtonId) return;
+    // Небольшая задержка чтобы панель успела открыться
+    const timer = setTimeout(() => {
+      const el = document.querySelector(`[data-button-id="${focusButtonId}"]`);
+      el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [focusButtonId]);
+
+  // Р Р°СЃРєСЂС‹РІР°РµРј СЃРµРєС†РёРё РїСЂРё РЅР°Р»РёС‡РёРё РєРѕРЅС‚РµРЅС‚Р°
+  useEffect(() => {
+    if (!selectedNode?.data) return;
+
+    if (lastUserInputNodeIdRef.current !== selectedNode.id) {
+      lastUserInputNodeIdRef.current = selectedNode.id;
+      wasUserInputPresentRef.current = false;
+    }
+
+    // РЎРµРєС†РёСЏ РјРµРґРёР°С„Р°Р№Р»РѕРІ
+    const hasMedia = selectedNode.data.attachedMedia?.length > 0 || 
+                     selectedNode.data.imageUrl || 
+                     selectedNode.data.videoUrl || 
+                     selectedNode.data.audioUrl || 
+                     selectedNode.data.documentUrl;
+    if (hasMedia && !isMediaSectionOpen) {
+      setIsMediaSectionOpen(true);
+    }
+
+    // РЎРµРєС†РёСЏ РєР»Р°РІРёР°С‚СѓСЂС‹
+    const hasKeyboard = selectedNode.data.keyboardType && selectedNode.data.keyboardType !== 'none';
+    const hasButtons = selectedNode.data.buttons?.length > 0;
+    if ((hasKeyboard || hasButtons) && !isKeyboardSectionOpen) {
+      setIsKeyboardSectionOpen(true);
+    }
+
+    // РЎРµРєС†РёСЏ РІРІРѕРґР° РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ
+    const hasMessageInput = selectedNode.type === 'message' && Boolean(
+      selectedNode.data.autoTransitionTo ||
+      hasLegacyMessageInput(selectedNode)
+    );
+    const hasUserInput = Boolean(
+      hasMessageInput ||
+      selectedNode.data.collectUserInput ||
+      selectedNode.data.enableTextInput ||
+      selectedNode.data.enablePhotoInput ||
+      selectedNode.data.enableVideoInput ||
+      selectedNode.data.enableAudioInput ||
+      selectedNode.data.enableDocumentInput
+    );
+
+    if (hasUserInput && !wasUserInputPresentRef.current && !isUserInputSectionOpen) {
+      setIsUserInputSectionOpen(true);
+    }
+    wasUserInputPresentRef.current = hasUserInput;
+  }, [selectedNode?.data, selectedNode?.id]);
+
+  /**
+   * РњРµРјРѕРёР·РёСЂРѕРІР°РЅРЅС‹Р№ СЃРїРёСЃРѕРє РІСЃРµС… СѓР·Р»РѕРІ РёР· РІСЃРµС… Р»РёСЃС‚РѕРІ
+   */
+  const getAllNodesFromAllSheets = useMemo(() =>
+    collectAllNodesFromSheets(allSheets, allNodes, currentSheetId),
+  [allSheets, allNodes, currentSheetId]);
+
+  /**
+   * РњРµРјРѕРёР·РёСЂРѕРІР°РЅРЅС‹Р№ СЃРїРёСЃРѕРє РґРѕСЃС‚СѓРїРЅС‹С… РІРѕРїСЂРѕСЃРѕРІ
+   */
+  /**
+   * РњРµРјРѕРёР·РёСЂРѕРІР°РЅРЅС‹Рµ С‚РµРєСЃС‚РѕРІС‹Рµ Рё РјРµРґРёР° РїРµСЂРµРјРµРЅРЅС‹Рµ
+   */
+  const { textVariables, mediaVariables } = useMemo(() => extractVariables(allNodes, botTables), [allNodes, botTables]);
+
+  /**
+   * РҐСѓРє РґР»СЏ СѓРїСЂР°РІР»РµРЅРёСЏ РјРµРґРёР°РїРµСЂРµРјРµРЅРЅС‹РјРё
+   */
+  const { attachedMediaVariables, handleMediaVariableSelect, handleMediaVariableRemove } = useMediaVariables(
+    selectedNode,
+    mediaVariables,
+    onNodeUpdate
+  );
+
+  const commandValidation = useNodeCommandValidation({ selectedNode });
+
+  // РЎРёРЅС…СЂРѕРЅРёР·Р°С†РёСЏ СѓСЃР»РѕРІРЅС‹С… СЃРѕРѕР±С‰РµРЅРёР№ СЃ СѓР·Р»РѕРј condition РЅР° С…РѕР»СЃС‚Рµ
+  useConditionalMessagesSync({
+    selectedNode,
+    allNodes,
+    onNodeUpdate,
+    onNodeAdd,
+    onNodeDelete,
+  });
+
+  // РђРІС‚РѕРґРѕРїРѕР»РЅРµРЅРёРµ РєРѕРјР°РЅРґ
+  const commandSuggestions = useMemo(() => {
+    if (commandInput.length > 0) {
+      return getCommandSuggestions(commandInput);
+    }
+    return STANDARD_COMMANDS.slice(0, 5);
+  }, [commandInput]);
+
+  if (!selectedNode) {
+    return <EmptyState onClose={onClose} />;
+  }
+
+  /**
+   * Дублирует кнопку, вставляя копию сразу после оригинала
+   * @param nodeId - ID узла
+   * @param button - Кнопка для дублирования
+   */
+  const handleDuplicateButton = (nodeId: string, button: Button) => {
+    const currentButtons = selectedNode.data.buttons || [];
+    const newButton = { ...button, id: generateButtonId() };
+    const index = currentButtons.findIndex((b: Button) => b.id === button.id);
+    const updated = [...currentButtons];
+    updated.splice(index + 1, 0, newButton);
+    onNodeUpdate(nodeId, { buttons: updated });
+  };
+
+  if (selectedNode.type === 'keyboard') {
+    return (
+      <aside className="w-full h-full bg-background border-l border-border flex flex-col shadow-lg md:shadow-none overflow-hidden" data-properties-panel>
+        <PropertiesHeader
+          selectedNode={selectedNode}
+          onNodeTypeChange={onNodeTypeChange}
+          onClose={onClose}
+          displayNodeId={displayNodeId}
+          {...headerFooterProps}
+        />
+        <div className="flex-1 overflow-y-auto min-h-0">
+          {propertiesView === 'json' ? (
+            <NodeDataJsonEditor
+              value={jsonDraft}
+              error={jsonError}
+              onChange={handleJsonChange}
+              onApply={applyJson}
+            />
+          ) : (
+            <KeyboardNodeProperties
+            selectedNode={selectedNode}
+            textVariables={textVariables as Variable[]}
+            getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+            onNodeUpdate={onNodeUpdate}
+            onButtonAdd={onButtonAdd}
+            onButtonUpdate={onButtonUpdate}
+            onButtonDelete={onButtonDelete}
+          />
+          )}
+        </div>
+        <PropertiesFooterWrapper
+          selectedNode={selectedNode}
+          onNodeUpdate={onNodeUpdate}
+          onActionLog={onActionLog}
+          onSaveProject={onSaveProject}
+          {...headerFooterProps}
+        />
+      </aside>
+    );
+  }
+
+  if (selectedNode.type === 'input') {
+    return (
+      <aside className="w-full h-full bg-background border-l border-border flex flex-col shadow-lg md:shadow-none overflow-hidden" data-properties-panel>
+        <PropertiesHeader
+          selectedNode={selectedNode}
+          onNodeTypeChange={onNodeTypeChange}
+          onClose={onClose}
+          displayNodeId={displayNodeId}
+          {...headerFooterProps}
+        />
+        <div className="flex-1 overflow-y-auto min-h-0">
+          {propertiesView === 'json' ? (
+            <NodeDataJsonEditor
+              value={jsonDraft}
+              error={jsonError}
+              onChange={handleJsonChange}
+              onApply={applyJson}
+            />
+          ) : (
+          <div className="p-4">
+          <SaveAnswerProperties
+            selectedNode={selectedNode}
+            onNodeUpdate={onNodeUpdate}
+            getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+            formatNodeDisplay={formatNodeDisplay}
+            textVariables={textVariables as Variable[]}
+          />
+          </div>
+          )}
+        </div>
+        <PropertiesFooterWrapper
+          selectedNode={selectedNode}
+          onNodeUpdate={onNodeUpdate}
+          onActionLog={onActionLog}
+          onSaveProject={onSaveProject}
+          {...headerFooterProps}
+        />
+      </aside>
+    );
+  }
+
+  return (
+    <aside className="w-full h-full bg-background border-l border-border flex flex-col shadow-lg md:shadow-none overflow-hidden" data-properties-panel>
+      {/* Properties Header */}
+      <PropertiesHeader
+        selectedNode={selectedNode}
+        onNodeTypeChange={onNodeTypeChange}
+        onClose={onClose}
+        displayNodeId={displayNodeId}
+        {...headerFooterProps}
+      />
+
+      {/* Properties Content */}
+      <div className="flex-1 overflow-y-auto min-h-0">
+        {propertiesView === 'json' ? (
+          <NodeDataJsonEditor
+            value={jsonDraft}
+            error={jsonError}
+            onChange={handleJsonChange}
+            onApply={applyJson}
+          />
+        ) : (
+        <div className="space-y-0">
+
+          {/* Basic Settings Section - СЃРєСЂС‹С‚Рѕ РґР»СЏ СѓР·Р»Р° СЂР°СЃСЃС‹Р»РєР°, client_auth, С‚СЂРёРіРіРµСЂРѕРІ, СѓСЃР»РѕРІРёСЏ Рё РјРµРґРёР°-РЅРѕРґС‹ */}
+          {selectedNode.type !== 'broadcast' && selectedNode.type !== 'client_auth' && selectedNode.type !== 'media' && (selectedNode.type as any) !== 'http_request' && (selectedNode.type as any) !== 'api_response' && (selectedNode.type as any) !== 'get_managed_bot_token' && (selectedNode.type as any) !== 'answer_callback_query' && (selectedNode.type as any) !== 'edit_message' && (selectedNode.type as any) !== 'delete_message' && (selectedNode.type as any) !== 'kick_user' && (selectedNode.type as any) !== 'set_variable' && (selectedNode.type as any) !== 'psql_query' && (selectedNode.type as any) !== 'convert_file' && (selectedNode.type as any) !== 'loop' && (selectedNode.type as any) !== 'bot_table' && (selectedNode.type as any) !== 'delay' && (selectedNode.type as any) !== 'send_invoice' && (selectedNode.type as any) !== 'create_invoice_link' && (selectedNode.type as any) !== 'refund_stars' && (selectedNode.type as any) !== 'edit_star_subscription' && (selectedNode.type as any) !== 'get_star_balance' && (selectedNode.type as any) !== 'code' && (selectedNode.type as any) !== 'userbot_message' && (selectedNode.type as any) !== 'userbot_click_button' && (selectedNode.type as any) !== 'userbot_inline_query' && (selectedNode.type as any) !== 'parallel_split' && (selectedNode.type as any) !== 'stop_processing' && (selectedNode.type as any) !== 'rate_counter' && (selectedNode.type as any) !== 'comment' && !isTriggerNode(selectedNode.type) && !isConditionNode(selectedNode.type) && (
+            <BasicSettingsSection
+              selectedNode={selectedNode}
+              projectId={projectId}
+              isOpen={isBasicSettingsOpen}
+              onToggle={() => setIsBasicSettingsOpen(!isBasicSettingsOpen)}
+              commandValue={selectedNode.data.command || getNodeDefaults(selectedNode.type).command || ''}
+              descriptionValue={selectedNode.data.description || getNodeDefaults(selectedNode.type).description || ''}
+              isValid={commandValidation.isValid}
+              errors={commandValidation.errors}
+              suggestions={commandSuggestions}
+              showSuggestions={showCommandSuggestions}
+              onNodeUpdate={onNodeUpdate}
+              onNodeIdChange={onNodeIdChange}
+              onCommandInput={setCommandInput}
+              onShowSuggestions={setShowCommandSuggestions}
+              allNodes={allNodes}
+              onNodeAdd={onNodeAdd}
+              onNodeDelete={onNodeDelete}
+              StickerConfiguration={StickerConfiguration}
+              VoiceConfiguration={VoiceConfiguration}
+              AnimationConfiguration={AnimationConfiguration}
+              LocationCoordinatesSection={LocationCoordinatesSection}
+              LocationDetailsSection={LocationDetailsSection}
+              FoursquareIntegrationSection={FoursquareIntegrationSection}
+              MapServicesSection={MapServicesSection}
+              ContactConfiguration={ContactConfiguration}
+              ContentManagementConfiguration={ContentManagementConfiguration}
+              ForwardMessageConfiguration={ForwardMessageConfiguration}
+              CreateForumTopicConfiguration={CreateForumTopicConfiguration}
+              UserManagementConfiguration={UserManagementConfiguration}
+              AdminRightsInfo={AdminRightsInfo}
+            />
+          )}
+
+          {/* Broadcast Section - С‚РѕР»СЊРєРѕ РґР»СЏ СѓР·Р»Р° СЂР°СЃСЃС‹Р»РєР° */}
+          {selectedNode.type === 'broadcast' && (
+            <BroadcastNodeProperties
+              node={selectedNode}
+              onUpdate={onNodeUpdate}
+            />
+          )}
+
+          {/* Client Auth Section - С‚РѕР»СЊРєРѕ РґР»СЏ СѓР·Р»Р° Р°РІС‚РѕСЂРёР·Р°С†РёРё Client API */}
+          {selectedNode.type === 'client_auth' && (
+            <ClientAuthProperties
+              node={selectedNode}
+            />
+          )}
+
+          {/* Media Section - С‚РѕР»СЊРєРѕ РґР»СЏ РјРµРґРёР°-РЅРѕРґС‹ */}
+          {selectedNode.type === 'media' && (
+            <MediaNodeProperties
+              projectId={projectId}
+              selectedNode={selectedNode}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              onNodeUpdate={onNodeUpdate}
+            />
+          )}
+
+          {selectedNode.type === 'forward_message' && (
+            <div className="w-full bg-gradient-to-br from-orange-50/40 to-amber-50/20 dark:from-orange-950/30 dark:to-amber-900/20 rounded-xl p-3 sm:p-4 md:p-5 border border-orange-200/40 dark:border-orange-800/40 backdrop-blur-sm">
+              <SectionHeader
+                title="Переслать сообщение"
+                description="Настройки источника сообщения и чата назначения"
+                isOpen={isForwardMessageSectionOpen}
+                onToggle={() => setIsForwardMessageSectionOpen((prev) => !prev)}
+                icon="share"
+                iconGradient="from-orange-100 to-amber-100 dark:from-orange-900/50 dark:to-amber-900/50"
+                iconColor="text-orange-600 dark:text-orange-400"
+              />
+              {isForwardMessageSectionOpen && (
+                <div className="mt-3 sm:mt-4">
+                  <ForwardMessageConfiguration
+                    selectedNode={selectedNode}
+                    onNodeUpdate={onNodeUpdate}
+                    allNodes={allNodes}
+                    formatNodeDisplay={formatNodeDisplay}
+                    getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+
+          {selectedNode.type === 'create_forum_topic' && (
+            <div className="w-full bg-gradient-to-br from-teal-50/40 to-cyan-50/20 dark:from-teal-950/30 dark:to-cyan-900/20 rounded-xl p-3 sm:p-4 md:p-5 border border-teal-200/40 dark:border-teal-800/40 backdrop-blur-sm">
+              <SectionHeader
+                title="Создать топик"
+                description="Создание топика в форум-группе Telegram"
+                isOpen={true}
+                onToggle={() => {}}
+                icon="layer-group"
+                iconGradient="from-teal-100 to-cyan-100 dark:from-teal-900/50 dark:to-cyan-900/50"
+                iconColor="text-teal-600 dark:text-teal-400"
+              />
+              <div className="mt-3 sm:mt-4">
+                <CreateForumTopicConfiguration
+                  selectedNode={selectedNode}
+                  onNodeUpdate={onNodeUpdate}
+                  getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* HTTP Request Section */}
+          {(selectedNode.type as any) === 'http_request' && (
+            <div className="w-full bg-gradient-to-br from-cyan-50/40 to-blue-50/20 dark:from-cyan-950/30 dark:to-blue-900/20 rounded-xl p-3 sm:p-4 md:p-5 border border-cyan-200/40 dark:border-cyan-800/40 backdrop-blur-sm">
+              <SectionHeader
+                title="HTTP запрос"
+                description="Настройки запроса к внешнему API"
+                isOpen={true}
+                onToggle={() => {}}
+                icon="globe"
+                iconGradient="from-cyan-100 to-blue-100 dark:from-cyan-900/50 dark:to-blue-900/50"
+                iconColor="text-cyan-600 dark:text-cyan-400"
+              />
+              <div className="mt-3 sm:mt-4">
+                <HttpRequestConfiguration
+                  selectedNode={selectedNode}
+                  onNodeUpdate={onNodeUpdate}
+                />
+              </div>
+            </div>
+          )}
+
+          {(selectedNode.type as any) === 'api_response' && (
+            <div className="w-full bg-gradient-to-br from-violet-50/40 to-indigo-50/20 dark:from-violet-950/30 dark:to-indigo-900/20 rounded-xl p-3 sm:p-4 md:p-5 border border-violet-200/40 dark:border-violet-800/40 backdrop-blur-sm">
+              <SectionHeader
+                title="Ответ API"
+                description="HTTP-ответ на запрос API-триггера"
+                isOpen={true}
+                onToggle={() => {}}
+                icon="reply"
+                iconGradient="from-violet-100 to-indigo-100 dark:from-violet-900/50 dark:to-indigo-900/50"
+                iconColor="text-violet-600 dark:text-violet-400"
+              />
+              <div className="mt-3 sm:mt-4">
+                <ApiResponseConfiguration
+                  selectedNode={selectedNode}
+                  onUpdateNode={onNodeUpdate}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Get Managed Bot Token Section */}
+          {(selectedNode.type as any) === 'get_managed_bot_token' && (
+            <div className="w-full bg-gradient-to-br from-indigo-50/40 to-violet-50/20 dark:from-indigo-950/30 dark:to-violet-900/20 rounded-xl p-3 sm:p-4 md:p-5 border border-indigo-200/40 dark:border-indigo-800/40 backdrop-blur-sm">
+              <SectionHeader
+                title="Получить токен бота"
+                description="getManagedBotToken — Bot API 9.6"
+                isOpen={true}
+                onToggle={() => {}}
+                icon="key"
+                iconGradient="from-indigo-100 to-violet-100 dark:from-indigo-900/50 dark:to-violet-900/50"
+                iconColor="text-indigo-600 dark:text-indigo-400"
+              />
+              <div className="mt-3 sm:mt-4">
+                <GetManagedBotTokenConfiguration
+                  selectedNode={selectedNode}
+                  onNodeUpdate={onNodeUpdate}
+                  getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+                  formatNodeDisplay={formatNodeDisplay}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Answer Callback Query Section */}
+          {(selectedNode.type as any) === 'answer_callback_query' && (
+            <div className="w-full bg-gradient-to-br from-purple-50/40 to-violet-50/20 dark:from-purple-950/30 dark:to-violet-900/20 rounded-xl p-3 sm:p-4 md:p-5 border border-purple-200/40 dark:border-purple-800/40 backdrop-blur-sm">
+              <SectionHeader
+                title="Уведомление inline-кнопки"
+                description="answerCallbackQuery — уведомление после нажатия кнопки"
+                isOpen={true}
+                onToggle={() => {}}
+                icon="bell"
+                iconGradient="from-purple-100 to-violet-100 dark:from-purple-900/50 dark:to-violet-900/50"
+                iconColor="text-purple-600 dark:text-purple-400"
+              />
+              <div className="mt-3 sm:mt-4">
+                <AnswerCallbackQueryConfiguration
+                  selectedNode={selectedNode}
+                  onNodeUpdate={onNodeUpdate}
+                  getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Edit Message Section */}
+          {(selectedNode.type as any) === 'edit_message' && (
+            <EditMessageConfiguration
+              selectedNode={selectedNode}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              allNodes={allNodes}
+              formatNodeDisplay={formatNodeDisplay}
+            />
+          )}
+
+          {/* Delete Message Section */}
+          {(selectedNode.type as any) === 'delete_message' && (
+            <DeleteMessageConfiguration
+              selectedNode={selectedNode}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+            />
+          )}
+
+          {/* Kick User Section */}
+          {(selectedNode.type as any) === 'kick_user' && (
+            <KickUserConfiguration
+              selectedNode={selectedNode}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+            />
+          )}
+
+          {/* Set Variable Section */}
+          {(selectedNode.type as any) === 'set_variable' && (
+            <SetVariableConfiguration
+              selectedNode={selectedNode}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              formatNodeDisplay={formatNodeDisplay}
+              textVariables={textVariables as Variable[]}
+            />
+          )}
+
+          {/* Delay Section */}
+          {(selectedNode.type as any) === 'delay' && (
+            <DelayConfiguration selectedNode={selectedNode} onNodeUpdate={onNodeUpdate} textVariables={textVariables as Variable[]} />
+          )}
+
+          {/* Send Invoice Section */}
+          {(selectedNode.type as any) === 'send_invoice' && (
+            <SendInvoiceConfiguration
+              selectedNode={selectedNode}
+              projectId={projectId}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              formatNodeDisplay={formatNodeDisplay}
+              textVariables={textVariables as Variable[]}
+              envVariables={envVariablesForNode}
+            />
+          )}
+
+          {(selectedNode.type as any) === 'create_invoice_link' && (
+            <CreateInvoiceLinkConfiguration
+              selectedNode={selectedNode}
+              projectId={projectId}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              formatNodeDisplay={formatNodeDisplay}
+              textVariables={textVariables as Variable[]}
+              envVariables={envVariablesForNode}
+            />
+          )}
+
+          {/* Refund Stars Section */}
+          {(selectedNode.type as any) === 'refund_stars' && (
+            <RefundStarsConfiguration
+              selectedNode={selectedNode}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              formatNodeDisplay={formatNodeDisplay}
+              textVariables={textVariables as Variable[]}
+            />
+          )}
+
+          {(selectedNode.type as any) === 'edit_star_subscription' && (
+            <EditStarSubscriptionConfiguration
+              selectedNode={selectedNode}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              formatNodeDisplay={formatNodeDisplay}
+              textVariables={textVariables as Variable[]}
+            />
+          )}
+
+          {(selectedNode.type as any) === 'get_star_balance' && (
+            <GetStarBalanceConfiguration
+              selectedNode={selectedNode}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              formatNodeDisplay={formatNodeDisplay}
+              textVariables={textVariables as Variable[]}
+            />
+          )}
+
+          {(selectedNode.type as any) === 'stop_processing' && (
+            <StopProcessingConfiguration selectedNode={selectedNode} />
+          )}
+
+          {(selectedNode.type as any) === 'rate_counter' && (
+            <RateCounterConfiguration
+              selectedNode={selectedNode}
+              onNodeUpdate={onNodeUpdate}
+              textVariables={textVariables as Variable[]}
+            />
+          )}
+
+          {/* Code Section */}
+          {(selectedNode.type as any) === 'code' && (
+            <CodeConfiguration
+              selectedNode={selectedNode}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              formatNodeDisplay={formatNodeDisplay}
+            />
+          )}
+
+          {/* Comment Section */}
+          {(selectedNode.type as any) === 'comment' && (
+            <CommentConfiguration selectedNode={selectedNode} onNodeUpdate={onNodeUpdate} />
+          )}
+
+          {/* SQL Query Section */}
+          {(selectedNode.type as any) === 'psql_query' && (
+            <div className="w-full bg-gradient-to-br from-violet-50/40 to-purple-50/20 dark:from-violet-950/30 dark:to-purple-900/20 rounded-xl p-3 sm:p-4 md:p-5 border border-violet-200/40 dark:border-violet-800/40 backdrop-blur-sm">
+              <PsqlQueryConfiguration
+                selectedNode={selectedNode}
+                onNodeUpdate={onNodeUpdate}
+                getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+                formatNodeDisplay={formatNodeDisplay}
+                textVariables={textVariables as Variable[]}
+                envVariables={envVariablesForNode}
+              />
+            </div>
+          )}
+
+          {/* Convert File Section */}
+          {(selectedNode.type as any) === 'convert_file' && (
+            <div className="w-full bg-gradient-to-br from-emerald-50/40 to-teal-50/20 dark:from-emerald-950/30 dark:to-teal-900/20 rounded-xl p-3 sm:p-4 md:p-5 border border-emerald-200/40 dark:border-emerald-800/40 backdrop-blur-sm">
+              <ConvertFileConfiguration
+                selectedNode={selectedNode}
+                onNodeUpdate={onNodeUpdate}
+                getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+                formatNodeDisplay={formatNodeDisplay}
+                textVariables={textVariables as Variable[]}
+              />
+            </div>
+          )}
+
+          {/* Loop Section */}
+          {(selectedNode.type as any) === 'loop' && (
+            <LoopConfiguration
+              selectedNode={selectedNode}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+            />
+          )}
+
+          {/* Bot Table Section */}
+          {(selectedNode.type as any) === 'bot_table' && (
+            <div className="w-full bg-gradient-to-br from-amber-50/40 to-yellow-50/20 dark:from-amber-950/30 dark:to-yellow-900/20 rounded-xl p-3 sm:p-4 md:p-5 border border-amber-200/40 dark:border-amber-800/40 backdrop-blur-sm">
+              <BotTableConfiguration
+                selectedNode={selectedNode}
+                projectId={projectId}
+                onNodeUpdate={onNodeUpdate}
+                getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+                formatNodeDisplay={formatNodeDisplay}
+                textVariables={textVariables as Variable[]}
+              />
+            </div>
+          )}
+
+          {/* Userbot Message Section */}
+          {(selectedNode.type as any) === 'userbot_message' && (
+            <UserbotMessageConfiguration
+              selectedNode={selectedNode}
+              allNodes={allNodes}
+              availableVariables={textVariables}
+              projectId={projectId}
+              onNodeUpdate={onNodeUpdate}
+            />
+          )}
+
+          {/* Userbot Click Button Section */}
+          {(selectedNode.type as any) === 'userbot_click_button' && (
+            <UserbotClickButtonConfiguration
+              selectedNode={selectedNode}
+              allNodes={allNodes}
+              availableVariables={textVariables}
+              onNodeUpdate={onNodeUpdate}
+            />
+          )}
+
+          {/* Userbot Inline Query Section */}
+          {(selectedNode.type as any) === 'userbot_inline_query' && (
+            <UserbotInlineQueryConfiguration
+              selectedNode={selectedNode}
+              allNodes={allNodes}
+              availableVariables={textVariables}
+              onNodeUpdate={onNodeUpdate}
+            />
+          )}
+
+          {/* Trigger Section - С‚РѕР»СЊРєРѕ РґР»СЏ СѓР·Р»РѕРІ-С‚СЂРёРіРіРµСЂРѕРІ */}
+          {isTriggerNode(selectedNode.type) && selectedNode.type === 'command_trigger' && (
+            <CommandTriggerConfiguration
+              selectedNode={selectedNode}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              formatNodeDisplay={formatNodeDisplay}
+              textVariables={textVariables as Variable[]}
+            />
+          )}
+          {isTriggerNode(selectedNode.type) && selectedNode.type === 'text_trigger' && (
+            <TextTriggerConfiguration
+              selectedNode={selectedNode}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              formatNodeDisplay={formatNodeDisplay}
+            />
+          )}
+          {isTriggerNode(selectedNode.type) && selectedNode.type === 'incoming_message_trigger' && (
+            <AnyMessageTriggerConfiguration
+              selectedNode={selectedNode}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+            />
+          )}
+          {isTriggerNode(selectedNode.type) && selectedNode.type === 'group_message_trigger' && (
+            <GroupMessageTriggerConfiguration
+              selectedNode={selectedNode}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+            />
+          )}
+          {isTriggerNode(selectedNode.type) && (selectedNode.type as any) === 'callback_trigger' && (
+            <CallbackTriggerConfiguration
+              selectedNode={selectedNode}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              formatNodeDisplay={formatNodeDisplay}
+            />
+          )}
+          {isTriggerNode(selectedNode.type) && (selectedNode.type as any) === 'incoming_callback_trigger' && (
+            <IncomingCallbackTriggerConfiguration
+              selectedNode={selectedNode}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              formatNodeDisplay={formatNodeDisplay}
+            />
+          )}
+          {isTriggerNode(selectedNode.type) && (selectedNode.type as any) === 'outgoing_message_trigger' && (
+            <OutgoingMessageTriggerConfiguration
+              selectedNode={selectedNode}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              formatNodeDisplay={formatNodeDisplay}
+            />
+          )}
+          {isTriggerNode(selectedNode.type) && (selectedNode.type as any) === 'managed_bot_updated_trigger' && (
+            <ManagedBotUpdatedTriggerConfiguration
+              selectedNode={selectedNode}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              formatNodeDisplay={formatNodeDisplay}
+            />
+          )}
+          {isTriggerNode(selectedNode.type) && (selectedNode.type as any) === 'successful_payment_trigger' && (
+            <SuccessfulPaymentTriggerConfiguration
+              selectedNode={selectedNode}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              formatNodeDisplay={formatNodeDisplay}
+            />
+          )}
+          {isTriggerNode(selectedNode.type) && (selectedNode.type as any) === 'schedule_trigger' && (
+            <ScheduleTriggerConfiguration
+              selectedNode={selectedNode}
+              onUpdateNode={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              formatNodeDisplay={formatNodeDisplay}
+            />
+          )}
+          {isTriggerNode(selectedNode.type) && (selectedNode.type as any) === 'api_trigger' && (
+            <ApiTriggerConfiguration
+              selectedNode={selectedNode}
+              projectId={projectId}
+              onUpdateNode={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              formatNodeDisplay={formatNodeDisplay}
+            />
+          )}
+          {isTriggerNode(selectedNode.type) && (selectedNode.type as any) === 'userbot_edit_trigger' && (
+            <UserbotEditTriggerConfiguration
+              selectedNode={selectedNode}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              formatNodeDisplay={formatNodeDisplay}
+            />
+          )}
+
+          {/* Condition Section вЂ” С‚РѕР»СЊРєРѕ РґР»СЏ СѓР·Р»Р° СѓСЃР»РѕРІРёСЏ */}
+          {isConditionNode(selectedNode.type) && (
+            <ConditionNodeConfiguration
+              selectedNode={selectedNode}
+              allNodes={allNodes}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              textVariables={textVariables as Variable[]}
+              onNodeUpdate={onNodeUpdate}
+            />
+          )}
+
+          {/* Parallel Split Section — только для узла параллельного запуска */}
+          {(selectedNode.type as any) === 'parallel_split' && (
+            <ParallelSplitConfiguration
+              selectedNode={selectedNode}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              onNodeUpdate={onNodeUpdate}
+            />
+          )}
+
+          {/* Message Content - скрыто для узлов управления, триггеров, условия и медиа-нодов */}
+          {!isManagementNode(selectedNode.type) && !isTriggerNode(selectedNode.type) && !isConditionNode(selectedNode.type) && selectedNode.type !== 'media' && (selectedNode.type as any) !== 'http_request' && (selectedNode.type as any) !== 'api_response' && (selectedNode.type as any) !== 'get_managed_bot_token' && (selectedNode.type as any) !== 'answer_callback_query' && (selectedNode.type as any) !== 'edit_message' && (selectedNode.type as any) !== 'set_variable' && (
+            <MessageContentSection
+              selectedNode={selectedNode}
+              allNodes={allNodes}
+              textVariables={textVariables}
+              mediaVariables={mediaVariables}
+              attachedMediaVariables={attachedMediaVariables}
+              isMessageTextOpen={isMessageTextOpen}
+              isMediaSectionOpen={isMediaSectionOpen}
+              onMessageTextToggle={() => setIsMessageTextOpen(!isMessageTextOpen)}
+              onMediaSectionToggle={() => setIsMediaSectionOpen(!isMediaSectionOpen)}
+              onNodeUpdate={onNodeUpdate}
+              onMediaVariableRemove={handleMediaVariableRemove}
+              onMediaVariableSelect={handleMediaVariableSelect}
+              projectId={projectId}
+            />
+          )}
+          {/* Media File Section - скрыто для узлов управления, триггеров, условия и медиа-нодов */}
+          {!isManagementNode(selectedNode.type) && !isTriggerNode(selectedNode.type) && !isConditionNode(selectedNode.type) && selectedNode.type !== 'media' && (selectedNode.type as any) !== 'http_request' && (selectedNode.type as any) !== 'api_response' && (selectedNode.type as any) !== 'get_managed_bot_token' && (selectedNode.type as any) !== 'answer_callback_query' && (selectedNode.type as any) !== 'edit_message' && (selectedNode.type as any) !== 'set_variable' && (
+            <MediaFileSection
+              projectId={projectId}
+              selectedNode={selectedNode}
+              isOpen={isMediaSectionOpen}
+              onToggle={() => setIsMediaSectionOpen(!isMediaSectionOpen)}
+              onNodeUpdate={onNodeUpdate}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+            />
+          )}
+
+          {/* Keyboard Section - скрыто для узлов управления, триггеров, условия и медиа-нодов */}
+          {selectedNode.type !== 'message' && !isManagementNode(selectedNode.type) && !isTriggerNode(selectedNode.type) && !isConditionNode(selectedNode.type) && selectedNode.type !== 'media' && (selectedNode.type as any) !== 'http_request' && (selectedNode.type as any) !== 'api_response' && (selectedNode.type as any) !== 'get_managed_bot_token' && (selectedNode.type as any) !== 'answer_callback_query' && (selectedNode.type as any) !== 'edit_message' && (selectedNode.type as any) !== 'set_variable' && (
+            <div className="w-full bg-gradient-to-br from-amber-50/40 to-yellow-50/20 dark:from-amber-950/30 dark:to-yellow-900/20 rounded-xl p-3 sm:p-4 md:p-5 border border-amber-200/40 dark:border-amber-800/40 backdrop-blur-sm">
+              <KeyboardSectionHeader
+                selectedNode={selectedNode}
+                isOpen={isKeyboardSectionOpen}
+                onToggle={() => setIsKeyboardSectionOpen(!isKeyboardSectionOpen)}
+              />
+
+              {/* РџРµСЂРµРєР»СЋС‡Р°С‚РµР»Рё С‚РёРїР° РєР»Р°РІРёР°С‚СѓСЂС‹ - РІСЃРµРіРґР° РІРёРґРЅС‹ */}
+              <KeyboardTypeSelector
+                selectedNode={selectedNode}
+                onNodeUpdate={onNodeUpdate}
+                onToggle={() => setIsKeyboardSectionOpen(true)}
+              />
+
+              {selectedNode.data.attachedMedia && selectedNode.data.attachedMedia.length > 1 && 
+               (selectedNode.data.keyboardType === 'inline' || selectedNode.data.keyboardType === 'reply') && (
+                <div className="mt-2">
+                  <InfoBlock
+                    variant="info"
+                    title="При включении клавиатуры"
+                    description="Только первый файл будет отображаться и отправляться. Остальные файлы сохранятся. Нажмите «Включить все файлы», чтобы использовать все медиа, но клавиатура при этом отключится."
+                  />
+                </div>
+              )}
+
+              {isKeyboardSectionOpen && (
+                <div className="space-y-3 sm:space-y-4">
+                  {selectedNode.data.keyboardType !== 'none' && (
+                    <>
+                      {/* РњРЅРѕР¶РµСЃС‚РІРµРЅРЅС‹Р№ РІС‹Р±РѕСЂ */}
+                      <div className="p-2.5 sm:p-3 md:p-4 rounded-lg sm:rounded-xl bg-gradient-to-br from-blue-50/40 to-cyan-50/30 dark:from-blue-950/20 dark:to-cyan-950/10 border border-blue-200/40 dark:border-blue-800/30">
+                        <MultipleSelectionSettings
+                          selectedNode={selectedNode}
+                          keyboardType={selectedNode.data.keyboardType as 'inline' | 'reply'}
+                          onNodeUpdate={onNodeUpdate}
+                        />
+                      </div>
+
+                      {/* Перемешивание кнопок — только для inline с >1 кнопкой */}
+                      {selectedNode.data.keyboardType === 'inline' && (selectedNode.data.buttons?.length ?? 0) > 1 && (
+                        <PropertyCheckbox
+                          id="shuffleButtonsLegacy"
+                          label="🔀 Перемешивать кнопки при каждом показе"
+                          checked={selectedNode.data.shuffleButtons || false}
+                          onChange={(checked) => onNodeUpdate(selectedNode.id, { shuffleButtons: checked })}
+                        />
+                      )}
+
+                      {/* РљРЅРѕРїРєРё РґРѕР±Р°РІР»РµРЅРёСЏ */}
+                      <KeyboardButtonsSection
+                        selectedNode={selectedNode}
+                        onButtonAdd={onButtonAdd}
+                      />
+
+                      {/* РЎРїРёСЃРѕРє РєРЅРѕРїРѕРє */}
+                      {selectedNode.data.buttons && selectedNode.data.buttons.length > 0 && (
+                        <div className="space-y-3">
+                          {(selectedNode.data.buttons || []).map((button) => (
+                            <ButtonCard
+                              key={button.id}
+                              nodeId={selectedNode.id}
+                              button={button}
+                              textVariables={textVariables}
+                              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+                              onButtonUpdate={onButtonUpdate}
+                              onButtonDelete={onButtonDelete}
+                              onButtonDuplicate={handleDuplicateButton}
+                              selectedNode={selectedNode}
+                              keyboardType={selectedNode.data.keyboardType as string}
+                            />
+                          ))}
+                        </div>
+                      )}
+                    </>
+                  )}
+
+                  {selectedNode.data.keyboardType !== 'none' && selectedNode.data.buttons && selectedNode.data.buttons.length > 0 && (
+                    <KeyboardLayoutEditor
+                      buttons={(() => {
+                        // Р”РѕР±Р°РІР»СЏРµРј РІРёСЂС‚СѓР°Р»СЊРЅСѓСЋ РєРЅРѕРїРєСѓ "Р“РѕС‚РѕРІРѕ" РґР»СЏ РѕС‚РѕР±СЂР°Р¶РµРЅРёСЏ
+                        const allButtons = [...selectedNode.data.buttons];
+                        if (selectedNode.data.allowMultipleSelection) {
+                          const hasCompleteButton = allButtons.some((b: any) => b.action === 'complete');
+                          if (!hasCompleteButton) {
+                            allButtons.push({
+                              id: 'done-button',
+                              text: 'вњ… Р“РѕС‚РѕРІРѕ',
+                              action: 'complete' as const,
+                              target: '',
+                              buttonType: 'complete' as const,
+                              skipDataCollection: false,
+                              hideAfterClick: false
+                            });
+                          }
+                        }
+                        return allButtons;
+                      })()}
+                      initialLayout={(() => {
+                        // Р•СЃР»Рё РµСЃС‚СЊ РјРЅРѕР¶РµСЃС‚РІРµРЅРЅС‹Р№ РІС‹Р±РѕСЂ Рё РЅРµС‚ РєРЅРѕРїРєРё complete, РґРѕР±Р°РІР»СЏРµРј done-button РІ layout
+                        const layout = selectedNode.data.keyboardLayout;
+                        if (!layout) return undefined;
+
+                        if (selectedNode.data.allowMultipleSelection) {
+                          const hasCompleteButton = selectedNode.data.buttons.some((b: any) => b.action === 'complete');
+                          if (!hasCompleteButton) {
+                            // Р”РѕР±Р°РІР»СЏРµРј done-button РІ РїРѕСЃР»РµРґРЅРёР№ СЂСЏРґ РёР»Рё СЃРѕР·РґР°С‘Рј РЅРѕРІС‹Р№
+                            const layoutWithDone = { ...layout };
+                            const allButtonIds = layoutWithDone.rows.flatMap(r => r.buttonIds);
+
+                            // Р•СЃР»Рё done-button СѓР¶Рµ РµСЃС‚СЊ РІ layout, РЅРµ РґРѕР±Р°РІР»СЏРµРј
+                            if (!allButtonIds.includes('done-button')) {
+                              if (layout.autoLayout) {
+                                // Р’ Р°РІС‚Рѕ-СЂРµР¶РёРјРµ РїСЂРѕСЃС‚Рѕ РґРѕР±Р°РІР»СЏРµРј РІ РєРѕРЅРµС†
+                                const lastRow = layoutWithDone.rows[layoutWithDone.rows.length - 1];
+                                if (lastRow && lastRow.buttonIds.length < layout.columns) {
+                                  lastRow.buttonIds.push('done-button');
+                                } else {
+                                  layoutWithDone.rows.push({ buttonIds: ['done-button'] });
+                                }
+                              } else {
+                                // Р’ СЂСѓС‡РЅРѕРј СЂРµР¶РёРјРµ РґРѕР±Р°РІР»СЏРµРј РІ РѕС‚РґРµР»СЊРЅС‹Р№ СЂСЏРґ
+                                layoutWithDone.rows.push({ buttonIds: ['done-button'] });
+                              }
+                            }
+
+                            return layoutWithDone;
+                          }
+                        }
+
+                        return layout;
+                      })()}
+                      onLayoutChange={(layout) => {
+                        // РЎРѕС…СЂР°РЅСЏРµРј layout СЃ done-button, С‡С‚РѕР±С‹ РѕРЅ РѕС‚РѕР±СЂР°Р¶Р°Р»СЃСЏ РЅР° РєР°РЅРІР°СЃРµ
+                        onNodeUpdate(selectedNode.id, { keyboardLayout: layout });
+                      }}
+                    />
+                  )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Universal User Input Collection - скрыто для узлов управления, триггеров, условия и медиа-нодов */}
+          {!isManagementNode(selectedNode.type) && !isTriggerNode(selectedNode.type) && !isConditionNode(selectedNode.type) && selectedNode.type !== 'media' && (selectedNode.type as any) !== 'http_request' && (selectedNode.type as any) !== 'api_response' && (selectedNode.type as any) !== 'get_managed_bot_token' && (selectedNode.type as any) !== 'answer_callback_query' && (selectedNode.type as any) !== 'edit_message' && (selectedNode.type as any) !== 'set_variable' && (
+            <UserInputSettingsSection
+              selectedNode={selectedNode}
+              getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+              isOpen={isUserInputSectionOpen}
+              onToggle={() => setIsUserInputSectionOpen((prev) => !prev)}
+              onNodeUpdate={onNodeUpdate}
+              formatNodeDisplay={formatNodeDisplay}
+              onNodeAdd={onNodeAdd}
+            />
+          )}
+
+        {/* Р Р°СЃС€РёСЂРµРЅРЅС‹Рµ РЅР°СЃС‚СЂРѕР№РєРё */}
+        <CommandAdvancedSettingsWrapper
+          selectedNode={selectedNode}
+          onNodeUpdate={onNodeUpdate}
+          isOpen={isAdvancedSettingsOpen}
+          onToggle={() => setIsAdvancedSettingsOpen(!isAdvancedSettingsOpen)}
+        />
+
+        </div>
+        )}
+      </div>
+
+      <PropertiesFooterWrapper
+          selectedNode={selectedNode}
+          onNodeUpdate={onNodeUpdate}
+          onActionLog={onActionLog}
+          onSaveProject={onSaveProject}
+          {...headerFooterProps}
+        />
+      </aside>
+    );
+  }
+
+
+
+
+

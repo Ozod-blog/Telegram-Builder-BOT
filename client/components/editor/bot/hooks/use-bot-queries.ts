@@ -1,0 +1,144 @@
+/**
+ * @fileoverview Хук для запросов данных ботов
+ *
+ * Инкапсулирует все useQuery/useQueries вызовы для панели управления ботами:
+ * - Список проектов
+ * - Токены по каждому проекту
+ * - Статусы ботов одним запросом на проект (`GET …/bot/statuses`)
+ * - Информация о ботах (getMe) по каждому проекту
+ *
+ * Важно: allTokens НЕ фильтруется — индексы сохраняются в соответствии с projects,
+ * иначе токены отображались бы под неправильными проектами (botUsername и др. поля
+ * не совпадали бы с нужным ботом).
+ *
+ * @module use-bot-queries
+ */
+
+import { useMemo } from 'react';
+import { useQuery, useQueries } from '@tanstack/react-query';
+import { apiRequest } from '@/queryClient';
+import { type BotProject, BotToken } from '@shared/schema';
+import type { BotStatusResponse } from '../bot-types';
+import type { BotInfo } from '../bot-types';
+import { useTelegramAuth } from '@/components/editor/header/hooks/use-telegram-auth';
+import { isTelegramUser } from '@/types/telegram-user';
+import { projectBotStatusesQueryKey } from '../project-bot-statuses-query';
+
+/**
+ * Результат хука запросов ботов
+ */
+export interface BotQueriesResult {
+  /** Список проектов */
+  projects: BotProject[];
+  /** Загружаются ли проекты */
+  projectsLoading: boolean;
+  /** Токены по каждому проекту (индекс совпадает с projects) */
+  allTokens: BotToken[][];
+  /** Все токены в плоском массиве с projectId */
+  allTokensFlat: (BotToken & { projectId: number })[];
+  /** Статусы ботов */
+  allBotStatuses: BotStatusResponse[];
+  /** Информация о ботах из Telegram API */
+  allBotInfos: (BotInfo | undefined)[];
+  /** Функции для ручного обновления статусов */
+  refetchStatuses: () => void;
+}
+
+/**
+ * Опции хука запросов ботов
+ */
+export interface UseBotQueriesOptions {
+  /**
+   * Грузить GET …/bot/info (Telegram getMe) по каждому проекту.
+   * false — только проекты, токены и статусы (терминалы, авторегистрация).
+   */
+  includeBotInfo?: boolean;
+}
+
+/**
+ * Хук для получения всех данных ботов
+ * @param options - Опции: нужен ли getMe по всем проектам
+ * @returns Проекты, токены, статусы и (опционально) профили ботов
+ */
+export function useBotQueries(options?: UseBotQueriesOptions): BotQueriesResult {
+  const includeBotInfo = options?.includeBotInfo !== false;
+  const { user } = useTelegramAuth();
+  const userId = user && isTelegramUser(user) ? user.id : 'anon';
+
+  const { data: projects = [], isLoading: projectsLoading } = useQuery<BotProject[]>({
+    queryKey: ['/api/projects', userId],
+    queryFn: () => apiRequest('GET', '/api/projects'),
+  });
+
+  const tokensResults = useQueries({
+    queries: projects.map(project => ({
+      queryKey: [`/api/projects/${project.id}/tokens`],
+      queryFn: () => apiRequest('GET', `/api/projects/${project.id}/tokens`),
+      enabled: projects.length > 0,
+      staleTime: 0,
+    })),
+  });
+
+  /**
+   * Токены по каждому проекту — индекс совпадает с projects.
+   * Фильтрация пустых массивов убрана намеренно: она сдвигала индексы
+   * и приводила к тому, что токены одного проекта отображались под другим,
+   * а поля (botUsername и др.) не совпадали с нужным проектом.
+   */
+  const allTokens: BotToken[][] = tokensResults.map(q =>
+    Array.isArray(q.data) ? (q.data as BotToken[]) : [],
+  );
+
+  const allTokensFlat = useMemo(
+    () =>
+      allTokens.flatMap((tokens, idx) =>
+        tokens.map(token => ({ ...token, projectId: projects[idx]?.id })),
+      ),
+    [allTokens, projects],
+  );
+
+  const statusResults = useQueries({
+    queries: projects.map((project) => ({
+      queryKey: projectBotStatusesQueryKey(project.id),
+      queryFn: () =>
+        apiRequest('GET', `/api/projects/${project.id}/bot/statuses`) as Promise<{
+          statuses: BotStatusResponse[];
+        }>,
+      enabled: projects.length > 0,
+      staleTime: 0,
+    })),
+  });
+
+  const allBotStatuses = statusResults.flatMap((q) => q.data?.statuses ?? []);
+
+  const botInfoResults = useQueries({
+    queries: projects.map((project, idx) => ({
+      queryKey: [`/api/projects/${project.id}/bot/info`],
+      queryFn: () => apiRequest('GET', `/api/projects/${project.id}/bot/info`),
+      enabled: includeBotInfo && projects.length > 0 && allTokens[idx].length > 0,
+      refetchInterval:
+        includeBotInfo && allBotStatuses.some(s => s?.status === 'running') ? 60000 : false,
+      refetchIntervalInBackground: false,
+      staleTime: 30000,
+      // Сохраняем предыдущие данные при рефетче — аватарки не мигают
+      placeholderData: (prev: BotInfo | undefined) => prev,
+    })),
+  });
+
+  // Не фильтруем undefined — сохраняем индексы в соответствии с projects
+  const allBotInfos = botInfoResults.map(q => q.data ?? undefined) as (BotInfo | undefined)[];
+
+  const refetchStatuses = () => {
+    statusResults.forEach(q => q.refetch());
+  };
+
+  return {
+    projects,
+    projectsLoading,
+    allTokens,
+    allTokensFlat,
+    allBotStatuses,
+    allBotInfos,
+    refetchStatuses,
+  };
+}

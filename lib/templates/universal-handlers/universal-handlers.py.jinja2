@@ -1,0 +1,72 @@
+{#
+  Универсальные обработчики
+
+  @fileoverview Fallback обработчики для необработанных сообщений и callback_query.
+               Fallback @dp.callback_query() обязателен — без него aiogram 3 не запускает
+               middleware (incoming_callback_trigger) для callback'ов, не совпадающих
+               ни с одним зарегистрированным фильтром, и логирует "Update is not handled".
+  @param {boolean} userDatabaseEnabled - Включена ли база данных пользователей
+  @param {array}   nodes               - Все узлы бота
+  @param {array}   commandNodes        - Узлы с командами (start/command)
+  @param {boolean} hasUrlButtons       - Есть ли URL кнопки в проекте
+  @param {array}   allNodeIds          - Все ID узлов
+  @param {boolean} generateCatchAll - Генерировать catch-all обработчики
+  @param {boolean} hasInputCollection - Есть ли сбор пользовательского ввода
+  @param {boolean} hasInputTimeoutNodes - Нужны ли утилиты таймаута/form_session
+#}
+
+{% set indentLevel = '    ' %}
+
+{% if hasInputCollection %}
+@dp.message(Command("cancel"))
+async def handle_cancel_input_form(message: types.Message):
+    """Общая отмена многошаговой формы: сброс ожидания ввода и промежуточных переменных."""
+    user_id = message.from_user.id
+    if user_id not in user_data or "waiting_for_input" not in user_data.get(user_id, {}):
+        return
+    await _clear_form_session(user_id)
+    await message.answer("Форма отменена.")
+
+{% endif %}
+
+@dp.message(F.text)
+async def fallback_text_handler(message: types.Message):
+    """
+    Fallback обработчик для всех текстовых сообщений без специфичного обработчика.
+    """
+    user_id = message.from_user.id
+    user_text = message.text
+{% include 'handle-user-input/handle-user-input.py.jinja2' %}
+    if not (user_id in user_data and "waiting_for_input" in user_data.get(user_id, {})):
+        if not user_data.get(user_id, {}).get("_imt_handled"):
+            logging.info(f"📩 Получено необработанное текстовое сообщение от {message.from_user.id}: {message.text}")
+
+{% if generateCatchAll %}
+@dp.message(F.photo)
+async def handle_unhandled_photo(message: types.Message):
+    """
+    Обрабатывает фотографии, которые не были обработаны другими обработчиками.
+    """
+    logging.info(f"📸 Получено фото от пользователя {message.from_user.id}")
+
+
+@dp.message()
+async def handle_unhandled_message(message: types.Message):
+    """
+    Catch-all обработчик для всех остальных типов сообщений (стикеры, голосовые, видео и т.д.).
+    Нужен чтобы middleware (incoming_message_trigger) срабатывал на любой тип сообщения.
+    """
+    logging.info(f"📨 Получено необработанное сообщение от {message.from_user.id} (тип: {message.content_type})")
+
+
+@dp.callback_query()
+async def fallback_callback_handler(callback_query: types.CallbackQuery, state: FSMContext = None):
+    """
+    Catch-all обработчик для всех callback_query без специфичного обработчика.
+    Обязателен для корректной работы middleware (incoming_callback_trigger):
+    в aiogram 3 middleware запускается только если есть хотя бы один подходящий handler.
+    Без этого обработчика динамические кнопки (project_42, project_123 и т.д.)
+    не обрабатываются и aiogram логирует "Update is not handled".
+    """
+    logging.info(f"📲 Получен необработанный callback от {callback_query.from_user.id}: {callback_query.data}")
+{% endif %}

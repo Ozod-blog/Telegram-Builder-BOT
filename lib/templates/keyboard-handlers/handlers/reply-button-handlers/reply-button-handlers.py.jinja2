@@ -1,0 +1,66 @@
+{#
+  Шаблон генерации обработчиков reply кнопок
+  @param {array} nodes - Все узлы
+  @param {string} indentLevel - Уровень отступа
+#}
+{%- set indent = indentLevel or '' -%}
+{%- set processedReplyButtons = [] -%}
+{%- set hasAnyReply = false -%}
+{%- set hasMultiSelect = false -%}
+{%- for node in nodes -%}
+{%- if node.data and node.data.keyboardType == 'reply' and node.data.buttons -%}
+{%- set hasAnyReply = true -%}
+{%- if node.data.allowMultipleSelection == true -%}
+{%- set hasMultiSelect = true -%}
+{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if hasAnyReply -%}
+{%- for node in nodes -%}
+{%- if node.data and node.data.keyboardType == 'reply' and node.data.buttons -%}
+{%- for button in node.data.buttons -%}
+{%- if button.text and button.action == 'goto' and button.target -%}
+{%- if button.text not in processedReplyButtons -%}
+{%- set _ = processedReplyButtons.push(button.text) -%}
+{%- set targetNode = none -%}
+{%- for n in nodes -%}{%- if n.id == button.target -%}{%- set targetNode = n -%}{%- endif -%}{%- endfor -%}
+{%- if targetNode %}
+
+{{ indent }}@dp.message(lambda message: message.text == "{{ button.text }}")
+{{ indent }}async def handle_reply_{{ button.id | safe_name }}(message: types.Message):
+{{ indent }}    user_id = message.from_user.id
+{{ indent }}    if user_id in user_data and "multi_select_node" in user_data[user_id] and user_data[user_id].get("multi_select_type") == "reply":
+{%- if hasMultiSelect %}
+{{ indent }}        await handle_multi_select_reply(message)
+{{ indent }}        return
+{%- endif %}
+{{ indent }}        user_data[user_id].pop("multi_select_node", None)
+{{ indent }}        user_data[user_id].pop("multi_select_type", None)
+{{ indent }}    if user_id not in user_data:
+{{ indent }}        user_data[user_id] = {}
+{{ indent }}    user_data[user_id]["last_node_id"] = "{{ targetNode.id }}"
+{%- if targetNode.type == 'command' and targetNode.data and targetNode.data.command %}
+{{ indent }}    await handle_command_{{ targetNode.data.command | safe_name }}(message)
+{%- else %}
+{{ indent }}    fake_callback = SimpleNamespace(
+{{ indent }}        id="reply_nav",
+{{ indent }}        from_user=message.from_user,
+{{ indent }}        chat_instance="",
+{{ indent }}        data="{{ targetNode.id }}",
+{{ indent }}        message=message,
+{{ indent }}        answer=lambda *args, **kwargs: asyncio.sleep(0)
+{{ indent }}    )
+{{ indent }}    await handle_callback_{{ targetNode.id | safe_name }}(fake_callback, state=None)
+{%- endif %}
+{%- endif -%}
+{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if hasMultiSelect %}
+
+{{ indent }}# Обработчик для reply кнопок множественного выбора
+{{ indent }}# multi_select_node и multi_select_type управляются в handle_multi_select_reply
+{%- endif -%}
+{%- endif -%}

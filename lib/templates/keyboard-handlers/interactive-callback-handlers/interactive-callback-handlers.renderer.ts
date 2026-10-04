@@ -1,0 +1,195 @@
+/**
+ * @fileoverview Renderer для шаблона interactive-callback-handlers
+ *
+ * Заменяет generateInteractiveCallbackHandlersWithConditionalMessagesMultiSelectAndAutoNavigation
+ * из bot-generator/transitions/generate-interactive-callback-handlers.ts
+ *
+ * @module templates/interactive-callback-handlers/interactive-callback-handlers.renderer
+ */
+
+import type { InteractiveCallbackHandlersTemplateParams } from './interactive-callback-handlers.params';
+import { generateCallbackHandlerInit, buildCallbackHandlerInitParams } from '../../callback-handler-init';
+import { generateAutoTransition } from '../../auto-transition';
+import { calculateAutoTransitionTarget } from '../../auto-transition';
+import { generateAttachedMediaVars } from '../../attached-media-vars';
+import { isLoggingEnabled } from '../../../bot-generator/core/logging';
+
+const NODE_TYPES_WITH_DEDICATED_HANDLERS = new Set<string>([
+  'message',
+  'input',
+  'keyboard',
+  'media',
+  'get_managed_bot_token',
+  'command_trigger',
+  'text_trigger',
+  'callback_trigger',
+  'condition',
+  'forward_message',
+  'create_forum_topic', // собственный обработчик генерируется шаблоном create-forum-topic.py.jinja2
+  'http_request', // собственный обработчик генерируется шаблоном http-request.py.jinja2
+  'group_message_trigger', // собственный обработчик генерируется шаблоном group-message-trigger.py.jinja2
+  'member_trigger', // собственный обработчик генерируется шаблоном member-trigger.py.jinja2
+  'set_variable', // собственный обработчик генерируется шаблоном set-variable.py.jinja2
+  'psql_query', // собственный обработчик генерируется шаблоном psql-query.py.jinja2
+  'convert_file', // собственный обработчик генерируется шаблоном convert-file.py.jinja2
+  'loop', // собственный обработчик генерируется шаблоном loop.py.jinja2
+  'parallel_split', // собственный обработчик генерируется шаблоном parallel-split.py.jinja2
+  'schedule_trigger', // собственный обработчик генерируется шаблоном schedule-trigger.py.jinja2
+  'api_trigger', // HTTP-роуты в api-trigger.py.jinja2
+  'api_response', // api-response.py.jinja2
+  'answer_callback_query', // собственный обработчик генерируется шаблоном answer-callback-query.py.jinja2
+  'bot_table', // собственный обработчик генерируется шаблоном bot-table.py.jinja2
+  'delay', // собственный обработчик генерируется шаблоном delay.py.jinja2
+  'send_invoice', // собственный обработчик генерируется шаблоном send-invoice.py.jinja2
+  'create_invoice_link', // createInvoiceLink в send-invoice.py.jinja2
+  'successful_payment_trigger', // роутер в send-invoice.py.jinja2 (fallback после счёта)
+  'refund_stars', // собственный обработчик генерируется шаблоном refund-stars.py.jinja2
+  'edit_star_subscription', // editUserStarSubscription
+  'get_star_balance', // getMyStarBalance
+  'stop_processing', // собственный обработчик генерируется шаблоном stop-processing.py.jinja2
+  'rate_counter', // собственный обработчик генерируется шаблоном rate-counter.py.jinja2
+  'code', // собственный обработчик генерируется шаблоном code.py.jinja2
+  'edit_message', // собственный обработчик генерируется шаблоном edit-message.py.jinja2
+  'delete_message', // собственный обработчик генерируется шаблоном delete-message.py.jinja2
+  'kick_user', // собственный обработчик генерируется шаблоном kick-user.py.jinja2
+  'userbot_message', // собственный обработчик генерируется шаблоном userbot-message.py.jinja2
+  'userbot_click_button', // собственный обработчик генерируется шаблоном userbot-click-button.py.jinja2
+  'userbot_inline_query', // собственный обработчик генерируется шаблоном userbot-inline-query.py.jinja2
+  'userbot_edit_trigger', // собственный обработчик генерируется шаблоном userbot-edit-trigger.py.jinja2
+]);
+
+/**
+ * Ищет кастомный callback_data среди кнопок всех узлов, ведущих к указанному nodeId.
+ * Применяется только для кнопок с action === 'goto' или action === 'command'.
+ *
+ * @param nodeId - ID целевого узла
+ * @param nodes - Массив всех узлов проекта
+ * @returns Кастомный callback_data или undefined
+ */
+function findCustomCallbackForNode(nodeId: string, nodes: any[]): string | undefined {
+  for (const node of nodes) {
+    const buttons: any[] = node.data?.buttons || [];
+    for (const btn of buttons) {
+      if (
+        btn.target === nodeId &&
+        (btn.action === 'goto' || btn.action === 'command') &&
+        btn.customCallbackData
+      ) {
+        return btn.customCallbackData as string;
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Генерирует интерактивные callback-обработчики для inline кнопок,
+ * автопереходов и условных кнопок.
+ *
+ * @param params - Параметры генерации
+ * @returns Сгенерированный Python-код
+ */
+export function generateInteractiveCallbackHandlers(
+  params: InteractiveCallbackHandlersTemplateParams
+): string {
+  const {
+    inlineNodes,
+    allReferencedNodeIds,
+    allConditionalButtons,
+    nodes,
+    connections,
+    processNodeButtonsAndGenerateHandlers,
+  } = params;
+
+  if (
+    inlineNodes.length === 0 &&
+    allReferencedNodeIds.size === 0 &&
+    allConditionalButtons.size === 0
+  ) {
+    return '';
+  }
+
+  let code = '';
+
+  if (inlineNodes.length > 0 || allConditionalButtons.size > 0) {
+    code += '\n# Обработчики inline кнопок\n';
+  } else {
+    code += '\n# Обработчики автопереходов\n';
+  }
+
+  const processedCallbacks = new Set<string>();
+  processNodeButtonsAndGenerateHandlers(processedCallbacks);
+
+  if (isLoggingEnabled()) {
+    console.log(`🔍 ГЕНЕРАТОР: Обработка allReferencedNodeIds: ${Array.from(allReferencedNodeIds).join(', ')}`);
+    console.log(`🔍 ГЕНЕРАТОР: Уже обработанные callbacks: ${Array.from(processedCallbacks).join(', ')}`);
+  }
+
+  allReferencedNodeIds.forEach(nodeId => {
+    if (processedCallbacks.has(nodeId)) return;
+
+    const targetNode = nodes.find((n: any) => n.id === nodeId);
+    if (!targetNode) return;
+    if (NODE_TYPES_WITH_DEDICATED_HANDLERS.has(targetNode.type)) return;
+
+    processedCallbacks.add(nodeId);
+
+    const shortNodeId = String(nodeId).slice(-10).replace(/^_+/, '');
+
+    // Ищем кастомный callback_data среди кнопок, ведущих к этому узлу
+    const customCb = findCustomCallbackForNode(nodeId, nodes);
+    const callbackPattern = customCb || nodeId;
+
+    // Декоратор и заголовок обработчика
+    code += `\n@dp.callback_query(lambda c: c.data == "${callbackPattern}")\n`;
+    code += `async def handle_callback_${nodeId.replace(/[^a-zA-Z0-9_]/g, '_')}(callback_query: types.CallbackQuery, state: FSMContext = None):\n`;
+    code += '    try:\n';
+    code += '        user_id = callback_query.from_user.id\n';
+    code += `        callback_data = callback_query.data\n`;
+    code += `        logging.info(f"🔵 Callback: handle_callback_${shortNodeId} для пользователя {user_id}")\n`;
+    code += '    except Exception as e:\n';
+    code += `        logging.error(f"❌ Ошибка в handle_callback_${shortNodeId}: {e}")\n`;
+    code += '        return\n';
+    code += '    \n';
+
+    // Инициализация callback обработчика
+    // Проверяем: есть ли в любом узле кнопка с hideAfterClick=true, ведущая к этому nodeId
+    const hasHideAfterClickIncoming = nodes.some((n: any) =>
+      (n.data?.buttons || []).some((btn: any) => btn.hideAfterClick === true && btn.target === nodeId)
+    );
+    code += generateCallbackHandlerInit(
+      buildCallbackHandlerInitParams(nodeId, targetNode, '    ', hasHideAfterClickIncoming, false)
+    );
+    code += '    \n';
+
+    // Переменные прикреплённых медиа
+    if (targetNode.data?.attachedMedia?.length > 0 || targetNode.data?.imageUrl) {
+      code += generateAttachedMediaVars({
+        nodeId,
+        attachedMedia: targetNode.data.attachedMedia || [],
+        imageUrl: targetNode.data.imageUrl,
+        videoUrl: targetNode.data.videoUrl,
+        audioUrl: targetNode.data.audioUrl,
+        documentUrl: targetNode.data.documentUrl,
+        indentLevel: '    ',
+      });
+      code += '    \n';
+    }
+
+    // Автопереход
+    const autoTransitionTarget = calculateAutoTransitionTarget(nodeId, targetNode.data, connections);
+    if (autoTransitionTarget) {
+      const targetExists = nodes.some((n: any) => n.id === autoTransitionTarget);
+      code += generateAutoTransition({
+        nodeId,
+        autoTransitionTarget,
+        targetExists,
+        indentLevel: '    ',
+      });
+    }
+
+    code += '    return\n';
+  });
+
+  return code;
+}

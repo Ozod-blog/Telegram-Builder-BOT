@@ -1,0 +1,28 @@
+/**
+ * @fileoverview Экспорт ядра генератора ботов
+ * Агрегирует конфигурацию и логирование
+ */
+
+export { isLoggingEnabled, logFlowAnalysis } from './logging';
+
+// Состояние генерации
+export {
+  createGenerationState,
+  markComponentGenerated,
+  isComponentGenerated,
+  emitOnce,
+  COMPONENT_NAMES,
+} from './generation-state';
+export type { GenerationState, ComponentName } from './generation-state';
+
+// Утилиты узлов
+export { addAutoTransitionNodes } from './add-auto-transition-nodes';
+export { addInputTargetNodes } from './add-input-target-nodes';
+export { collectInputTargetNodes } from './collect-input-target-nodes';
+export { collectMediaVariables } from './collect-media-variables';
+export { extractNodeData } from './extract-node-data';
+export type { ExtractNodeDataResult } from './extract-node-data';
+export { extractNodesAndConnections } from './extract-nodes-and-connections';
+export { normalizeKeyboardBindings } from './normalize-keyboard-bindings';
+export { toEnhancedNode, toEnhancedNodes } from './to-enhanced-node';
+export { collectAllCommandCallbacksFromNodes, findCommandNode } from './command-utils';

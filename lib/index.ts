@@ -1,0 +1,157 @@
+/**
+ * @fileoverview Главный экспорт библиотеки bot-generator
+ * 
+ * Модуль агрегирует и переэкспортирует все функции и типы библиотеки.
+ * Используется для централизованного импорта в других модулях проекта.
+ * 
+ * @module lib/index
+ */
+
+// Main bot generator
+export * from './bot-generator';
+export * from './commands';
+// Keyboard exports are now aggregated in './bot-generator/Keyboard'
+export { generateSynonymHandlers, generateSynonyms, collectSynonymEntries } from './templates/synonyms';
+export * from './bot-generator/core/add-auto-transition-nodes';
+export * from './bot-generator/core/extract-node-data';
+
+// Conditional logic
+// export * from './bot-generator/Conditional'; // module does not exist
+
+// Formatting utilities
+export * from './templates/filters';
+
+// Feature detection
+export { hasCommandButtons } from './templates/filters';
+// hasConditionalButtons does not exist yet
+// hasInlineButtons и hasMultiSelectNodes экспортируются из './bot-generator/Keyboard'
+export { hasMediaNodes } from './templates/filters';
+export { hasAutoTransitions } from './templates/filters';
+export { hasInputCollection, hasInputTimeoutNodes } from './templates/filters';
+// hasLocationFeatures does not exist yet
+export { hasNodesRequiringSafeEditOrSend } from './templates/filters';
+
+// Keyboard generators - после миграции на Jinja2
+// Основные генераторы клавиатур используют адаптеры к Jinja2 шаблонам
+export * from './templates/keyboard/keyboard.renderer';
+
+// Code mapping utilities
+export * from './bot-generator/map-utils';
+
+// Media handlers
+// export * from './bot-generator/MediaHandler'; // module does not exist
+
+// Message handlers
+export * from './templates/message-handler';
+
+// Project scaffolding
+export * from './scaffolding';
+
+// User management handlers — перенесено в templates/user-handler (Jinja2)
+export { generateUserHandler, generateUserHandlerFromNode, nodeToUserHandlerParams } from './templates/user-handler';
+// admin-rights перенесён в templates/admin-rights (Jinja2)
+export { generateAdminRightsHandler, generateAdminRightsFromNode, nodeToAdminRightsParams } from './templates/admin-rights';
+/** Экспорт шаблона пересылки сообщений */
+export { generateForwardMessage, generateForwardMessageFromNode, nodeToForwardMessageParams } from './templates/forward-message';
+/** Типы шаблона пересылки сообщений */
+export type { ForwardMessageTemplateParams, ForwardMessageTargetRecipient, ForwardMessageSourceMode, ForwardMessageTargetMode } from './templates/forward-message';
+
+/** Экспорт шаблона удаления сообщений */
+export { generateDeleteMessage, generateDeleteMessageHandlers, collectDeleteMessageEntries } from './templates/delete-message';
+/** Типы шаблона удаления сообщений */
+export type { DeleteMessageTemplateParams, DeleteMessageEntry, DeleteMessageIdSource, DeleteMessageChatIdSource } from './templates/delete-message';
+
+/** Экспорт шаблона исключения пользователя */
+export { generateKickUser, generateKickUserHandlers, collectKickUserEntries } from './templates/kick-user';
+/** Типы шаблона исключения пользователя */
+export type { KickUserTemplateParams, KickUserEntry, KickUserIdSource, KickUserChatIdSource } from './templates/kick-user';
+
+/** Экспорт шаблона параллельного запуска веток */
+export { generateParallelSplit, generateParallelSplitHandlers, collectParallelSplitEntries } from './templates/parallel-split';
+/** Типы шаблона параллельного запуска веток */
+export type { ParallelSplitTemplateParams, ParallelSplitEntry, ParallelSplitBranchEntry } from './templates/parallel-split';
+
+// Additional utilities
+export { addInputTargetNodes } from './bot-generator/core/add-input-target-nodes';
+
+// Collection utilities
+export { collectInputTargetNodes } from './bot-generator/core/collect-input-target-nodes';
+
+// General utilities (migrated to core/ and templates/filters/)
+
+// Node navigation
+export * from './bot-generator/node-navigation';
+
+// Handle node functions generator
+export { generateHandleNodeFunctions } from './templates/handle-node-function';
+
+// Validation utilities
+export { validateGeneratedPython, assertValidPython } from './bot-generator/validation';
+
+// Types re-export
+export type {
+  BotNode,
+  BotNodeArray,
+  Button,
+  ButtonAction,
+  ResponseOption,
+  NodeData,
+  KeyboardType,
+  FormatMode,
+  InputType,
+  CodeNodeRange,
+  CodeWithMap,
+  GenerationContext,
+  InputCollectionCheckResult,
+  PythonValidationResult,
+  ImportGeneratorOptions,
+  CallbackHandler,
+  EnhancedNode,
+  EnhancedNodeArray,
+  ButtonActionOverride,
+  ButtonOverride,
+  KeyboardTypeOverride,
+  FormatModeOverride
+} from './bot-generator/types';
+
+export type { StandardCommand, CommandCategory } from './commands';
+export type { ExtractNodeDataResult } from './bot-generator/core/extract-node-data';
+
+// Утилиты конвертации и валидации
+export { toEnhancedNode, toEnhancedNodes } from './bot-generator/core/to-enhanced-node';
+export { validateEnhancedNode, validateEnhancedNodes } from './bot-generator/validation';
+export type { ValidationResult } from './bot-generator/validation';
+
+// Ядро: контекст и состояние генерации
+export { createGenerationState, withLogging } from './bot-generator/core/generation-state';
+export { markComponentGenerated, isComponentGenerated } from './bot-generator/core/generation-state';
+export type { GenerationState } from './bot-generator/core/generation-state';
+
+export { createGenerationContext, createGenerationContextFromNodes } from './bot-generator/core/create-generation-context';
+export type { SectionContext } from './bot-generator/core/generation-context';
+export { createSectionContext } from './bot-generator/core/generation-context';
+
+/** Экспорт шаблона Python-кода (Telethon) */
+export { generateCodeHandlers, collectCodeEntries } from './templates/code';
+
+/** Экспорт шаблона триггера участника */
+export { generateMemberTriggerHandlers, collectMemberTriggerEntries, generateMemberTriggers } from './templates/member-trigger';
+export {
+  collectSuccessfulPaymentTriggerEntries,
+  generateSuccessfulPaymentTriggerHandlers,
+} from './templates/successful-payment-trigger';
+export type { MemberTriggerEntry, MemberTriggerTemplateParams } from './templates/member-trigger';
+
+/** Экспорт шаблона остановки middleware-цепочки */
+export { generateStopProcessingHandlers, collectStopProcessingEntries, generateStopProcessing } from './templates/stop-processing';
+export type { StopProcessingEntry, StopProcessingTemplateParams } from './templates/stop-processing';
+
+/** Экспорт шаблона счётчика частоты */
+export { generateRateCounterHandlers, collectRateCounterEntries, generateRateCounter } from './templates/rate-counter';
+export type { RateCounterEntry, RateCounterTemplateParams } from './templates/rate-counter';
+
+// Ядро: централизованное логирование
+export { createLogger, generatorLogger } from './bot-generator/core/generator-logger';
+export type { GeneratorLogger, LogLevel, LoggerOptions } from './bot-generator/core/generator-logger';
+
+

@@ -1,0 +1,475 @@
+{#
+  Шаблон обработчика медиа-ноды
+
+  @fileoverview Генерирует Python-код для отправки медиафайлов из массива attachedMedia.
+  Поддерживает одиночную отправку и медиагруппы, FSInputFile для /uploads/ путей,
+  автопереход, логирование и список получателей (messageSendRecipients).
+
+  @param {string}   nodeId                  - уникальный идентификатор узла
+  @param {array}    attachedMedia           - массив URL медиафайлов
+  @param {boolean}  enableAutoTransition    - включить автопереход
+  @param {string}   autoTransitionTo        - ID целевого узла автоперехода
+  @param {array}    messageSendRecipients   - список получателей (пустой = отправка пользователю)
+#}
+
+{#- Макрос: определяет тип медиа по расширению URL -#}
+{%- macro get_media_type(url) -%}
+{%- set u = url | lower -%}
+{%- if '.jpg' in u or '.jpeg' in u or '.png' in u or '.gif' in u or '.webp' in u -%}photo
+{%- elif '.mp4' in u or '.avi' in u or '.mov' in u -%}video
+{%- elif '.mp3' in u or '.wav' in u or '.ogg' in u -%}audio
+{%- else -%}document
+{%- endif -%}
+{%- endmacro -%}
+
+{#- Макрос: определяет класс InputMedia по расширению URL -#}
+{%- macro get_input_media_class(url) -%}
+{%- set u = url | lower -%}
+{%- if '.jpg' in u or '.jpeg' in u or '.png' in u or '.gif' in u or '.webp' in u -%}InputMediaPhoto
+{%- elif '.mp4' in u or '.avi' in u or '.mov' in u -%}InputMediaVideo
+{%- elif '.mp3' in u or '.wav' in u or '.ogg' in u -%}InputMediaAudio
+{%- else -%}InputMediaDocument
+{%- endif -%}
+{%- endmacro -%}
+
+{#- Вычисляем hasUserRecipient: если все получатели chat_id — пользователю не отправляем -#}
+{%- set hasUserRecipient = true %}
+{%- if messageSendRecipients and messageSendRecipients|length > 0 %}
+  {%- set hasUserRecipient = false %}
+  {%- for r in messageSendRecipients %}
+    {%- if r.type == 'user' %}
+      {%- set hasUserRecipient = true %}
+    {%- endif %}
+  {%- endfor %}
+{%- endif %}
+
+{#- Флаг: есть ли дополнительные chat_id получатели -#}
+{%- set hasChatIdRecipients = false %}
+{%- if messageSendRecipients and messageSendRecipients|length > 0 %}
+  {%- for r in messageSendRecipients %}
+    {%- if r.type == 'chat_id' and r.chatId %}
+      {%- set hasChatIdRecipients = true %}
+    {%- endif %}
+  {%- endfor %}
+{%- endif %}
+
+@dp.callback_query(lambda c: c.data == "{{ nodeId }}")
+async def handle_callback_{{ nodeId|safe_name }}(callback_query: types.CallbackQuery, state: FSMContext = None):
+    """Обработчик медиа-ноды для узла {{ nodeId }}"""
+    is_fake_callback = getattr(callback_query, '_is_fake', False)
+    logging.info(f"Медиа-нода {{ nodeId }}: отправка медиафайлов")
+    # Сразу убираем анимацию загрузки в Telegram
+    try:
+        await callback_query.answer()
+    except Exception:
+        pass
+
+    def _extract_file_id_from_message(_msg, _mtype: str) -> str:
+        """Извлекает file_id из ответного сообщения Telegram по типу медиа"""
+        try:
+            if _mtype == "photo" and _msg.photo:
+                return _msg.photo[-1].file_id
+            elif _mtype == "video" and _msg.video:
+                return _msg.video.file_id
+            elif _mtype == "audio" and _msg.audio:
+                return _msg.audio.file_id
+            elif _mtype == "document" and _msg.document:
+                return _msg.document.file_id
+        except Exception:
+            pass
+        return ""
+
+{%- if hasChatIdRecipients %}
+    # Инициализируем переменные пользователя для подстановки в chat_id получателях
+    all_user_vars = {}
+    try:
+        all_user_vars = await init_all_user_vars(callback_query.from_user.id)
+    except Exception:
+        pass
+{%- endif %}
+
+{%- if hasUserRecipient %}
+{%- if attachedMedia and attachedMedia | length == 1 %}
+{%- set url = attachedMedia[0] %}
+{%- if '{' in url and '}' in url %}
+    # Отправка медиа из пользовательской переменной
+    user_id = callback_query.from_user.id
+    all_user_vars = await init_all_user_vars(user_id)
+    _raw_media_ref = "{{ url|e }}"
+    _resolved_media = _raw_media_ref
+    _resolved_media_type = "document"
+    _has_resolved_media = False
+
+    if _raw_media_ref.startswith("{") and _raw_media_ref.endswith("}"):
+        _media_var_name = _raw_media_ref[1:-1]
+        _media_value = all_user_vars.get(_media_var_name)
+        # Отладочный лог для диагностики переменной типа file
+        logging.info(f"🔍 Медиа-переменная '{_media_var_name}': тип=" + type(_media_value).__name__ + ", значение=" + ('dict с type=' + str(_media_value.get('type')) if isinstance(_media_value, dict) else str(_media_value)[:100] if _media_value else 'None'))
+        if isinstance(_media_value, dict) and _media_value.get("type") == "file":
+            # Отправка файла из переменной типа file (base64) через BufferedInputFile
+            import base64 as _b64_media
+            from aiogram.types import BufferedInputFile as _BufFile
+            _file_bytes = _b64_media.b64decode(_media_value.get("data", ""))
+            _file_name = _media_value.get("fileName", "file")
+            _buf_file = _BufFile(file=_file_bytes, filename=_file_name)
+            _mime = _media_value.get("mimeType", "")
+            if "image" in _mime:
+                await callback_query.message.answer_photo(_buf_file)
+            elif "audio" in _mime:
+                await callback_query.message.answer_audio(_buf_file)
+            elif "video" in _mime:
+                await callback_query.message.answer_video(_buf_file)
+            else:
+                await callback_query.message.answer_document(_buf_file)
+            logging.info(f"✅ Файл '{_file_name}' ({_mime}) отправлен через BufferedInputFile ({len(_file_bytes)} байт)")
+            return  # файл отправлен, выходим без лишних проверок
+        elif isinstance(_media_value, dict):
+            _resolved_media_type = _media_value.get("type", "document")
+            _resolved_media = (
+                _media_value.get("value")
+                or _media_value.get("photoUrl")
+                or _media_value.get("videoUrl")
+                or _media_value.get("audioUrl")
+                or _media_value.get("documentUrl")
+                or _raw_media_ref
+            )
+            if _resolved_media_type == "document":
+                if _media_value.get("photoUrl") or "photo" in _media_var_name.lower():
+                    _resolved_media_type = "photo"
+                elif _media_value.get("videoUrl") or "video" in _media_var_name.lower():
+                    _resolved_media_type = "video"
+                elif _media_value.get("audioUrl") or "audio" in _media_var_name.lower() or "voice" in _media_var_name.lower():
+                    _resolved_media_type = "audio"
+            _has_resolved_media = _resolved_media != _raw_media_ref
+        elif _media_value:
+            _resolved_media = _media_value
+            _media_name = _media_var_name.lower()
+            if "photo" in _media_name:
+                _resolved_media_type = "photo"
+            elif "video" in _media_name:
+                _resolved_media_type = "video"
+            elif "audio" in _media_name or "voice" in _media_name:
+                _resolved_media_type = "audio"
+            _has_resolved_media = True
+    else:
+        _has_resolved_media = True
+
+    if not _has_resolved_media:
+        logging.warning(f"⚠️ Медиа-переменная {_raw_media_ref} не заполнена. all_user_vars keys: {list(all_user_vars.keys())[:20]}")
+        logging.warning(f"Медиа-переменная {_raw_media_ref} не заполнена для узла {{ nodeId }}")
+        return
+
+    if _resolved_media_type == "photo":
+        await callback_query.message.answer_photo(_resolved_media)
+    elif _resolved_media_type == "video":
+        await callback_query.message.answer_video(_resolved_media)
+    elif _resolved_media_type == "audio":
+        await callback_query.message.answer_audio(_resolved_media)
+    else:
+        await callback_query.message.answer_document(_resolved_media)
+{%- else %}
+{%- set mtype = get_media_type(url) | trim %}
+{%- set cached_file_id = (telegramFileIds or {})[url] if telegramFileIds and url in telegramFileIds else '' %}
+{%- set _thumb_fid = (thumbnailFileIds or {})[url] if thumbnailFileIds and url in thumbnailFileIds else '' %}
+{%- set _thumb_url = (thumbnailUrls or {})[url] if thumbnailUrls and url in thumbnailUrls else '' %}
+{%- set _thumb_val = _thumb_fid or _thumb_url %}
+{%- if _thumb_val and mtype == 'video' %}
+  {%- if '/uploads/' in _thumb_val %}
+    {%- set _thumb_arg = ', thumbnail=FSInputFile(get_upload_file_path("' + _thumb_val + '"))' %}
+  {%- else %}
+    {%- set _thumb_arg = ', thumbnail="' + _thumb_val + '"' %}
+  {%- endif %}
+{%- else %}
+  {%- set _thumb_arg = '' %}
+{%- endif %}
+    # Отправка одиночного медиафайла
+{%- if cached_file_id %}
+    # Отправка через кэшированный Telegram file_id (повторная отправка)
+    logging.info(f"📎 Узел {{ nodeId }}: отправка через кэшированный file_id={{ cached_file_id }}...")
+    await callback_query.message.answer_{{ mtype }}("{{ cached_file_id }}"{{ _thumb_arg }})
+{%- elif '/uploads/' in url %}
+    _file_path = get_upload_file_path("{{ url }}")
+    if not os.path.exists(_file_path):
+        logging.error(f"❌ Медиафайл не найден: {_file_path} (узел {{ nodeId }})")
+        return
+    _cached_fid = _media_file_id_cache.get("{{ url }}")
+    _sent_via_cache = False
+    if _cached_fid:
+        logging.info(f"📎 Узел {{ nodeId }}: отправка через in-memory file_id (без перегенерации)")
+        try:
+            await callback_query.message.answer_{{ mtype }}(_cached_fid{{ _thumb_arg }})
+            _sent_via_cache = True
+        except Exception as _fid_err:
+            if not _is_wrong_file_id_error(_fid_err):
+                raise
+            logging.warning(f"⚠️ Узел {{ nodeId }}: невалидный file_id, переотправка через FSInputFile: {_fid_err}")
+            await _invalidate_media_file_id("{{ url }}")
+    if not _sent_via_cache:
+        logging.info(f"📤 Узел {{ nodeId }}: первая отправка файла через FSInputFile, file_id будет получен из ответа")
+{%- if mtype == 'video' %}
+{%- if _thumb_fid %}
+        logging.info(f"🖼 Узел {{ nodeId }}: обложка через file_id={{ _thumb_fid }}...")
+{%- elif _thumb_url and '/uploads/' in _thumb_url %}
+        logging.info(f"🖼 Узел {{ nodeId }}: обложка через FSInputFile={{ _thumb_url }}")
+{%- elif _thumb_url %}
+        logging.info(f"🖼 Узел {{ nodeId }}: обложка через URL={{ _thumb_url }}")
+{%- else %}
+        logging.info(f"🖼 Узел {{ nodeId }}: обложка не установлена")
+{%- endif %}
+{%- endif %}
+        _media_file = FSInputFile(_file_path)
+        _sent_msg = await callback_query.message.answer_{{ mtype }}(_media_file{{ _thumb_arg }})
+        _new_file_id = _extract_file_id_from_message(_sent_msg, "{{ mtype }}")
+        if _new_file_id:
+            await _save_media_file_id("{{ url }}", _new_file_id, "{{ mtype }}", "application/octet-stream")
+            logging.info(f"✅ Узел {{ nodeId }}: получен file_id={_new_file_id[:20]}... для файла {{ url }}")
+{%- if _thumb_url and mtype == 'video' %}
+        # Сохраняем file_id обложки из ответа Telegram (video.thumbnail.file_id)
+        if _sent_msg and _sent_msg.video and _sent_msg.video.thumbnail:
+            _thumb_new_fid = _sent_msg.video.thumbnail.file_id
+            await _save_media_file_id("{{ _thumb_url }}", _thumb_new_fid, "photo", "image/jpeg")
+            logging.info(f"✅ Узел {{ nodeId }}: получен file_id обложки={_thumb_new_fid[:20]}... для {{ _thumb_url }}")
+{%- endif %}
+{%- else %}
+    logging.info(f"📤 Узел {{ nodeId }}: первая отправка файла по URL, file_id будет получен из ответа")
+{%- if mtype == 'video' %}
+{%- if _thumb_fid %}
+    logging.info(f"🖼 Узел {{ nodeId }}: обложка через file_id={{ _thumb_fid }}...")
+{%- elif _thumb_url and '/uploads/' in _thumb_url %}
+    logging.info(f"🖼 Узел {{ nodeId }}: обложка через FSInputFile={{ _thumb_url }}")
+{%- elif _thumb_url %}
+    logging.info(f"🖼 Узел {{ nodeId }}: обложка через URL={{ _thumb_url }}")
+{%- else %}
+    logging.info(f"🖼 Узел {{ nodeId }}: обложка не установлена")
+{%- endif %}
+{%- endif %}
+    _sent_msg = await callback_query.message.answer_{{ mtype }}("{{ url|e }}"{{ _thumb_arg }})
+    _new_file_id = _extract_file_id_from_message(_sent_msg, "{{ mtype }}")
+    if _new_file_id:
+        await _save_media_file_id("{{ url }}", _new_file_id, "{{ mtype }}", "application/octet-stream")
+        logging.info(f"✅ Узел {{ nodeId }}: получен file_id={_new_file_id[:20]}... для URL {{ url }}")
+{%- if _thumb_url and mtype == 'video' %}
+    # Сохраняем file_id обложки из ответа Telegram (video.thumbnail.file_id)
+    if _sent_msg and _sent_msg.video and _sent_msg.video.thumbnail:
+        _thumb_new_fid = _sent_msg.video.thumbnail.file_id
+        await _save_media_file_id("{{ _thumb_url }}", _thumb_new_fid, "photo", "image/jpeg")
+        logging.info(f"✅ Узел {{ nodeId }}: получен file_id обложки={_thumb_new_fid[:20]}... для {{ _thumb_url }}")
+{%- endif %}
+{%- endif %}
+{%- endif %}
+
+{%- elif attachedMedia and attachedMedia | length > 1 %}
+    # Отправка медиагруппы с поддержкой кеша file_id
+    _media_group = []
+    # Индексы элементов, которые реально попали в группу (для сопоставления с ответом)
+    _media_group_urls = []
+{%- for url in attachedMedia %}
+{%- set cls = get_input_media_class(url) | trim %}
+{%- set mtype_g = get_media_type(url) | trim %}
+{%- if '/uploads/' in url %}
+    _fp_{{ loop.index }} = get_upload_file_path("{{ url }}")
+    if not os.path.exists(_fp_{{ loop.index }}):
+        logging.error(f"❌ Медиафайл не найден: {_fp_{{ loop.index }}} (узел {{ nodeId }}, индекс {{ loop.index0 }})")
+    else:
+        _cached_fid_g_{{ loop.index }} = _media_file_id_cache.get("{{ url }}")
+        if _cached_fid_g_{{ loop.index }}:
+            logging.info(f"📎 Узел {{ nodeId }}: медиагруппа[{{ loop.index0 }}] через in-memory file_id")
+            _media_group.append({{ cls }}(media=_cached_fid_g_{{ loop.index }}))
+        else:
+            logging.info(f"📤 Узел {{ nodeId }}: медиагруппа[{{ loop.index0 }}] через FSInputFile (первая отправка)")
+            _media_group.append({{ cls }}(media=FSInputFile(_fp_{{ loop.index }})))
+        _media_group_urls.append("{{ url|e }}")
+{%- else %}
+    _media_group.append({{ cls }}(media="{{ url|e }}"))
+    _media_group_urls.append("{{ url|e }}")
+{%- endif %}
+{%- endfor %}
+    if not _media_group:
+        logging.error(f"❌ Все медиафайлы недоступны для узла {{ nodeId }}")
+        return
+    _sent_group = await callback_query.message.answer_media_group(_media_group)
+    # Сохраняем file_id каждого файла из медиагруппы в кеш и БД
+    if _sent_group:
+        for _gi, _gmsg in enumerate(_sent_group):
+            if _gi >= len(_media_group_urls):
+                break
+            _gurl = _media_group_urls[_gi]
+            _gfid = None
+            try:
+                if _gmsg.photo:
+                    _gfid = _gmsg.photo[-1].file_id
+                elif _gmsg.video:
+                    _gfid = _gmsg.video.file_id
+                elif _gmsg.audio:
+                    _gfid = _gmsg.audio.file_id
+                elif _gmsg.document:
+                    _gfid = _gmsg.document.file_id
+            except Exception:
+                pass
+            if _gfid:
+                await _save_media_file_id(_gurl, _gfid, "document", "application/octet-stream")
+                logging.info(f"✅ Узел {{ nodeId }}: медиагруппа[{_gi}] file_id={_gfid[:20]}... для {_gurl[:40]}")
+
+{%- else %}
+    # Нет медиафайлов для отправки
+    pass
+
+{%- endif %}
+{%- endif %}{# /hasUserRecipient #}
+
+{#- Вспомогательная функция для отправки дополнительным chat_id получателям -#}
+{%- if hasChatIdRecipients %}
+    async def _send_media_to_{{ nodeId|safe_name }}(_target_chat_id, _thread_id=None, _bot=None):
+        """
+        Отправляет медиафайлы в указанный чат через указанный бот (или глобальный).
+
+        @param _target_chat_id - Идентификатор целевого чата
+        @param _thread_id - Идентификатор топика (для групп), None если не нужен
+        @param _bot - Экземпляр бота для отправки; если None — используется глобальный bot
+        """
+        _b = _bot if _bot is not None else bot
+        try:
+{%- if attachedMedia and attachedMedia | length == 1 %}
+{%- set url = attachedMedia[0] %}
+{%- if '{' in url and '}' in url %}
+            _raw = "{{ url|e }}"
+            _rtype = "document"
+            _rval = _raw
+            _mv = all_user_vars.get(_raw[1:-1]) if _raw.startswith("{") and _raw.endswith("}") else None
+            if isinstance(_mv, dict):
+                _rtype = _mv.get("type", "document")
+                _rval = _mv.get("value") or _mv.get("photoUrl") or _mv.get("videoUrl") or _mv.get("audioUrl") or _mv.get("documentUrl") or _raw
+            elif _mv:
+                _rval = _mv
+            if _rtype == "photo":
+                await _b.send_photo(_target_chat_id, _rval, message_thread_id=_thread_id)
+            elif _rtype == "video":
+                await _b.send_video(_target_chat_id, _rval, message_thread_id=_thread_id)
+            elif _rtype == "audio":
+                await _b.send_audio(_target_chat_id, _rval, message_thread_id=_thread_id)
+            else:
+                await _b.send_document(_target_chat_id, _rval, message_thread_id=_thread_id)
+{%- else %}
+{%- set mtype = get_media_type(url) | trim %}
+{%- if '/uploads/' in url %}
+            _fp = get_upload_file_path("{{ url }}")
+            if not os.path.exists(_fp):
+                logging.error(f"❌ Медиафайл не найден: {_fp} (узел {{ nodeId }})")
+                return
+            _cached_fid_r = _media_file_id_cache.get("{{ url }}")
+            _sent_r = None
+            if _cached_fid_r:
+                logging.info(f"📎 Узел {{ nodeId }}: доп. получатель — отправка через in-memory file_id")
+                try:
+                    _sent_r = await _b.send_{{ mtype }}(_target_chat_id, _cached_fid_r, message_thread_id=_thread_id)
+                except Exception as _fid_err:
+                    if not _is_wrong_file_id_error(_fid_err):
+                        raise
+                    logging.warning(f"⚠️ Узел {{ nodeId }}: доп. получатель — невалидный file_id, FSInputFile: {_fid_err}")
+                    await _invalidate_media_file_id("{{ url }}")
+            if _sent_r is None:
+                logging.info(f"📤 Узел {{ nodeId }}: доп. получатель — первая отправка через FSInputFile")
+                _sent_r = await _b.send_{{ mtype }}(_target_chat_id, FSInputFile(_fp), message_thread_id=_thread_id)
+                _new_fid_r = _extract_file_id_from_message(_sent_r, "{{ mtype }}")
+                if _new_fid_r:
+                    await _save_media_file_id("{{ url }}", _new_fid_r, "{{ mtype }}", "application/octet-stream")
+                    logging.info(f"✅ Узел {{ nodeId }}: доп. получатель — file_id={_new_fid_r[:20]}... сохранён в кеш")
+{%- else %}
+            await _b.send_{{ mtype }}(_target_chat_id, "{{ url|e }}", message_thread_id=_thread_id)
+{%- endif %}
+{%- endif %}
+{%- elif attachedMedia and attachedMedia | length > 1 %}
+            _mg = []
+            _mg_urls = []
+{%- for url in attachedMedia %}
+{%- set cls = get_input_media_class(url) | trim %}
+{%- set mtype_r = get_media_type(url) | trim %}
+{%- if '/uploads/' in url %}
+            _fp2_{{ loop.index }} = get_upload_file_path("{{ url }}")
+            if os.path.exists(_fp2_{{ loop.index }}):
+                _cached_fid_mg_{{ loop.index }} = _media_file_id_cache.get("{{ url }}")
+                if _cached_fid_mg_{{ loop.index }}:
+                    _mg.append({{ cls }}(media=_cached_fid_mg_{{ loop.index }}))
+                else:
+                    _mg.append({{ cls }}(media=FSInputFile(_fp2_{{ loop.index }})))
+                _mg_urls.append("{{ url|e }}")
+{%- else %}
+            _mg.append({{ cls }}(media="{{ url|e }}"))
+            _mg_urls.append("{{ url|e }}")
+{%- endif %}
+{%- endfor %}
+            if _mg:
+                _sent_mg = await _b.send_media_group(_target_chat_id, _mg, message_thread_id=_thread_id)
+                # Кешируем file_id из ответа медиагруппы (доп. получатель)
+                if _sent_mg:
+                    for _mgi, _mgmsg in enumerate(_sent_mg):
+                        if _mgi >= len(_mg_urls):
+                            break
+                        _mgurl = _mg_urls[_mgi]
+                        _mgfid = None
+                        try:
+                            if _mgmsg.photo: _mgfid = _mgmsg.photo[-1].file_id
+                            elif _mgmsg.video: _mgfid = _mgmsg.video.file_id
+                            elif _mgmsg.audio: _mgfid = _mgmsg.audio.file_id
+                            elif _mgmsg.document: _mgfid = _mgmsg.document.file_id
+                        except Exception:
+                            pass
+                        if _mgfid and _mgurl not in _media_file_id_cache:
+                            await _save_media_file_id(_mgurl, _mgfid, "document", "application/octet-stream")
+                            logging.info(f"✅ Узел {{ nodeId }}: доп. получатель медиагруппа[{_mgi}] file_id={_mgfid[:20]}...")
+{%- else %}
+            pass
+{%- endif %}
+        except Exception as _send_err:
+            logging.error(f"❌ Ошибка отправки медиа в {_target_chat_id}: {_send_err}")
+
+    {# Цикл по дополнительным chat_id получателям #}
+{%- for recipient in messageSendRecipients %}
+{%- if recipient.type == 'chat_id' and recipient.chatId %}
+    # Отправка получателю {{ loop.index }}: {{ recipient.chatId }}
+    try:
+        _rchat = replace_variables_in_text("{{ recipient.chatId }}", all_user_vars, {})
+{%- if recipient.isGroup %}
+        if _rchat.lstrip('-').isdigit() and not _rchat.startswith('-'):
+            _rchat = f"-100{_rchat}"
+{%- endif %}
+{%- if recipient.threadId %}
+        _rthread = replace_variables_in_text("{{ recipient.threadId }}", all_user_vars, {})
+        _rthread_int = int(_rthread) if _rthread and _rthread.strip().lstrip('-').isdigit() else None
+{%- else %}
+        _rthread_int = None
+{%- endif %}
+        _rchat_id = int(_rchat) if _rchat.lstrip('-').isdigit() else _rchat
+{%- if recipient.botToken %}
+        _rbot_token = replace_variables_in_text("{{ recipient.botToken }}", all_user_vars, {})
+        _rbot = Bot(token=_rbot_token) if _rbot_token and _rbot_token.strip() else None
+        await _send_media_to_{{ nodeId|safe_name }}(_rchat_id, _rthread_int, _bot=_rbot)
+{%- else %}
+        await _send_media_to_{{ nodeId|safe_name }}(_rchat_id, _rthread_int)
+{%- endif %}
+        logging.info(f"📤 Медиа отправлено получателю {_rchat}")
+    except Exception as _re:
+        logging.error(f"❌ Ошибка отправки медиа получателю {_rchat}: {_re}")
+{%- endif %}
+{%- endfor %}
+{%- endif %}{# /hasChatIdRecipients #}
+
+{%- if enableAutoTransition and autoTransitionTo %}
+    # Автопереход к следующему узлу
+    logging.info(f"Автопереход от узла {{ nodeId }} к узлу {{ autoTransitionTo }}")
+    class FakeCallbackQuery:
+        def __init__(self, message, target_node_id):
+            self.from_user = message.from_user
+            self.message = message
+            self.data = target_node_id
+            self.chat = message.chat
+            self.date = message.date
+            self.message_id = message.message_id
+            self._is_fake = True
+
+        async def answer(self, *args, **kwargs):
+            pass
+
+    fake_cb = FakeCallbackQuery(callback_query.message, "{{ autoTransitionTo }}")
+    await handle_callback_{{ autoTransitionTo|safe_name }}(fake_cb, state=state)
+{%- endif %}

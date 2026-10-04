@@ -1,0 +1,202 @@
+/**
+ * @fileoverview Таблица токенов ботов
+ * @module shared/schema/tables/bot-tokens
+ */
+
+import { pgTable, text, serial, integer, timestamp, bigint } from "drizzle-orm/pg-core";
+import { z } from "zod";
+
+import { botProjects } from "./bot-projects";
+import { telegramUsers } from "./telegram-users";
+
+/**
+ * Таблица токенов ботов
+ */
+export const botTokens = pgTable("bot_tokens", {
+  /** Уникальный идентификатор токена */
+  id: serial("id").primaryKey(),
+  /** Идентификатор проекта (ссылка на bot_projects.id) */
+  projectId: integer("project_id").references(() => botProjects.id, { onDelete: "cascade" }).notNull(),
+  /** Идентификатор владельца токена (наследуется от проекта) */
+  ownerId: bigint("owner_id", { mode: "number" }).references(() => telegramUsers.id, { onDelete: "cascade" }),
+  /** Пользовательское имя для токена */
+  name: text("name").notNull(),
+  /** Токен бота (хранится в зашифрованном виде) */
+  token: text("token").notNull(),
+  /** Флаг токена по умолчанию (0 = нет, 1 = да) */
+  isDefault: integer("is_default").default(0),
+  /** Флаг активности токена (0 = неактивен, 1 = активен) */
+  isActive: integer("is_active").default(1),
+  /** Описание токена */
+  description: text("description"),
+  /** Имя бота из Telegram API */
+  botFirstName: text("bot_first_name"),
+  /** Имя пользователя бота (@username) из Telegram API */
+  botUsername: text("bot_username"),
+  /** Полное описание бота из Telegram API */
+  botDescription: text("bot_description"),
+  /** Короткое описание бота из Telegram API */
+  botShortDescription: text("bot_short_description"),
+  /** URL аватарки бота из Telegram API */
+  botPhotoUrl: text("bot_photo_url"),
+  /** Флаг возможности бота присоединяться к группам */
+  botCanJoinGroups: integer("bot_can_join_groups"),
+  /** Флаг возможности бота читать все сообщения в группах */
+  botCanReadAllGroupMessages: integer("bot_can_read_all_group_messages"),
+  /** Флаг поддержки инлайн-запросов ботом */
+  botSupportsInlineQueries: integer("bot_supports_inline_queries"),
+  /** Флаг наличия главного веб-приложения у бота */
+  botHasMainWebApp: integer("bot_has_main_web_app"),
+  /** Время последнего использования токена */
+  lastUsedAt: timestamp("last_used_at"),
+  /** Флаг отслеживания времени выполнения (0 = выключено, 1 = включено) */
+  trackExecutionTime: integer("track_execution_time").default(0),
+  /** Общее время выполнения в секундах */
+  totalExecutionSeconds: integer("total_execution_seconds").default(0),
+  /** Флаг автоперезапуска при краше (0 = выключено, 1 = включено) */
+  autoRestart: integer("auto_restart").default(0),
+  /** Максимальное количество попыток автоперезапуска подряд */
+  maxRestartAttempts: integer("max_restart_attempts").default(3),
+  /** Уровень логирования Python-бота (DEBUG, INFO, WARNING, ERROR) */
+  logLevel: text("log_level").default("DEBUG"),
+  /** Защита контента от копирования/пересылки (0 = выключено, 1 = включено) */
+  protectContent: integer("protect_content").default(0),
+  /** Флаг сохранения входящих медиафайлов от пользователей (0 = выключено, 1 = включено) */
+  saveIncomingMedia: integer("save_incoming_media").default(0),
+  /**
+   * Срок хранения сообщений в bot_messages (дни).
+   * 0 = без автоочистки; иначе сервер удаляет сообщения токена старше N дней.
+   * Дневные агрегаты аналитики не затрагиваются.
+   */
+  messagesRetentionDays: integer("messages_retention_days").notNull().default(0),
+  /**
+   * Генерировать catch-all обработчики необработанных сообщений/callback
+   * (0 = выключено, 1 = включено). При наличии incoming-триггеров/динамических
+   * кнопок генератор включает их принудительно независимо от флага.
+   */
+  catchAllHandlers: integer("catch_all_handlers").default(1),
+  /**
+   * Живое обновление контента из таблицы _content без перезапуска
+   * (0 = выключено, 1 = включено). По умолчанию выключено — меньше памяти.
+   * Управляет генерацией load_content/reload_content/_content_reload_loop/_content_subscribe_redis.
+   */
+  contentCache: integer("content_cache").default(0),
+  /** Режим запуска бота: 'polling' (по умолчанию) или 'webhook' */
+  launchMode: text("launch_mode").default("polling"),
+  /** Базовый URL для webhook режима (например https://example.com) */
+  webhookBaseUrl: text("webhook_base_url"),
+  /** Секретный токен для верификации webhook запросов */
+  webhookSecretToken: text("webhook_secret_token"),
+  /** Включён ли Telethon userbot (0 = выключено, 1 = включено) */
+  userbotEnabled: integer("userbot_enabled").default(0),
+  /** API ID для Telethon (из my.telegram.org) */
+  userbotApiId: text("userbot_api_id"),
+  /** API Hash для Telethon (из my.telegram.org) */
+  userbotApiHash: text("userbot_api_hash"),
+  /** Session string для Telethon (авторизованная сессия) */
+  userbotSessionString: text("userbot_session_string"),
+  /** Дата создания токена */
+  createdAt: timestamp("created_at").defaultNow(),
+  /** Дата последнего обновления токена */
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+
+/**
+ * Флаг 0/1 из JSON: допускает null (как в ответах API/БД).
+ * @returns Zod-схема для опционального числового флага
+ */
+const optionalFlag = () => z.number().min(0).max(1).nullable().optional();
+
+/** Схема для вставки данных токена бота */
+export const insertBotTokenSchema = z.object({
+  /** Идентификатор проекта */
+  projectId: z.number().int(),
+  /** Идентификатор владельца токена */
+  ownerId: z.number().nullable().optional(),
+  /** Название токена (обязательное поле) */
+  name: z.string().min(1, "Имя токена обязательно"),
+  /** Токен бота (обязательное поле) */
+  token: z.string().min(1, "Токен обязателен"),
+  /** Флаг токена по умолчанию (0 = нет, 1 = да) */
+  isDefault: z.number().min(0).max(1).default(0),
+  /** Флаг активности токена (0 = неактивен, 1 = активен) */
+  isActive: z.number().min(0).max(1).default(1),
+  /** Описание токена */
+  description: z.string().nullable().optional(),
+  /** Имя бота из Telegram API */
+  botFirstName: z.string().nullable().optional(),
+  /** Username бота из Telegram API */
+  botUsername: z.string().nullable().optional(),
+  /** Полное описание бота из Telegram API */
+  botDescription: z.string().nullable().optional(),
+  /** Короткое описание бота из Telegram API */
+  botShortDescription: z.string().nullable().optional(),
+  /** URL аватарки бота из Telegram API */
+  botPhotoUrl: z.string().nullable().optional(),
+  /** Флаг возможности бота присоединяться к группам */
+  botCanJoinGroups: optionalFlag(),
+  /** Флаг возможности бота читать все сообщения в группах */
+  botCanReadAllGroupMessages: optionalFlag(),
+  /** Флаг поддержки инлайн-запросов ботом */
+  botSupportsInlineQueries: optionalFlag(),
+  /** Флаг наличия главного веб-приложения у бота */
+  botHasMainWebApp: optionalFlag(),
+  /**
+   * Время последнего использования (Date или ISO-строка из JSON).
+   * null первым в union — иначе z.coerce.date ломает null из API.
+   */
+  lastUsedAt: z.union([z.null(), z.coerce.date()]).optional(),
+  /** Флаг отслеживания времени выполнения (0 = выключено, 1 = включено) */
+  trackExecutionTime: z.number().min(0).max(1).default(0),
+  /** Общее время выполнения в секундах */
+  totalExecutionSeconds: z.number().min(0).default(0),
+  /** Флаг автоперезапуска при краше (0 = выключено, 1 = включено) */
+  autoRestart: z.number().min(0).max(1).default(0),
+  /** Максимальное количество попыток автоперезапуска подряд */
+  maxRestartAttempts: z.number().min(1).max(10).default(3),
+  /** Уровень логирования Python-бота (DEBUG, INFO, WARNING, ERROR) */
+  logLevel: z.enum(['DEBUG', 'INFO', 'WARNING', 'ERROR']).default('DEBUG').optional(),
+  /** Защита контента от копирования/пересылки (0 = выключено, 1 = включено) */
+  protectContent: z.number().min(0).max(1).default(0),
+  /** Флаг сохранения входящих медиафайлов от пользователей (0 = выключено, 1 = включено) */
+  saveIncomingMedia: z.number().min(0).max(1).default(0),
+  /**
+   * Срок хранения сообщений в днях (0 = безлимит; иначе 7/30/60/90/180/365)
+   */
+  messagesRetentionDays: z
+    .union([
+      z.literal(0),
+      z.literal(7),
+      z.literal(30),
+      z.literal(60),
+      z.literal(90),
+      z.literal(180),
+      z.literal(365),
+    ])
+    .default(0)
+    .optional(),
+  /** Генерировать catch-all обработчики (0 = выключено, 1 = включено) */
+  catchAllHandlers: z.number().min(0).max(1).default(1),
+  /** Живое обновление контента из таблицы _content (0 = выключено, 1 = включено; по умолчанию выкл) */
+  contentCache: z.number().min(0).max(1).default(0),
+  /** Режим запуска бота: polling или webhook */
+  launchMode: z.enum(['polling', 'webhook']).default('polling').optional(),
+  /** Базовый URL для webhook режима */
+  webhookBaseUrl: z.string().nullable().optional(),
+  /** Секретный токен для верификации webhook запросов */
+  webhookSecretToken: z.string().nullable().optional(),
+  /** Включён ли Telethon userbot (0 = выключено, 1 = включено) */
+  userbotEnabled: z.number().min(0).max(1).default(0).optional(),
+  /** API ID для Telethon */
+  userbotApiId: z.string().nullable().optional(),
+  /** API Hash для Telethon */
+  userbotApiHash: z.string().nullable().optional(),
+  /** Session string для Telethon */
+  userbotSessionString: z.string().nullable().optional(),
+});
+
+/** Тип записи токена бота */
+export type BotToken = typeof botTokens.$inferSelect;
+
+/** Тип для вставки токена бота */
+export type InsertBotToken = typeof botTokens.$inferInsert;

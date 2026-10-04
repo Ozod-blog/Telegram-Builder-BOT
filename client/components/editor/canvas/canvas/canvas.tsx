@@ -1,0 +1,1901 @@
+/**
+ * @fileoverview Холст визуального редактора Telegram-бота.
+ *
+ * Компонент отвечает за отображение узлов, drag-to-connect связи,
+ * историю операций и специальные семантики соединений на канвасе.
+ * Для `forward_message` связь от message/media-узла трактуется как
+ * привязка источника сообщения, а не как автопереход выполнения.
+ * Зум к курсору/щипку использует ref-зеркала pan/zoom для синхронности.
+ */
+
+import { useRef, useCallback, useState, useEffect, useMemo } from 'react';
+import { CanvasSheets } from '@/components/editor/canvas/canvas-sheets';
+import { useCanvasViewport } from './use-canvas-viewport';
+import { useCanvasAutoFit } from './use-canvas-auto-fit';
+import { CanvasToolbar } from './canvas-toolbar';
+import { EditorLearnOverlay, useEditorLearn } from '@/components/editor/canvas/learn';
+import { registerEditorLearn, setEditorLearnActive } from '@/components/editor/canvas/learn/editor-learn-bridge';
+import { CanvasContent } from './canvas-content';
+import { MobileCanvasFab } from './mobile-canvas-fab';
+import { useConnectionDrag } from './use-connection-drag';
+import { useCanvasViewHistory } from './use-canvas-view-history';
+import { useMarqueeSelection } from './use-marquee-selection';
+import { useMoveNodesToSheet } from './use-move-nodes-to-sheet';
+import { useMoveNodesToProject } from './use-move-nodes-to-project';
+import { MarqueeOverlay } from './marquee-overlay';
+import { MultiSelectionToolbar } from './multi-selection-toolbar';
+import { clearKeyboardNodeId, setKeyboardNodeId } from '../canvas-node/keyboard-connection';
+import { ensureInvoicePayButton } from '@/components/editor/properties/utils/invoice-pay-button';
+import { buildInvoiceWithPayKeyboard } from '@/components/editor/properties/utils/create-invoice-with-keyboard';
+import {
+  findInvoiceHostForKeyboard,
+  findPayButtonOnKeyboard,
+} from '@/components/editor/properties/utils/invoice-pay-connection';
+import { PortType } from '../canvas-node/port-colors';
+import { getCanvasViewportMetrics, screenPointToCanvasPoint } from './utils/canvas-coordinate-utils';
+import { collectCrossSheetLinks, collectIncomingCrossSheetLinks } from './utils/collect-cross-sheet-links';
+
+import { toast } from '@/hooks/use-toast';
+import { Node, ComponentDefinition } from '@/types/bot';
+import type { CommandPreset } from '@/components/editor/sidebar/massive/commands';
+import { BotDataWithSheets } from '@shared/schema';
+import { SheetsManager } from '@/utils/sheets/sheets-manager';
+import { generateNextSheetName } from '@/utils/sheets/generate-next-sheet-name';
+import { nanoid } from 'nanoid';
+import { generateButtonId } from '@/utils/generate-button-id';
+import { needsMessageDefaults } from '@/utils/sheets/needs-message-defaults';
+
+/**
+ * Типы узлов, которые могут выступать источником сообщения для `forward_message`.
+ */
+const FORWARD_MESSAGE_SOURCE_NODE_TYPES = new Set<Node['type']>([
+  'message',
+  'media',
+  'photo',
+  'video',
+  'audio',
+  'document',
+  'sticker',
+  'voice',
+  'animation',
+  'location',
+  'contact',
+]);
+
+/**
+ * Проверяет, можно ли трактовать связь как source-link для `forward_message`.
+ *
+ * @param node - Исходный узел связи.
+ * @returns `true`, если узел может быть источником пересылаемого сообщения.
+ */
+function canLinkForwardMessageSource(node: Node | undefined): boolean {
+  return Boolean(node && FORWARD_MESSAGE_SOURCE_NODE_TYPES.has(node.type));
+}
+
+/**
+ * Интерфейс действия в истории операций
+ * @interface Action
+ */
+export interface Action {
+  /** Уникальный идентификатор действия */
+  id: string;
+  /** Тип выполненного действия */
+  type: 'add' | 'delete' | 'move' | 'move_end' | 'update' | 'connect' | 'disconnect' | 'duplicate' | 'reset' | 'type_change' | 'id_change' | 'button_add' | 'button_update' | 'button_delete' | 'sheet_add' | 'sheet_delete' | 'sheet_rename' | 'sheet_duplicate' | 'sheet_switch';
+  /** Описание действия для пользователя */
+  description: string;
+  /** Временная метка выполнения действия */
+  timestamp: number;
+}
+
+/**
+ * Свойства компонента холста для редактирования бота
+ * @interface CanvasProps
+ */
+interface CanvasProps {
+  // Новая система листов (опциональные для совместимости)
+  /** Данные бота с поддержкой листов */
+  botData?: BotDataWithSheets;
+  /** Колбэк для обновления данных бота */
+  onBotDataUpdate?: (data: BotDataWithSheets) => void;
+
+  // Существующие пропсы для совместимости
+  /** Массив узлов на холсте */
+  nodes: Node[];
+  /** Идентификатор выбранного узла */
+  selectedNodeId: string | null;
+  /** Колбэк при выборе узла */
+  onNodeSelect: (nodeId: string) => void;
+  /** Колбэк при добавлении узла */
+  onNodeAdd: (node: Node) => void;
+  /** Колбэк при удалении узла */
+  onNodeDelete: (nodeId: string) => void;
+  /** Колбэк при дублировании узла */
+  onNodeDuplicate?: (nodeId: string, targetPosition?: { x: number; y: number }) => void;
+  /** Колбэк при перемещении узла */
+  onNodeMove: (nodeId: string, position: { x: number; y: number }) => void;
+  /** Колбэк в начале перемещения узла (для сохранения в историю) */
+  onNodeMoveStart?: (nodeId: string) => void;
+  /** Колбэк в конце перемещения узла (для сохранения в историю) */
+  onNodeMoveEnd?: (nodeId: string) => void;
+  /** Колбэк при обновлении узлов */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  onNodesUpdate?: (nodes: Node[]) => void;
+  /** Колбэк для отмены действия */
+  onUndo?: () => void;
+  /** Колбэк для отката на N шагов назад */
+  onUndoSteps?: (steps: number) => void;
+  /** Колбэк для повтора действия */
+  onRedo?: () => void;
+  /** Доступность отмены */
+  canUndo?: boolean;
+  /** Доступность повтора */
+  canRedo?: boolean;
+  /** Колбэк для сохранения */
+  onSave?: () => void;
+  /** Колбэк сохранения с заметкой — создаёт постоянный ручной чекпоинт */
+  onSaveWithNote?: (note: string) => void;
+  /** Флаг процесса сохранения */
+  isSaving?: boolean;
+  /** Колбэк для копирования в буфер обмена */
+  onCopyToClipboard?: (nodeIds: string[]) => void;
+  /** Колбэк для вставки из буфера обмена */
+  onPasteFromClipboard?: (offsetX?: number, offsetY?: number) => void;
+  /** Наличие данных в буфере обмена */
+  hasClipboardData?: boolean;
+
+  // Глобальное состояние перетаскивания узлов
+  /** Флаг перетаскивания узла */
+  isNodeBeingDragged?: boolean;
+  /** Установка флага перетаскивания */
+  setIsNodeBeingDragged?: (isDragging: boolean) => void;
+
+  // Кнопки управления интерфейсом
+  /** Переключение видимости заголовка */
+  onToggleHeader?: () => void;
+  /** Переключение видимости боковой панели */
+  onToggleSidebar?: () => void;
+  /** Переключение видимости панели свойств */
+  onToggleProperties?: () => void;
+  /** Переключение видимости холста */
+  onToggleCanvas?: () => void;
+  /** Видимость заголовка */
+  headerVisible?: boolean;
+  /** Видимость боковой панели */
+  sidebarVisible?: boolean;
+  /** Видимость панели свойств */
+  propertiesVisible?: boolean;
+  /** Видимость холста */
+  canvasVisible?: boolean;
+
+  // Мобильные функции
+  /** Открытие мобильной боковой панели */
+  onOpenMobileSidebar?: () => void;
+  /** Открытие мобильной панели свойств */
+  onOpenMobileProperties?: () => void;
+
+  // Передача размеров узлов для иерархического макета
+  /** Колбэк для передачи размеров узлов */
+  onNodeSizesChange?: (nodeSizes: Map<string, { width: number; height: number }>) => void;
+
+  // Логирование действий в историю
+  /** Колбэк для логирования действий */
+  onActionLog?: (type: Action['type'], description: string) => void;
+
+  // История действий (передаётся из родителя)
+  /** Массив истории действий */
+  actionHistory?: Action[];
+  /** Колбэк для удаления записей из внешней истории по id */
+  onActionHistoryRemove?: (ids: Set<string>) => void;
+  /** Колбэк удаления соединения (вызывается из ConnectionsLayer) */
+  onConnectionDelete?: (fromId: string, toId: string, type: string) => void;
+  /** Колбэк перед созданием соединения — для сохранения в историю */
+  onConnectionCreate?: () => void;
+  /** Автоматически вписать содержимое в экран при первой загрузке узлов */
+  autoFitOnLoad?: boolean;
+  /** Инкрементируй это значение чтобы принудительно вызвать fitToContent */
+  fitTrigger?: number;
+  /** ID узла для фокусировки (выделение + центрирование) */
+  focusNodeId?: string | null;
+  /** ID узла для программной подсветки (имитация hover из сайдбара) */
+  highlightNodeId?: string | null;
+  /** Колбэк перемещения узла в другой лист */
+  onMoveNodeToSheet?: (nodeId: string, sheetId: string) => void;
+  /** Колбэк для авто-расстановки узлов */
+  onAutoLayout?: () => void;
+  /** Текущий режим просмотра холста (Холст / JSON) */
+  canvasView?: import('@/pages/editor/components/canvas-view-toggle').CanvasView;
+  /** Колбэк смены режима просмотра */
+  onViewChange?: (view: import('@/pages/editor/components/canvas-view-toggle').CanvasView) => void;
+  /** Подавить автоматическое вписывание в экран (например при возврате с JSON) */
+  suppressAutoFit?: boolean;
+  /** ID проекта (для превью Telegram file_id через прокси) */
+  projectId?: number;
+  /** Список всех проектов (для переноса узлов в другой проект) */
+  projects?: Array<{ id: number; name: string; ownerId: number | null; data?: unknown }>;
+  /** Колбэк навигации к целевой ноде через портал с фокусом (двойной клик) */
+  onPortalNavigate?: (targetNodeId: string) => void;
+  /** Колбэк после восстановления версии — перезагрузка холста */
+  onRestoreVersion?: () => void;
+}
+
+export function Canvas({
+  botData,
+  onBotDataUpdate,
+  nodes,
+  selectedNodeId,
+  onNodeSelect,
+  onNodeAdd,
+  onNodeDelete,
+  onNodeDuplicate,
+  onNodeMove,
+  onNodeMoveStart,
+  onNodeMoveEnd,
+  onNodesUpdate,
+  onUndo,
+  onUndoSteps,
+  onRedo,
+  canUndo,
+  canRedo,
+  onSave,
+  onSaveWithNote,
+  isSaving,
+  onCopyToClipboard,
+  onPasteFromClipboard,
+  hasClipboardData,
+  isNodeBeingDragged,
+  setIsNodeBeingDragged,
+  onToggleHeader,
+  onToggleSidebar,
+  onToggleProperties,
+  onToggleCanvas,
+  headerVisible,
+  sidebarVisible,
+  propertiesVisible,
+  canvasVisible,
+  onNodeSizesChange,
+  onActionLog,
+  actionHistory: externalActionHistory,
+  onActionHistoryRemove,
+  onConnectionDelete: onConnectionDeleteProp,
+  onConnectionCreate,
+  autoFitOnLoad,
+  fitTrigger,
+  focusNodeId,
+  highlightNodeId,
+  onMoveNodeToSheet,
+  onAutoLayout,
+  canvasView,
+  onViewChange,
+  suppressAutoFit,
+  projectId,
+  projects = [],
+  onOpenMobileSidebar,
+  onOpenMobileProperties,
+  onPortalNavigate,
+  onRestoreVersion,
+}: CanvasProps) {
+  const learnNodes = Array.isArray(nodes) ? nodes : [];
+  const learn = useEditorLearn(learnNodes, learnNodes.length === 0);
+  useEffect(() => registerEditorLearn(learn.start), [learn.start]);
+  useEffect(() => {
+    setEditorLearnActive(learn.active);
+    return () => setEditorLearnActive(false);
+  }, [learn.active]);
+  const canvasRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  /** Ref для onConnectionCreate чтобы handleConnectionComplete не устаревал */
+  const onConnectionCreateRef = useRef(onConnectionCreate);
+  useEffect(() => { onConnectionCreateRef.current = onConnectionCreate; }, [onConnectionCreate]);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const [lastClickPosition, setLastClickPosition] = useState({ x: 100, y: 100 });
+  const [clickTransform, setClickTransform] = useState({ pan: { x: 0, y: 0 }, zoom: 100 });
+
+  // Состояние для хранения реальных размеров узлов
+  const [nodeSizes, setNodeSizes] = useState<Map<string, { width: number; height: number }>>(new Map());
+
+  // ID узла, который сейчас перетаскивается (для подсветки связанных узлов и линий)
+  const [draggingNodeId, setDraggingNodeId] = useState<string | null>(null);
+
+  /**
+   * Список листов доступных для перемещения узла (все кроме активного)
+   */
+  const availableSheets = useMemo(() => {
+    if (!botData?.sheets) return [];
+    return botData.sheets
+      .filter(s => s.id !== botData.activeSheetId)
+      .map(s => ({ id: s.id, name: s.name }));
+  }, [botData]);
+
+  /** Количество порталов к другим листам (для бейджа в тулбаре) */
+  const portalsCount = useMemo(() => {
+    if (!botData?.sheets || !botData.activeSheetId) return 0;
+    const outgoing = collectCrossSheetLinks(nodes, botData.sheets, botData.activeSheetId).length;
+    const incoming = collectIncomingCrossSheetLinks(nodes, botData.sheets, botData.activeSheetId).length;
+    return outgoing + incoming;
+  }, [nodes, botData]);
+
+  /** Состояние мульти-выделения узлов рамкой */
+  const {
+    tool,
+    setTool,
+    toggleTool,
+    selectedNodeIds,
+    marqueeRect,
+    startMarquee,
+    updateMarquee,
+    finishMarquee,
+    clearSelection,
+    toggleNodeSelection,
+  } = useMarqueeSelection();
+
+  /** Пустой фон сетки редактора — для pan / marquee */
+  const isEditorEmptyTarget = useCallback((target: HTMLElement) => (
+    target.classList.contains('canvas-grid-modern') ||
+    target.closest('.canvas-grid-modern') === target
+  ), []);
+
+  /**
+   * Marquee: ЛКМ по пустому холсту без Alt при активном инструменте рамки
+   * @param e - Событие мыши
+   * @returns true если событие съедено
+   */
+  const onEditorEmptyLeftClick = useCallback((e: React.MouseEvent) => {
+    if (tool !== 'marquee' || e.button !== 0 || e.altKey) return false;
+    e.preventDefault();
+    const rect = canvasRef.current?.getBoundingClientRect();
+    const x = rect ? e.clientX - rect.left : e.clientX;
+    const y = rect ? e.clientY - rect.top : e.clientY;
+    clearSelection();
+    startMarquee(x, y);
+    return true;
+  }, [tool, clearSelection, startMarquee]);
+
+  const {
+    pan,
+    zoom,
+    setPan,
+    setZoom,
+    panRef,
+    zoomRef,
+    isPanning,
+    animateTransform,
+    triggerTransformAnimation,
+    zoomIn,
+    zoomOut,
+    resetZoom,
+    setZoomLevel,
+    handleMouseDown,
+    handleMouseUp,
+    handleContextMenu,
+  } = useCanvasViewport({
+    canvasRef,
+    isEmptyTarget: isEditorEmptyTarget,
+    onEmptyLeftClick: onEditorEmptyLeftClick,
+    isNodeBeingDragged,
+  });
+
+  /** Групповое перемещение выделенных узлов в листы */
+  const { moveNodesToSheet, moveNodesToNewSheet } = useMoveNodesToSheet(botData, onBotDataUpdate);
+
+  /** Список других проектов (без текущего) для меню "В проект" */
+  const otherProjects = useMemo(
+    () => projects.filter(p => p.id !== projectId).map(p => ({ id: p.id, name: p.name, ownerId: p.ownerId })),
+    [projects, projectId]
+  );
+
+  /** Групповой перенос выделенных узлов в другой проект (в новый лист) */
+  const { moveNodesToProject } = useMoveNodesToProject({ projectId, botData, onBotDataUpdate, projects });
+
+  /** Ref на актуальную функцию вписывания — используется хуком авто-FIT */
+  const fitToContentRef = useRef<() => void>(() => {});
+
+  // Авто-FIT вида камеры (автоуместить): логика вынесена в отдельный хук,
+  // см. use-canvas-auto-fit.ts — ожидание размеров узлов, debounce, single-fit.
+  useCanvasAutoFit({
+    autoFitOnLoad,
+    suppressAutoFit,
+    fitTrigger,
+    nodes,
+    nodeSizes,
+    fitToContentRef,
+  });
+
+  /** Стек предыдущих видов — сохраняется только перед программным focusOnNode */
+  const {
+    pushView,
+    restorePreviousView: popViewFromHistory,
+    canRestore: canRestorePreviousView,
+    clear: clearViewHistory,
+  } = useCanvasViewHistory();
+
+  /**
+   * Восстанавливает предыдущий pan/zoom из стека истории вида
+   */
+  const restorePreviousView = useCallback(() => {
+    const previous = popViewFromHistory();
+    if (!previous) return;
+    triggerTransformAnimation();
+    setZoom(previous.zoom);
+    setPan(previous.pan);
+  }, [popViewFromHistory, triggerTransformAnimation]);
+
+  /**
+   * Центрирует холст на узле: выделяет узел и подбирает масштаб/смещение
+   * @param nodeId - Идентификатор узла для фокусировки
+   */
+  const focusOnNode = useCallback((nodeId: string) => {
+    const node = nodes.find(n => n.id === nodeId);
+    if (!node) return;
+    pushView(panRef.current, zoomRef.current);
+    triggerTransformAnimation();
+    onNodeSelect(nodeId);
+    const scrollContainer = canvasRef.current?.parentElement;
+    if (!scrollContainer) return;
+    const containerWidth = scrollContainer.clientWidth;
+    const containerHeight = scrollContainer.clientHeight;
+    const nodeW = nodeSizes.get(nodeId)?.width ?? 320;
+    const nodeH = nodeSizes.get(nodeId)?.height ?? 200;
+
+    // Подбираем масштаб чтобы узел занимал ~60% экрана, но не больше 100%
+    const scaleX = (containerWidth * 0.6) / nodeW;
+    const scaleY = (containerHeight * 0.6) / nodeH;
+    const targetZoom = Math.min(Math.min(scaleX, scaleY) * 100, 100);
+    const newZoom = Math.max(targetZoom, 30);
+
+    setZoom(newZoom);
+    const newPanX = containerWidth / 2 - (node.position.x + nodeW / 2) * (newZoom / 100);
+    const newPanY = containerHeight / 2 - (node.position.y + nodeH / 2) * (newZoom / 100);
+    setPan({ x: newPanX, y: newPanY });
+  }, [nodes, nodeSizes, onNodeSelect, pushView, setZoom, setPan, triggerTransformAnimation]);
+
+  /**
+   * Фокусировка на узле: выделяет узел и центрирует его в видимой области
+   */
+  useEffect(() => {
+    if (!focusNodeId) return;
+    focusOnNode(focusNodeId);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusNodeId]);
+
+  // Состояние открытия поиска узлов (управляется кнопкой и горячей клавишей Ctrl+F)
+  const [searchOpen, setSearchOpen] = useState(false);
+
+  // Состояние видимости порталов к другим листам
+  const [showPortals, setShowPortals] = useState(false);
+
+  /** Переключение видимости порталов */
+  const togglePortals = useCallback(() => setShowPortals(prev => !prev), []);
+
+  // Система истории действий — используем внешнюю историю если передана, иначе локальную
+  const [localActionHistory, setLocalActionHistory] = useState<Action[]>([]);
+  const actionHistory = externalActionHistory || localActionHistory;
+  const [selectedActionsForUndo, setSelectedActionsForUndo] = useState<Set<string>>(new Set());
+  const [isSelecting, setIsSelecting] = useState(false);
+  const [selectionStart, setSelectionStart] = useState<number | null>(null);
+
+  // Функция для добавления действия в историю
+  const addAction = useCallback((type: Action['type'], description: string) => {
+    // Если есть внешний обработчик - используем его (централизованное управление)
+    if (onActionLog) {
+      onActionLog(type, description);
+    } else {
+      // Иначе используем локальное состояние
+      setLocalActionHistory(prev => {
+        const newAction: Action = {
+          id: nanoid(),
+          type,
+          description,
+          timestamp: Date.now()
+        };
+        const updated = [newAction, ...prev].slice(0, 50);
+        return updated;
+      });
+    }
+  }, [onActionLog]);
+
+  /**
+   * Применяет результат drag-to-connect одним проходом, чтобы сохранить
+   * и источник, и цель связи без конфликтов между последовательными обновлениями.
+   */
+  const handleConnectionComplete = useCallback(({
+    sourceNodeId,
+    targetNodeId,
+    portType,
+    buttonId,
+  }: {
+    sourceNodeId: string;
+    targetNodeId: string;
+    portType: PortType;
+    buttonId?: string;
+  }) => {
+    onConnectionCreateRef.current?.();
+
+    const sourceNode = nodes.find(n => n.id === sourceNodeId);
+    const targetNode = nodes.find(n => n.id === targetNodeId);
+    const existingSourceNodeId = typeof (targetNode?.data as any)?.sourceMessageNodeId === 'string'
+      ? (targetNode?.data as any).sourceMessageNodeId.trim()
+      : '';
+    const existingSourceMode = (targetNode?.data as any)?.sourceMessageIdSource;
+    const isForwardMessageSourceLink =
+      portType === 'auto-transition' &&
+      targetNode?.type === 'forward_message' &&
+      canLinkForwardMessageSource(sourceNode) &&
+      existingSourceMode !== 'manual' &&
+      existingSourceMode !== 'variable' &&
+      (!existingSourceNodeId || existingSourceNodeId === sourceNodeId);
+
+    /** Связь от кнопки «Оплатить» → цель после оплаты на send_invoice */
+    let invoicePayHostId: string | null = null;
+    if (portType === 'button-goto' && buttonId && sourceNode?.type === 'keyboard') {
+      const payBtn = findPayButtonOnKeyboard(sourceNode);
+      const host = findInvoiceHostForKeyboard(sourceNode.id, nodes);
+      if (payBtn?.id === buttonId && host) {
+        invoicePayHostId = host.id;
+      }
+    }
+
+    const updatedNodes = nodes.map((n) => {
+      const data = { ...n.data } as Record<string, unknown>;
+
+      if (invoicePayHostId && n.id === invoicePayHostId) {
+        data.autoTransitionTo = targetNodeId;
+        data.enableAutoTransition = true;
+        return { ...n, data };
+      }
+
+      if (n.id === sourceNodeId) {
+        if (isForwardMessageSourceLink) {
+          return n;
+        }
+
+        if (portType === 'trigger-next' || portType === 'auto-transition') {
+          /**
+           * Сообщение использует один общий порт.
+           * При дропе на keyboard создаём привязку клавиатуры,
+           * а при дропе на любой другой узел — обычный переход.
+           */
+          if (
+            portType === 'auto-transition'
+            && (sourceNode?.type === 'message' || (sourceNode?.type as string) === 'send_invoice')
+            && targetNode?.type === 'keyboard'
+          ) {
+            return { ...n, data: setKeyboardNodeId(data, targetNodeId) as unknown as Node['data'] };
+          }
+
+          data.autoTransitionTo = targetNodeId;
+          if (portType === 'auto-transition') {
+            data.enableAutoTransition = true;
+          }
+          return { ...n, data };
+        }
+
+        if (portType === 'button-goto' && buttonId) {
+          /** Фиксированные порты refund_stars */
+          if ((n.type as any) === 'refund_stars') {
+            if (buttonId === 'refund-success') {
+              data.autoTransitionTo = targetNodeId;
+              data.enableAutoTransition = true;
+              return { ...n, data };
+            }
+            if (buttonId === 'refund-empty') {
+              data.refundEmptyTarget = targetNodeId;
+              return { ...n, data };
+            }
+            if (buttonId === 'refund-not-found') {
+              data.refundNotFoundTarget = targetNodeId;
+              return { ...n, data };
+            }
+            if (buttonId === 'refund-already') {
+              data.refundAlreadyRefundedTarget = targetNodeId;
+              return { ...n, data };
+            }
+          }
+
+          /** Порты edit_star_subscription */
+          if ((n.type as any) === 'edit_star_subscription') {
+            if (buttonId === 'sub-success') {
+              data.autoTransitionTo = targetNodeId;
+              data.enableAutoTransition = true;
+              return { ...n, data };
+            }
+            if (buttonId === 'sub-empty') {
+              data.subscriptionEmptyTarget = targetNodeId;
+              return { ...n, data };
+            }
+            if (buttonId === 'sub-error') {
+              data.subscriptionErrorTarget = targetNodeId;
+              return { ...n, data };
+            }
+          }
+
+          /** Порты get_star_balance */
+          if ((n.type as any) === 'get_star_balance') {
+            if (buttonId === 'bal-success') {
+              data.autoTransitionTo = targetNodeId;
+              data.enableAutoTransition = true;
+              return { ...n, data };
+            }
+            if (buttonId === 'bal-error') {
+              data.balanceErrorTarget = targetNodeId;
+              return { ...n, data };
+            }
+          }
+
+          /** Порты create_invoice_link */
+          if ((n.type as any) === 'create_invoice_link') {
+            if (buttonId === 'invoice-link-created') {
+              data.autoTransitionTo = targetNodeId;
+              data.enableAutoTransition = true;
+              return { ...n, data };
+            }
+            if (buttonId === 'invoice-link-after-pay') {
+              data.afterPaymentTo = targetNodeId;
+              return { ...n, data };
+            }
+          }
+
+          /** pay у счёта — не пишем target на кнопку, host уже обновлён выше */
+          if (invoicePayHostId) {
+            return n;
+          }
+
+          const buttons = (data.buttons as any[] | undefined) ?? [];
+          data.buttons = buttons.map((btn: any) =>
+            btn.id === buttonId ? { ...btn, target: targetNodeId } : btn
+          );
+          const branches = (data.branches as any[] | undefined) ?? [];
+          if (branches.length > 0) {
+            data.branches = branches.map((b: any) =>
+              b.id === buttonId ? { ...b, target: targetNodeId } : b
+            );
+          }
+          /** Ветки узла параллельного запуска — порты работают как у condition */
+          const parallelBranches = (data.parallelBranches as any[] | undefined) ?? [];
+          if (parallelBranches.length > 0) {
+            data.parallelBranches = parallelBranches.map((b: any) =>
+              b.id === buttonId ? { ...b, target: targetNodeId } : b
+            );
+          }
+          return { ...n, data };
+        }
+
+        if (`${portType}` === 'input-target') {
+          data.inputTargetNodeId = targetNodeId;
+          return { ...n, data };
+        }
+      }
+
+      if (n.id === targetNodeId && n.type === 'forward_message' && isForwardMessageSourceLink) {
+        return {
+          ...n,
+          data: {
+            ...data,
+            sourceMessageIdSource:
+              data.sourceMessageIdSource === 'manual' || data.sourceMessageIdSource === 'variable'
+                ? 'current_message'
+                : (data.sourceMessageIdSource as string | undefined) || 'current_message',
+            sourceMessageId: '',
+            sourceMessageVariableName: '',
+            sourceMessageNodeId: sourceNodeId,
+          },
+        };
+      }
+
+      /** При привязке счёта к клавиатуре — кнопка «Оплатить» и только inline */
+      if (
+        n.id === targetNodeId
+        && n.type === 'keyboard'
+        && (sourceNode?.type as string) === 'send_invoice'
+        && portType === 'auto-transition'
+      ) {
+        return {
+          ...n,
+          data: {
+            ...data,
+            keyboardType: 'inline',
+            buttons: ensureInvoicePayButton(data.buttons as any),
+          } as Node['data'],
+        };
+      }
+
+      return n;
+    }) as Node[];
+
+    onNodesUpdate?.(updatedNodes);
+    addAction('connect', `Создано соединение от узла ${sourceNodeId}`);
+  }, [nodes, onNodesUpdate, addAction]);
+
+  /**
+   * Удаляет соединение между двумя узлами.
+   * Если передан внешний onConnectionDelete — делегируем ему (он вызовет saveToHistory).
+   * Иначе — очищаем соответствующее поле в данных исходного узла напрямую.
+   */
+  const handleConnectionDelete = useCallback((fromId: string, toId: string, type: string) => {
+    if (onConnectionDeleteProp) {
+      onConnectionDeleteProp(fromId, toId, type);
+      return;
+    }
+
+    const sourceForDelete = nodes.find((n) => n.id === fromId);
+    let clearInvoicePayHostId: string | null = null;
+    if (type === 'button-goto' && sourceForDelete?.type === 'keyboard') {
+      const payBtn = findPayButtonOnKeyboard(sourceForDelete);
+      const host = findInvoiceHostForKeyboard(fromId, nodes);
+      if (payBtn && host && (host.data as any)?.autoTransitionTo === toId) {
+        clearInvoicePayHostId = host.id;
+      }
+    }
+
+    const updatedNodes = nodes.map(n => {
+      const data = { ...n.data } as Record<string, unknown>;
+
+      if (clearInvoicePayHostId && n.id === clearInvoicePayHostId) {
+        data.enableAutoTransition = false;
+        delete data.autoTransitionTo;
+        return { ...n, data };
+      }
+
+      if (n.id === fromId) {
+        if (type === 'trigger-next') {
+          delete data.autoTransitionTo;
+        } else if (type === 'auto-transition') {
+          data.enableAutoTransition = false;
+          delete data.autoTransitionTo;
+        } else if (type === 'button-goto') {
+          /** Сброс выходов refund_stars по целевому id */
+          if ((n.type as any) === 'refund_stars') {
+            if (data.autoTransitionTo === toId) {
+              data.enableAutoTransition = false;
+              delete data.autoTransitionTo;
+            }
+            if (data.refundEmptyTarget === toId) delete data.refundEmptyTarget;
+            if (data.refundNotFoundTarget === toId) delete data.refundNotFoundTarget;
+            if (data.refundAlreadyRefundedTarget === toId) {
+              delete data.refundAlreadyRefundedTarget;
+            }
+          }
+          if ((n.type as any) === 'edit_star_subscription') {
+            if (data.autoTransitionTo === toId) {
+              data.enableAutoTransition = false;
+              delete data.autoTransitionTo;
+            }
+            if (data.subscriptionEmptyTarget === toId) delete data.subscriptionEmptyTarget;
+            if (data.subscriptionErrorTarget === toId) delete data.subscriptionErrorTarget;
+          }
+          if ((n.type as any) === 'get_star_balance') {
+            if (data.autoTransitionTo === toId) {
+              data.enableAutoTransition = false;
+              delete data.autoTransitionTo;
+            }
+            if (data.balanceErrorTarget === toId) delete data.balanceErrorTarget;
+          }
+          if ((n.type as any) === 'create_invoice_link') {
+            if (data.autoTransitionTo === toId) {
+              data.enableAutoTransition = false;
+              delete data.autoTransitionTo;
+            }
+            if (data.afterPaymentTo === toId) delete data.afterPaymentTo;
+          }
+          if (clearInvoicePayHostId) {
+            return n;
+          }
+          const buttons = (data.buttons as any[] | undefined) ?? [];
+          data.buttons = buttons.map((btn: any) =>
+            btn.action === 'goto' && btn.target === toId ? { ...btn, target: undefined } : btn
+          );
+          const branches = (data.branches as any[] | undefined) ?? [];
+          if (branches.length > 0) {
+            data.branches = branches.map((b: any) =>
+              b.target === toId ? { ...b, target: undefined } : b
+            );
+          }
+          /** Разрыв связи ветки параллельного запуска */
+          const parallelBranches = (data.parallelBranches as any[] | undefined) ?? [];
+          if (parallelBranches.length > 0) {
+            data.parallelBranches = parallelBranches.map((b: any) =>
+              b.target === toId ? { ...b, target: undefined } : b
+            );
+          }
+        } else if (type === 'input-target') {
+          delete data.inputTargetNodeId;
+          // Также чистим autoTransitionTo для input-узлов (fallback для старых данных)
+          if (n.type === 'input') {
+            delete data.autoTransitionTo;
+          }
+        } else if (type === 'keyboard-link') {
+          return { ...n, data: clearKeyboardNodeId(data) };
+        }
+        return { ...n, data };
+      }
+
+      if (n.id === toId && type === 'condition-source') {
+        delete data.sourceNodeId;
+        return { ...n, data };
+      }
+
+      if (n.id === toId && type === 'forward-source' && n.type === 'forward_message') {
+        delete data.sourceMessageId;
+        delete data.sourceMessageVariableName;
+        delete data.sourceMessageNodeId;
+        data.sourceMessageIdSource = 'current_message';
+        return { ...n, data };
+      }
+
+      return n;
+    }) as Node[];
+    onNodesUpdate?.(updatedNodes);
+    addAction('disconnect', `Удалено соединение`);
+  }, [onConnectionDeleteProp, nodes, onNodesUpdate, addAction]);
+
+  const {
+    draftConnection,
+    hoveredTargetNodeId,
+    handlePortMouseDown,
+  } = useConnectionDrag({
+    nodes,
+    zoom,
+    pan,
+    canvasRef,
+    nodeSizes,
+    onConnectionComplete: handleConnectionComplete,
+  });
+
+  /**
+   * Выполняет реальный откат состояния холста на N шагов назад.
+   * Находит индекс самой ранней выбранной записи в истории действий
+   * и откатывает ровно столько шагов через undoSteps (или последовательные undo).
+   * После отката удаляет выбранные записи из UI-истории.
+   */
+  const handleUndoSelected = useCallback(() => {
+    if (selectedActionsForUndo.size === 0) return;
+
+    // Находим индекс самой ранней (последней по индексу) выбранной записи
+    // actionHistory[0] — самое новое действие, actionHistory[N-1] — самое старое
+    let earliestIndex = -1;
+    for (let i = actionHistory.length - 1; i >= 0; i--) {
+      if (selectedActionsForUndo.has(actionHistory[i].id)) {
+        earliestIndex = i;
+        break;
+      }
+    }
+
+    // Количество шагов = индекс самой ранней записи + 1
+    // (откатываем до состояния ДО этого действия)
+    const stepsToUndo = earliestIndex >= 0 ? earliestIndex + 1 : selectedActionsForUndo.size;
+
+    if (onUndoSteps) {
+      onUndoSteps(stepsToUndo);
+    } else if (onUndo) {
+      onUndo();
+    }
+
+    // Удаляем выбранные записи из UI-истории
+    if (onActionHistoryRemove) {
+      onActionHistoryRemove(selectedActionsForUndo);
+    } else {
+      setLocalActionHistory(prev => prev.filter(a => !selectedActionsForUndo.has(a.id)));
+    }
+    setSelectedActionsForUndo(new Set());
+  }, [selectedActionsForUndo, actionHistory, onUndoSteps, onUndo, onActionHistoryRemove]);
+
+  // Toggle selection for an action
+  const toggleActionSelection = useCallback((actionId: string) => {
+    setSelectedActionsForUndo(prev => {
+      const newSet = new Set(prev);
+      if (newSet.has(actionId)) {
+        newSet.delete(actionId);
+      } else {
+        newSet.add(actionId);
+      }
+      return newSet;
+    });
+  }, []);
+
+  // Выбор диапазона действий
+  const selectRange = useCallback((startIndex: number, endIndex: number) => {
+    setSelectedActionsForUndo(() => {
+      const [min, max] = startIndex <= endIndex ? [startIndex, endIndex] : [endIndex, startIndex];
+      const newSet = new Set<string>();
+      for (let i = min; i <= max; i++) {
+        if (actionHistory[i]) {
+          newSet.add(actionHistory[i].id);
+        }
+      }
+      return newSet;
+    });
+  }, [actionHistory]);
+
+  // Начало выделения
+  const handleMouseDownAction = useCallback((index: number) => {
+    if (actionHistory[index]) {
+      setIsSelecting(true);
+      setSelectionStart(index);
+      toggleActionSelection(actionHistory[index].id);
+    }
+  }, [actionHistory, toggleActionSelection]);
+
+  // Во время выделения
+  const handleMouseOverAction = useCallback((index: number) => {
+    if (isSelecting && selectionStart !== null) {
+      selectRange(selectionStart, index);
+    }
+  }, [isSelecting, selectionStart, selectRange]);
+
+  // Конец выделения
+  useEffect(() => {
+    const handleMouseUp = () => {
+      setIsSelecting(false);
+    };
+
+    if (isSelecting) {
+      document.addEventListener('mouseup', handleMouseUp);
+      return () => document.removeEventListener('mouseup', handleMouseUp);
+    }
+    return () => {};
+  }, [isSelecting]);
+
+  // Обработчик изменения размеров узлов
+  const handleNodeSizeChange = useCallback((nodeId: string, size: { width: number; height: number }) => {
+    setNodeSizes(prev => {
+      const newMap = new Map(prev);
+      newMap.set(nodeId, size);
+      return newMap;
+    });
+  }, []);
+
+  // Отдельный эффект для передачи размеров в родительский компонент
+  useEffect(() => {
+    if (onNodeSizesChange && nodeSizes.size > 0) {
+      onNodeSizesChange(nodeSizes);
+    }
+  }, [nodeSizes, onNodeSizesChange]);
+
+  // Убираем автоматический layout при изменении nodeSizes - он был слишком агрессивным
+  // Автоиерархия должна работать только при загрузке шаблонов, а не постоянно
+
+  // Получение активного листа (с fallback'ом для совместимости)
+  // const activeSheet = botData ? SheetsManager.getActiveSheet(botData) : null;
+
+  // Обработчики для работы с листами
+  const handleSheetSelect = useCallback((sheetId: string) => {
+    if (!botData || !onBotDataUpdate) return;
+
+    // ВАЖНО: Сначала сохраняем текущее состояние редактора в активный лист
+    let dataWithCurrentSheetSaved = botData;
+    if (botData.activeSheetId) {
+      dataWithCurrentSheetSaved = SheetsManager.updateSheetData(
+        botData,
+        botData.activeSheetId,
+        nodes
+      );
+    }
+
+    // Затем переключаемся на новый лист
+    const updatedData = SheetsManager.setActiveSheet(dataWithCurrentSheetSaved, sheetId);
+    clearViewHistory();
+    onBotDataUpdate(updatedData);
+  }, [botData, onBotDataUpdate, nodes, clearViewHistory]);
+
+  const handleSheetAdd = useCallback((name: string) => {
+    if (!botData || !onBotDataUpdate) return;
+
+    // Сохраняем текущее состояние перед добавлением нового листа
+    let dataWithCurrentSheetSaved = botData;
+    if (botData.activeSheetId) {
+      dataWithCurrentSheetSaved = SheetsManager.updateSheetData(
+        botData,
+        botData.activeSheetId,
+        nodes
+      );
+    }
+
+    const updatedData = SheetsManager.addSheet(dataWithCurrentSheetSaved, name);
+    onBotDataUpdate(updatedData);
+  }, [botData, onBotDataUpdate, nodes]);
+
+  const handleSheetDelete = useCallback((sheetId: string) => {
+    if (!botData || !onBotDataUpdate) return;
+    try {
+      const updatedData = SheetsManager.deleteSheet(botData, sheetId);
+      onBotDataUpdate(updatedData);
+    } catch (error) {
+      console.error('Ошибка удаления листа:', error);
+    }
+  }, [botData, onBotDataUpdate]);
+
+  const handleSheetRename = useCallback((sheetId: string, newName: string) => {
+    if (!botData || !onBotDataUpdate) return;
+    const updatedData = SheetsManager.renameSheet(botData, sheetId, newName);
+    onBotDataUpdate(updatedData);
+  }, [botData, onBotDataUpdate]);
+
+  const handleSheetDuplicate = useCallback((sheetId: string) => {
+    if (!botData || !onBotDataUpdate) return;
+    try {
+      // Сохраняем текущее состояние перед дублированием
+      let dataWithCurrentSheetSaved = botData;
+      if (botData.activeSheetId) {
+        dataWithCurrentSheetSaved = SheetsManager.updateSheetData(
+          botData,
+          botData.activeSheetId,
+          nodes
+        );
+      }
+
+      const updatedData = SheetsManager.duplicateSheetInProject(dataWithCurrentSheetSaved, sheetId);
+      onBotDataUpdate(updatedData);
+    } catch (error) {
+      console.error('Ошибка дублирования листа:', error);
+    }
+  }, [botData, onBotDataUpdate, nodes]);
+
+  // Функция для получения центральной позиции видимой области canvas
+  const getCenterPosition = useCallback(() => {
+    if (canvasRef.current) {
+      const scrollContainer = canvasRef.current.parentElement;
+      const containerWidth = scrollContainer ? scrollContainer.clientWidth - 64 : window.innerWidth - 64;
+      const containerHeight = scrollContainer ? scrollContainer.clientHeight - 64 : window.innerHeight - 64;
+
+      // Вычисляем центр в координатах canvas (с учетом текущего pan и zoom)
+      const centerX = (containerWidth / 2 - pan.x) / (zoom / 100);
+      const centerY = (containerHeight / 2 - pan.y) / (zoom / 100);
+
+      const position = {
+        x: Math.max(50, centerX - 160),
+        y: Math.max(50, centerY - 50)
+      };
+
+      return position;
+    }
+    return { x: 400, y: 300 }; // fallback если canvas не найден
+  }, [pan, zoom]);
+
+  // Вычисляет canvas-координаты для вставки: из lastClickPosition или центр видимой области
+  const getPastePosition = useCallback(() => {
+    if (canvasRef.current && lastClickPosition.x !== 100 && lastClickPosition.y !== 100) {
+      const rect = canvasRef.current.getBoundingClientRect();
+      const screenX = lastClickPosition.x - rect.left;
+      const screenY = lastClickPosition.y - rect.top;
+      // Правильная формула: (screen - pan) / zoom
+      const canvasX = (screenX - clickTransform.pan.x) / (clickTransform.zoom / 100);
+      const canvasY = (screenY - clickTransform.pan.y) / (clickTransform.zoom / 100);
+      // Проверяем что координаты в разумных пределах видимой области
+      const scrollContainer = canvasRef.current.parentElement;
+      const vw = scrollContainer ? scrollContainer.clientWidth : window.innerWidth;
+      const vh = scrollContainer ? scrollContainer.clientHeight : window.innerHeight;
+      const visibleMinX = -clickTransform.pan.x / (clickTransform.zoom / 100);
+      const visibleMinY = -clickTransform.pan.y / (clickTransform.zoom / 100);
+      const visibleMaxX = visibleMinX + vw / (clickTransform.zoom / 100);
+      const visibleMaxY = visibleMinY + vh / (clickTransform.zoom / 100);
+      if (canvasX >= visibleMinX && canvasX <= visibleMaxX && canvasY >= visibleMinY && canvasY <= visibleMaxY) {
+        return { x: canvasX, y: canvasY };
+      }
+    }
+    return getCenterPosition();
+  }, [lastClickPosition, clickTransform, getCenterPosition]);
+
+
+  const fitToContent = useCallback(() => {
+    if (nodes.length === 0) return;
+    if (!canvasRef.current) return;
+
+    // Вычисляем границы всех узлов
+    // Приоритет: nodeSizes (из ResizeObserver) → DOM измерение → fallback
+    const nodeBounds = nodes.reduce((bounds, node) => {
+      let w = 320;
+      let h = 200;
+
+      const measured = nodeSizes.get(node.id);
+      if (measured) {
+        w = measured.width;
+        h = measured.height;
+      } else {
+        // Пробуем измерить из DOM напрямую
+        const allNodeEls = canvasRef.current?.querySelectorAll<HTMLElement>('[data-canvas-node]');
+        if (allNodeEls) {
+          // Ищем узел по индексу (порядок совпадает с nodes array)
+          const idx = nodes.indexOf(node);
+          const el = allNodeEls[idx];
+          if (el) {
+            const rect = el.getBoundingClientRect();
+            const zoom100 = 1 / (zoom / 100);
+            w = rect.width * zoom100;
+            h = rect.height * zoom100;
+          }
+        }
+      }
+
+      return {
+        left: Math.min(bounds.left, node.position.x),
+        right: Math.max(bounds.right, node.position.x + w),
+        top: Math.min(bounds.top, node.position.y),
+        bottom: Math.max(bounds.bottom, node.position.y + h)
+      };
+    }, { left: Infinity, right: -Infinity, top: Infinity, bottom: -Infinity });
+
+    if (!isFinite(nodeBounds.left) || !isFinite(nodeBounds.right) ||
+      !isFinite(nodeBounds.top) || !isFinite(nodeBounds.bottom)) return;
+
+    const contentWidth = nodeBounds.right - nodeBounds.left;
+    const contentHeight = nodeBounds.bottom - nodeBounds.top;
+    if (contentWidth <= 0 || contentHeight <= 0) return;
+
+    // Берём размеры из main — он занимает всю видимую область
+    const mainEl = canvasRef.current.closest('main');
+    if (!mainEl) return;
+    const mainRect = mainEl.getBoundingClientRect();
+    const containerWidth = mainRect.width;
+    const containerHeight = mainRect.height;
+
+    // Измеряем реальные высоты toolbar и sheets через data-атрибуты
+    const toolbarEl = mainEl.querySelector<HTMLElement>('[data-canvas-toolbar]');
+    const sheetsEl = mainEl.querySelector<HTMLElement>('[data-canvas-sheets]');
+    const toolbarHeight = toolbarEl ? toolbarEl.getBoundingClientRect().height : 60;
+    const sheetsHeight = sheetsEl ? sheetsEl.getBoundingClientRect().height : 0;
+
+    // Видимая область между toolbar и sheets
+    const visibleWidth = containerWidth;
+    const visibleHeight = containerHeight - toolbarHeight - sheetsHeight;
+
+    if (visibleWidth <= 0 || visibleHeight <= 0) return;
+
+    // Масштаб с 10% отступами
+    const scaleX = (visibleWidth * 0.9) / contentWidth;
+    const scaleY = (visibleHeight * 0.9) / contentHeight;
+    const newZoom = Math.max(Math.min(Math.min(scaleX, scaleY) * 100, 100), 1);
+
+    // Центр контента в canvas-координатах
+    const centerX = (nodeBounds.left + nodeBounds.right) / 2;
+    const centerY = (nodeBounds.top + nodeBounds.bottom) / 2;
+
+    // Центр видимой области в экранных координатах (относительно контейнера скролла, без тулбара)
+    const screenCenterX = visibleWidth / 2;
+    const screenCenterY = visibleHeight / 2;
+
+    const newPanX = screenCenterX - centerX * (newZoom / 100);
+    const newPanY = screenCenterY - centerY * (newZoom / 100);
+
+    if (!isFinite(newPanX) || !isFinite(newPanY)) return;
+
+    setZoom(newZoom);
+    setPan({ x: newPanX, y: newPanY });
+    triggerTransformAnimation();
+    // Сбрасываем scroll контейнера — pan управляет позицией через transform
+    if (scrollContainerRef.current) {
+      scrollContainerRef.current.scrollTop = 0;
+      scrollContainerRef.current.scrollLeft = 0;
+    }
+  }, [nodes, nodeSizes, zoom, triggerTransformAnimation]);
+
+  // Держим ref актуальным чтобы хук авто-FIT не имел stale closure
+  fitToContentRef.current = fitToContent;
+
+  // Принудительный fit по внешнему триггеру (смена листа / шаблон) полностью
+  // обрабатывается хуком useCanvasAutoFit: он сбрасывает ключ набора, дожидается
+  // готовности размеров узлов и делает РОВНО одно вписывание (с debounce и
+  // graceful-fallback). Отдельный setTimeout-повтор убран — он давал двойной fit.
+
+  // Handle keyboard shortcuts
+  useEffect(() => {
+    
+    
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // В JSON-режиме не перехватываем горячие клавиши — Monaco Editor должен их обрабатывать сам
+      if (canvasView === 'json') return;
+
+      // Проверяем, что фокус не находится на input или textarea
+      const target = e.target as HTMLElement;
+      const isInputField =
+        target.tagName === 'INPUT' ||
+        target.tagName === 'TEXTAREA' ||
+        target.contentEditable === 'true' ||
+        !!target.closest('[contenteditable="true"]') ||
+        !!target.closest('.monaco-editor') ||
+        !!target.closest('[data-properties-panel]');
+
+      if (!isInputField) {
+        // Escape — сначала восстанавливает предыдущий вид, иначе снимает выделение
+        if (e.key === 'Escape') {
+          if (canRestorePreviousView) {
+            e.preventDefault();
+            restorePreviousView();
+            return;
+          }
+          if (selectedNodeIds.size > 0 || tool === 'marquee') {
+            e.preventDefault();
+            clearSelection();
+            if (tool === 'marquee') setTool('pointer');
+            return;
+          }
+        }
+
+        // Обработка клавиши Delete для удаления выбранного узла
+        if (e.key === 'Delete' && selectedNodeId && onNodeDelete) {
+          e.preventDefault();
+          const node = nodes.find(n => n.id === selectedNodeId);
+          addAction('delete', `Удален узел "${node?.type || 'Unknown'}"`);
+          onNodeDelete(selectedNodeId);
+          return;
+        }
+      }
+
+      if (e.ctrlKey || e.metaKey) {
+        // Ctrl+F — открыть поиск узлов (e.code не зависит от раскладки клавиатуры)
+        if (e.code === 'KeyF' && !e.shiftKey) {
+          e.preventDefault();
+          setSearchOpen(true);
+          return;
+        }
+
+        // Если фокус в поле ввода — пропускаем команды холста.
+        // Исключение: Ctrl+S (сохранение) работает всегда.
+        if (isInputField) {
+          const key = e.key.toLowerCase();
+          if ((key === 's' || key === 'ы') && onSave && !isSaving) {
+            e.preventDefault();
+            onSave();
+          }
+          return;
+        }
+
+        // Обработка Ctrl+Shift+C/V в первую очередь (межпроектное копирование)
+        if (e.shiftKey) {
+          switch (e.key) {
+            case 'c':
+            case 'C':
+            case 'с':
+            case 'С':
+              e.preventDefault();
+              e.stopPropagation();
+              if (selectedNodeId && onCopyToClipboard) {
+                onCopyToClipboard([selectedNodeId]);
+              }
+              return;
+            case 'v':
+            case 'V':
+            case 'м':
+            case 'М':
+              e.preventDefault();
+              e.stopPropagation();
+              if (onPasteFromClipboard) {
+                const { x: targetX, y: targetY } = getPastePosition();
+                onPasteFromClipboard(targetX, targetY);
+              }
+              return;
+          }
+        }
+        
+        switch (e.key) {
+          case '=':
+          case '+':
+            e.preventDefault();
+            zoomIn();
+            break;
+          case '-':
+            e.preventDefault();
+            zoomOut();
+            break;
+          case '0':
+            e.preventDefault();
+            resetZoom();
+            break;
+          case '1':
+            e.preventDefault();
+            fitToContent();
+            break;
+          case '2':
+            e.preventDefault();
+            {
+              /** Ctrl+2 — переключение авто-уместить при смене листа */
+              const current = localStorage.getItem('canvas-auto-fit-sheet');
+              const newValue = current === 'false' ? 'true' : 'false';
+              localStorage.setItem('canvas-auto-fit-sheet', newValue);
+              toast({
+                title: newValue === 'true'
+                  ? 'Авто-уместить при смене листа: ВКЛ'
+                  : 'Авто-уместить при смене листа: ВЫКЛ',
+              });
+            }
+            break;
+          case 'z':
+          case 'Z':
+          case 'я':
+          case 'Я':
+            e.preventDefault();
+            if (e.shiftKey) {
+              onRedo?.();
+            } else {
+              onUndo?.();
+            }
+            break;
+          case 'y':
+          case 'Y':
+          case 'н':
+          case 'Н':
+            e.preventDefault();
+            onRedo?.();
+            break;
+          case 's':
+          case 'S':
+          case 'ы':
+          case 'Ы':
+            e.preventDefault();
+            if (onSave && !isSaving) {
+              onSave();
+            }
+            break;
+          case 'c':
+          case 'C':
+          case 'с':
+          case 'С':
+            e.preventDefault();
+            e.stopPropagation();
+            // Ctrl+C без Shift - дублирование узла
+            if (selectedNodeId && onNodeDuplicate) {
+              const node = nodes.find(n => n.id === selectedNodeId);
+              addAction('duplicate', `Дублирован узел "${node?.type || 'Unknown'}"`);
+              onNodeDuplicate(selectedNodeId, getPastePosition());
+            }
+            break;
+          case 'd':
+          case 'D':
+          case 'в':
+          case 'В':
+            e.preventDefault();
+            if (selectedNodeId && onNodeDuplicate) {
+              const node = nodes.find(n => n.id === selectedNodeId);
+              addAction('duplicate', `Дублирован узел "${node?.type || 'Unknown'}"`);
+              onNodeDuplicate(selectedNodeId, getPastePosition());
+            }
+            break;
+          case 'v':
+          case 'V':
+          case 'м':
+          case 'М':
+            e.preventDefault();
+            e.stopPropagation();
+            // Ctrl+V без Shift - вставка из буфера
+            if (onPasteFromClipboard) {
+              const { x: targetX, y: targetY } = getPastePosition();
+              onPasteFromClipboard(targetX, targetY);
+            }
+            break;
+        }
+      }
+    };
+
+    // Обработчик для предотвращения масштабирования всей страницы на trackpad
+    const handleGesture = (e: Event) => {
+      if ((e as any).ctrlKey) {
+        e.preventDefault();
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    // Добавляем обработчики для предотвращения жестов масштабирования
+    document.addEventListener('gesturestart', handleGesture, { passive: false });
+    document.addEventListener('gesturechange', handleGesture, { passive: false });
+    document.addEventListener('gestureend', handleGesture, { passive: false });
+
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+      document.removeEventListener('gesturestart', handleGesture);
+      document.removeEventListener('gesturechange', handleGesture);
+      document.removeEventListener('gestureend', handleGesture);
+    };
+  }, [zoomIn, zoomOut, resetZoom, fitToContent, onUndo, onRedo, canUndo, canRedo, onSave, isSaving, selectedNodeId, onNodeDelete, onNodeDuplicate, nodes, addAction, getPastePosition, onPasteFromClipboard, onCopyToClipboard, canvasView, clearSelection, selectedNodeIds, tool, setTool, canRestorePreviousView, restorePreviousView]);
+
+  // Глобальные обработчики рисования рамки выделения (marquee)
+  useEffect(() => {
+    if (!marqueeRect) return;
+
+    /** Обновляет рамку по координатам относительно холста */
+    const handleMarqueeMove = (e: MouseEvent) => {
+      const rect = canvasRef.current?.getBoundingClientRect();
+      const x = rect ? e.clientX - rect.left : e.clientX;
+      const y = rect ? e.clientY - rect.top : e.clientY;
+      updateMarquee(x, y);
+    };
+
+    /** Завершает рамку и вычисляет попавшие узлы */
+    const handleMarqueeUp = () => {
+      finishMarquee({ nodes, nodeSizes, pan, zoom });
+    };
+
+    document.addEventListener('mousemove', handleMarqueeMove);
+    document.addEventListener('mouseup', handleMarqueeUp);
+    return () => {
+      document.removeEventListener('mousemove', handleMarqueeMove);
+      document.removeEventListener('mouseup', handleMarqueeUp);
+    };
+  }, [marqueeRect, nodes, nodeSizes, pan, zoom, updateMarquee, finishMarquee]);
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(false);
+
+    /** Вычисляет позицию дропа в координатах холста */
+    const getDropPosition = () => {
+      const scrollContainer = canvasRef.current?.parentElement;
+      const viewport = getCanvasViewportMetrics(scrollContainer);
+      if (!viewport) return getCenterPosition();
+
+      const point = screenPointToCanvasPoint(e.clientX, e.clientY, viewport, pan, zoom);
+      if (point.x >= -10000 && point.y >= -10000 && point.x <= 10000 && point.y <= 10000) {
+        return {
+          x: point.x - 160,
+          y: point.y - 50,
+        };
+      }
+      return getCenterPosition();
+    };
+
+    // Проверяем сначала command_preset
+    const presetData = e.dataTransfer.getData('application/command-preset');
+    if (presetData) {
+      const preset = JSON.parse(presetData) as CommandPreset;
+      const dropPosition = getDropPosition();
+      const triggerId = nanoid();
+      const messageId = nanoid();
+
+      // Создаём command_trigger
+      onNodeAdd({
+        id: triggerId,
+        type: 'command_trigger',
+        position: dropPosition,
+        data: {
+          command: preset.triggerData.command,
+          description: preset.triggerData.description || '',
+          showInMenu: preset.triggerData.showInMenu ?? true,
+          isPrivateOnly: preset.triggerData.isPrivateOnly ?? false,
+          autoTransitionTo: messageId,
+        },
+      } as unknown as Node);
+
+      // Создаём message рядом (+320px по X)
+      const buttons = (preset.messageData.buttons || []).map(btn => ({
+        id: nanoid(),
+        text: btn.text,
+        action: 'default' as const,
+        buttonType: 'normal' as const,
+        skipDataCollection: false,
+        hideAfterClick: false,
+      }));
+
+      onNodeAdd({
+        id: messageId,
+        type: 'message',
+        position: { x: dropPosition.x + 320, y: dropPosition.y },
+        data: {
+          messageText: preset.messageData.text,
+          keyboardType: buttons.length > 0 ? 'inline' : 'none',
+          buttons,
+          markdown: false,
+          oneTimeKeyboard: false,
+          resizeKeyboard: true,
+        },
+      } as unknown as Node);
+
+      addAction('add', `Добавлена команда "${preset.triggerData.command}" с ответом`);
+      return;
+    }
+
+    const componentData = e.dataTransfer.getData('application/json');
+    if (!componentData) return;
+
+    const component: ComponentDefinition = JSON.parse(componentData);
+    const nodePosition = getDropPosition();
+
+    // Нода-комментарий не нуждается в служебных полях клавиатуры
+    const clonedData = structuredClone(
+      !needsMessageDefaults(component.type)
+        ? { ...component.defaultData }
+        : {
+            oneTimeKeyboard: false,
+            resizeKeyboard: true,
+            markdown: false,
+            ...component.defaultData
+          }
+    );
+    // Регенерируем id кнопок чтобы они были уникальны между узлами
+    if (Array.isArray((clonedData as any).buttons)) {
+      (clonedData as any).buttons = (clonedData as any).buttons.map((btn: any) => ({ ...btn, id: generateButtonId() }));
+    }
+
+    /** Счёт — сразу с соседней клавиатурой «Оплатить» */
+    if ((component.type as string) === 'send_invoice') {
+      const { invoice, keyboard } = buildInvoiceWithPayKeyboard(
+        nanoid(),
+        nanoid(),
+        nodePosition,
+        clonedData as Record<string, unknown>,
+      );
+      addAction('add', 'Добавлен счёт со клавиатурой «Оплатить»');
+      onNodeAdd(invoice);
+      onNodeAdd(keyboard);
+      return;
+    }
+
+    const newNode: Node = {
+      id: nanoid(),
+      type: component.type,
+      position: nodePosition,
+      data: clonedData
+    };
+
+    addAction('add', `Добавлен узел "${component.type}"`);
+    onNodeAdd(newNode);
+  }, [onNodeAdd, pan, zoom, getCenterPosition, addAction]);
+
+  // Обработчик canvas-drop события для touch устройств  
+  const handleCanvasDrop = useCallback((e: CustomEvent) => {
+    const { component, position } = e.detail;
+
+    if (!component) {
+      return;
+    }
+
+    let nodePosition;
+
+    if (position && canvasRef.current) {
+      const scrollContainer = canvasRef.current.parentElement;
+      const viewport = getCanvasViewportMetrics(scrollContainer);
+      const canvasRect = canvasRef.current.getBoundingClientRect();
+
+      if (viewport) {
+        const point = screenPointToCanvasPoint(
+          canvasRect.left + position.x,
+          canvasRect.top + position.y,
+          viewport,
+          pan,
+          zoom
+        );
+        nodePosition = { x: point.x - 160, y: point.y - 50 };
+      } else {
+        nodePosition = getCenterPosition();
+      }
+    } else {
+      nodePosition = getCenterPosition();
+    }
+
+    const clonedTouchData = structuredClone(
+      !needsMessageDefaults(component.type)
+        ? { ...component.defaultData }
+        : {
+            oneTimeKeyboard: false,
+            resizeKeyboard: true,
+            markdown: false,
+            ...component.defaultData
+          }
+    );
+    if (Array.isArray((clonedTouchData as any).buttons)) {
+      (clonedTouchData as any).buttons = (clonedTouchData as any).buttons.map((btn: any) => ({ ...btn, id: generateButtonId() }));
+    }
+
+    /** Счёт — сразу с соседней клавиатурой «Оплатить» */
+    if ((component.type as string) === 'send_invoice') {
+      const { invoice, keyboard } = buildInvoiceWithPayKeyboard(
+        nanoid(),
+        nanoid(),
+        nodePosition,
+        clonedTouchData as Record<string, unknown>,
+      );
+      addAction('add', 'Добавлен счёт со клавиатурой «Оплатить»');
+      onNodeAdd(invoice);
+      onNodeAdd(keyboard);
+      return;
+    }
+
+    const newNode: Node = {
+      id: nanoid(),
+      type: component.type,
+      position: nodePosition,
+      data: clonedTouchData
+    };
+
+    addAction('add', `Добавлен узел "${component.type}"`);
+    onNodeAdd(newNode);
+  }, [onNodeAdd, pan, zoom, getCenterPosition, addAction]);
+
+  // Handle canvas-drop событие для touch устройств
+  useEffect(() => {
+    const canvasElement = canvasRef.current;
+    if (canvasElement) {
+      canvasElement.addEventListener('canvas-drop', handleCanvasDrop as EventListener);
+      return () => canvasElement.removeEventListener('canvas-drop', handleCanvasDrop as EventListener);
+    }
+    return () => {};
+  }, [handleCanvasDrop]);
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(false);
+  }, []);
+
+  const handleCanvasClick = useCallback((e: React.MouseEvent) => {
+    // Сохраняем позицию клика и текущий transform для последующей вставки
+    setLastClickPosition({ x: e.clientX, y: e.clientY });
+    setClickTransform({ pan: { x: pan.x, y: pan.y }, zoom });
+    
+    if (e.target === e.currentTarget) {
+      onNodeSelect('');
+      // Клик по пустому холсту снимает мульти-выделение ТОЛЬКО в режиме курсора.
+      // В режиме рамки клик после рисования рамки не должен сбрасывать выделение
+      // (иначе из-за батчинга React выделение очищается сразу после установки).
+      if (tool === 'pointer' && selectedNodeIds.size > 0) {
+        clearSelection();
+      }
+    }
+  }, [onNodeSelect, pan.x, pan.y, zoom, clearSelection, selectedNodeIds, tool]);
+
+  /**
+   * Стабильный обработчик дублирования узла через контекстное меню.
+   * Вынесен из инлайна в CanvasContent, чтобы пропсы мемоизированных нод
+   * не менялись на каждый кадр зума и ноды не ре-рендерились.
+   */
+  const handleNodeDuplicateAtPosition = useCallback((nodeId: string) => {
+    onNodeDuplicate?.(nodeId, getPastePosition());
+  }, [onNodeDuplicate, getPastePosition]);
+
+  /** Стабильный обработчик начала перемещения узла (фиксирует draggingNodeId) */
+  const handleNodeMoveStart = useCallback((nodeId: string) => {
+    setDraggingNodeId(nodeId);
+    onNodeMoveStart?.(nodeId);
+  }, [onNodeMoveStart]);
+
+  /** Стабильный обработчик окончания перемещения узла (сбрасывает draggingNodeId) */
+  const handleNodeMoveEnd = useCallback((nodeId: string) => {
+    setDraggingNodeId(null);
+    onNodeMoveEnd?.(nodeId);
+  }, [onNodeMoveEnd]);
+
+  /**
+   * Стабильный обработчик Shift+клика по узлу.
+   * Добавляет или убирает узел из мульти-выделения через toggleNodeSelection.
+   */
+  const handleNodeShiftClick = useCallback((nodeId: string) => toggleNodeSelection(nodeId), [toggleNodeSelection]);
+
+  /**
+   * Групповое удаление всех выделенных рамкой узлов.
+   * Удаляет каждый узел через onNodeDelete и очищает выделение.
+   */
+  const handleGroupDelete = useCallback(() => {
+    if (selectedNodeIds.size === 0 || !onNodeDelete) return;
+    addAction('delete', `Удалено узлов: ${selectedNodeIds.size}`);
+    selectedNodeIds.forEach(id => onNodeDelete(id));
+    clearSelection();
+  }, [selectedNodeIds, onNodeDelete, addAction, clearSelection]);
+
+  /** Групповое копирование выделенных узлов в буфер обмена */
+  const handleGroupCopy = useCallback(() => {
+    if (selectedNodeIds.size === 0 || !onCopyToClipboard) return;
+    onCopyToClipboard(Array.from(selectedNodeIds));
+    addAction('duplicate', `Скопировано узлов в буфер: ${selectedNodeIds.size}`);
+  }, [selectedNodeIds, onCopyToClipboard, addAction]);
+
+  /** Групповое перемещение выделенных узлов в существующий лист */
+  const handleGroupMoveToSheet = useCallback((sheetId: string) => {
+    if (selectedNodeIds.size === 0) return;
+    moveNodesToSheet(Array.from(selectedNodeIds), sheetId);
+    addAction('sheet_switch', `Перемещено узлов в лист: ${selectedNodeIds.size}`);
+    clearSelection();
+  }, [selectedNodeIds, moveNodesToSheet, addAction, clearSelection]);
+
+  /** Групповой перенос выделенных узлов в другой проект (в новый лист) */
+  const handleGroupMoveToProject = useCallback((targetProjectId: number) => {
+    if (selectedNodeIds.size === 0) return;
+    moveNodesToProject(Array.from(selectedNodeIds), targetProjectId);
+    addAction('sheet_switch', `Перенесено узлов в проект: ${selectedNodeIds.size}`);
+    clearSelection();
+  }, [selectedNodeIds, moveNodesToProject, addAction, clearSelection]);
+
+  /** Групповое перемещение выделенных узлов в новый лист */
+  const handleGroupMoveToNewSheet = useCallback(() => {
+    if (selectedNodeIds.size === 0) return;
+    // Автоматическое имя нового листа (как при нажатии кнопки "+")
+    const name = generateNextSheetName(botData?.sheets ?? []);
+    moveNodesToNewSheet(Array.from(selectedNodeIds), name);
+    addAction('sheet_add', `Создан лист "${name}" с узлами: ${selectedNodeIds.size}`);
+    clearSelection();
+  }, [selectedNodeIds, moveNodesToNewSheet, addAction, clearSelection, botData]);
+
+  return (
+    <main className="w-full h-full relative overflow-hidden bg-gradient-to-br from-slate-50 via-gray-50 to-slate-100 dark:from-slate-950 dark:via-gray-950 dark:to-slate-900">
+      <div ref={scrollContainerRef} className="absolute inset-x-0 overflow-auto" style={{ top: 60, bottom: 60 }}>
+
+        {/* Enhanced Canvas Grid */}
+        <div
+          ref={canvasRef}
+          className="min-h-full relative canvas-grid-modern"
+          style={{
+            width: '100%',
+            height: '100%',
+            cursor: isPanning ? 'grabbing' : 'grab',
+            // Предотвращение масштабирования на сенсорных устройствах
+            touchAction: 'none'
+          }}
+          data-drag-over={isDragOver}
+          data-canvas-drop-zone
+          onDrop={handleDrop}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onClick={handleCanvasClick}
+          onMouseDown={handleMouseDown}
+          onMouseUp={handleMouseUp}
+          onContextMenu={handleContextMenu}
+        >
+          {/* Фон-сетка в отдельном слое, обрезанном по видимой области.
+              Сетка двигается через GPU-transform (translate по модулю шага),
+              а не через background-position — поэтому при панорамировании фон
+              НЕ перерисовывается (нет каскадной перерисовки нод) и не мерцает.
+              background-size меняется только при зуме, поэтому точки остаются
+              чёткими 1px, а внешний вид — прежним. */}
+          <div className="absolute inset-0 overflow-hidden pointer-events-none">
+            <div
+              className="absolute"
+              style={{
+                inset: '-60px',
+                backgroundImage: 'radial-gradient(circle at 1px 1px, rgba(99, 102, 241, 0.15) 1px, transparent 0)',
+                backgroundSize: `${24 * zoom / 100}px ${24 * zoom / 100}px`,
+                transform: `translate(${pan.x % (24 * zoom / 100)}px, ${pan.y % (24 * zoom / 100)}px)`,
+                willChange: 'transform',
+              }}
+            />
+          </div>
+
+          {/* Transformable Canvas Content */}
+          <CanvasContent
+            botData={botData}
+            nodes={nodes}
+            pan={pan}
+            zoom={zoom}
+            zoomRef={zoomRef}
+            panRef={panRef}
+            disableTransition={!animateTransform}
+            selectedNodeId={selectedNodeId}
+            selectedNodeIds={selectedNodeIds}
+            onNodeSelect={onNodeSelect}
+            onShiftClick={handleNodeShiftClick}
+            onNodeDelete={onNodeDelete}
+            onNodeDuplicate={onNodeDuplicate}
+            onNodeDuplicateAtPosition={onNodeDuplicate ? handleNodeDuplicateAtPosition : undefined}
+            onNodeMove={onNodeMove}
+            onNodeMoveStart={handleNodeMoveStart}
+            onNodeMoveEnd={handleNodeMoveEnd}
+            setIsNodeBeingDragged={setIsNodeBeingDragged}
+            onSizeChange={handleNodeSizeChange}
+            nodeSizes={nodeSizes}
+            onPortMouseDown={handlePortMouseDown}
+            draftConnection={draftConnection}
+            hoveredTargetNodeId={hoveredTargetNodeId}
+            onConnectionDelete={handleConnectionDelete}
+            draggingNodeId={draggingNodeId}
+            sheets={availableSheets}
+            onMoveNodeToSheet={onMoveNodeToSheet}
+            highlightNodeId={highlightNodeId}
+            projectId={projectId}
+            showPortals={showPortals}
+            onSheetNavigate={handleSheetSelect}
+            onPortalNavigate={onPortalNavigate}
+          />
+
+          {/* Слой рамки выделения (marquee) — координаты в screen-пространстве холста,
+              поэтому рендерится вне трансформируемого CanvasContent */}
+          <MarqueeOverlay rect={marqueeRect} />
+          {nodes.length === 0 && (
+            <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 bg-white/95 dark:bg-slate-900/95 backdrop-blur-xl rounded-3xl shadow-2xl border border-gray-200/50 dark:border-slate-600/50 p-12 w-96 text-center transition-all duration-500 hover:scale-105">
+              <div className="w-20 h-20 bg-gradient-to-br from-blue-500/10 via-purple-500/10 to-pink-500/10 dark:from-blue-400/20 dark:via-purple-400/20 dark:to-pink-400/20 rounded-3xl flex items-center justify-center mx-auto mb-8 border border-blue-200/50 dark:border-blue-600/30 transition-all duration-300 hover:scale-110 hover:shadow-lg hover:shadow-blue-500/20">
+                <i className="fas fa-plus text-blue-600 dark:text-blue-400 text-3xl drop-shadow-sm"></i>
+              </div>
+              <h3 className="text-gray-800 dark:text-gray-200 mb-4 font-bold text-xl bg-gradient-to-r from-blue-600 to-purple-600 bg-clip-text text-transparent">Перетащите элемент сюда</h3>
+              <p className="text-gray-600 dark:text-gray-400 text-base leading-relaxed">Выберите компонент из левой панели и перетащите на холст для создания бота</p>
+            </div>
+          )}
+        </div>
+
+      </div>
+
+      {learn.active ? (
+        <EditorLearnOverlay
+          learn={learn}
+          sidebarVisible={sidebarVisible}
+          propertiesVisible={propertiesVisible}
+          onToggleSidebar={onToggleSidebar}
+          onToggleProperties={onToggleProperties}
+        />
+      ) : null}
+
+      {/* Панель инструментов - фиксированная панель вверху */}
+      <CanvasToolbar
+        nodes={nodes}
+        zoom={zoom}
+        actionHistory={actionHistory}
+        canRedo={canRedo}
+        isSaving={isSaving}
+        selectedNodeId={selectedNodeId}
+        hasClipboardData={hasClipboardData}
+        headerVisible={headerVisible}
+        sidebarVisible={sidebarVisible}
+        canvasVisible={canvasVisible}
+        propertiesVisible={propertiesVisible}
+        onZoomOut={zoomOut}
+        onZoomIn={zoomIn}
+        onResetZoom={resetZoom}
+        onFitToContent={fitToContent}
+        onZoomLevelChange={setZoomLevel}
+        canRestorePreviousView={canRestorePreviousView}
+        onRestorePreviousView={restorePreviousView}
+        onUndo={onUndo}
+        onRedo={onRedo}
+        onSave={onSave}
+        onSaveWithNote={onSaveWithNote}
+        onAutoLayout={onAutoLayout}
+        onCopyToClipboard={onCopyToClipboard}
+        onPasteFromClipboard={onPasteFromClipboard}
+        lastClickPosition={lastClickPosition}
+        clickTransform={clickTransform}
+        onToggleHeader={onToggleHeader}
+        onToggleSidebar={onToggleSidebar}
+        onToggleCanvas={onToggleCanvas}
+        onToggleProperties={onToggleProperties}
+        handleMouseDownAction={handleMouseDownAction}
+        handleMouseOverAction={handleMouseOverAction}
+        toggleActionSelection={toggleActionSelection}
+        selectedActionsForUndo={selectedActionsForUndo}
+        handleUndoSelected={handleUndoSelected}
+        canvasView={canvasView}
+        onViewChange={onViewChange}
+        onNodeFocus={focusOnNode}
+        searchOpen={searchOpen}
+        onSearchOpenChange={setSearchOpen}
+        marqueeActive={tool === 'marquee'}
+        onToggleMarquee={toggleTool}
+        showPortals={showPortals}
+        onTogglePortals={togglePortals}
+        portalsCount={portalsCount}
+        projectId={projectId}
+        onRestoreVersion={onRestoreVersion}
+      />
+
+      {/* Плавающая панель для мобильных устройств */}
+      <MobileCanvasFab
+        onOpenMobileSidebar={onOpenMobileSidebar}
+        onOpenMobileProperties={onOpenMobileProperties}
+        selectedNodeId={selectedNodeId}
+      />
+
+      {/* Плавающий бар групповых действий над выделенными рамкой узлами */}
+      <MultiSelectionToolbar
+        count={selectedNodeIds.size}
+        sheets={availableSheets}
+        projects={otherProjects}
+        onDelete={handleGroupDelete}
+        onCopy={handleGroupCopy}
+        onMoveToSheet={handleGroupMoveToSheet}
+        onMoveToNewSheet={handleGroupMoveToNewSheet}
+        onMoveToProject={handleGroupMoveToProject}
+      />
+
+      {/* Компонент листов холста - фиксированная панель внизу */}
+      {botData && botData.sheets && botData.sheets.length > 0 && onBotDataUpdate && (
+        <div data-canvas-sheets className="absolute bottom-0 left-0 right-0 z-30 pointer-events-auto">
+          <CanvasSheets
+            sheets={botData.sheets}
+            activeSheetId={botData.activeSheetId || botData.sheets[0]?.id || null}
+            onSheetSelect={handleSheetSelect}
+            onSheetAdd={handleSheetAdd}
+            onSheetDelete={handleSheetDelete}
+            onSheetRename={handleSheetRename}
+            onSheetDuplicate={handleSheetDuplicate}
+            maxVisibleTabs={5}
+          />
+        </div>
+      )}
+    </main>
+  );
+}

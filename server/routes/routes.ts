@@ -1,0 +1,3773 @@
+/**
+ * @fileoverview Основной роутер HTTP API для проектов, токенов, интеграций и базы пользователей
+ */
+
+import { insertBotTokenSchema } from "@shared/schema";
+import { ChildProcess } from "child_process";
+import PostgresStore from "connect-pg-simple";
+import type { Express, RequestHandler } from "express";
+import session from "express-session";
+import { existsSync, mkdirSync, unlinkSync } from "fs";
+import { type Server } from "http";
+import multer from "multer";
+import { join } from "path";
+import { Pool } from "pg";
+
+/**
+ * Экспортируемый экземпляр session middleware для использования в WebSocket.
+ * Инициализируется в registerRoutes() и позволяет прикрепить сессию к WS запросам.
+ */
+export let exportedSessionMiddleware: RequestHandler | null = null;
+import { z } from "zod";
+import { eq } from "drizzle-orm";
+import { cleanupBotStates } from "../bots/cleanupBotStates";
+import { stopBot } from "../bots/stopBot";
+import { db, pool as dbPool } from "../database/db";
+import { initializeDatabaseTables } from "../database/init-db";
+import { ensureDefaultProject } from "../utils/ensureDefaultProject";
+import { downloadFileFromUrl } from "../files/downloadFileFromUrl";
+import { getFileType } from "../files/getFileType";
+import { seedDefaultTemplates } from "../utils/seed-templates";
+import { storage } from "../storages/storage";
+import { authMiddleware, getOwnerIdFromRequest, requireAuth } from "../telegram/auth-middleware";
+import { setupGuard } from "../middleware/setup-guard";
+import { ALLOWED_SERVER_ENV_KEYS } from "../constants/allowed-server-env-keys";
+import { identifyAgent } from "../middleware/agentTokenMiddleware";
+import { requireApiAuth } from "../middleware/requireApiAuth";
+import { requireProjectAccess } from "../middleware/requireProjectAccess";
+import { requireTokenOwnership } from "../middleware/requireResourceOwnership";
+import { requireMediaOwnership } from "../middleware/mediaOwnership";
+import { setupTemplatesRoutes } from "./templates/setupTemplatesRoutes";
+import { deleteBotUserHandler } from "./botUsers/handlers/deleteBotUserHandler";
+import { updateBotUserHandler } from "./botUsers/handlers/updateBotUserHandler";
+import { deleteProjectTokenHandler } from "./botTokens/handlers/deleteProjectTokenHandler";
+import { isMaskedOrPlaceholderToken, toPublicBotToken } from "./botTokens/to-public-bot-token";
+import { checkUrlAccessibility } from "../utils/checkUrlAccessibility";
+import { validateExternalUrl } from "../utils/validateExternalUrl";
+import { resolveSessionCookieOptions } from "../utils/resolveSessionCookie";
+import { resolveSessionSecret } from "../utils/resolveSessionSecret";
+import { handleTelegramError } from "../utils/telegram-error-handler";
+import { fetchWithProxy } from "../utils/telegram-proxy";
+import { setupAuthRoutes } from "./setupAuthRoutes";
+import {
+  resolveDialogKind,
+  wantsUsers,
+  wantsGroups,
+  groupChatTypesSql,
+  buildGroupsSelectSql,
+} from "./botUsers/dialogListKind";
+import { setupBotIntegrationRoutes } from "./setupBotIntegrationRoutes";
+import { setupWebhookRoutes } from './setupWebhookRoutes';
+import { setupHooksRoutes } from './hooks/setupHooksRoutes';
+import { getRedisPublisher, waitForRedisInit } from "../redis/redisClient";
+import { setupProjectRoutes } from "./setupProjectRoutes";
+import { setupUserProjectAndTokenRoutes } from "./setupUserProjectAndTokenRoutes";
+import { setupAgentTokenRoutes } from "./setupAgentTokenRoutes";
+import { setupMcpRoutes } from "./mcp/setupMcpRoutes";
+import { setupStorageConfigRoutes } from "./setupStorageConfigRoutes";
+import type { StorageBotTokenInput, StorageBotTokenUpdate } from "../storages/storageTypes";
+import { ensureStorageRegistryLoaded } from "../storage/storage-registry";
+import { readStorageLimitBytes } from "../storage/storage-config";
+import {
+  computeLocalUsedBytes,
+  isQuotaExceeded,
+  persistUploadToBackend,
+  resolveUploadBackend,
+  StorageBackendWriteError,
+} from "./media/upload-storage-helper";
+import { enrichMediaFilesWithTokens } from "./media/enrich-media-files-with-tokens";
+import { broadcastProjectEvent, emitTokenUpdated } from "../terminal";
+import { getRequestTokenId } from "./utils/resolve-request-token";
+import { getTelegramProxyAgent } from "../utils/telegram-proxy";
+import { setupSwagger } from "../swagger/setup-swagger";
+import {
+  CHART_WINDOW_INTERVAL,
+  getChartSeriesGranularity,
+} from "./messages/chart-granularity-config";
+import {
+  isDailyActivityGranularity,
+  queryActivityFromDaily,
+} from "./messages/queryActivityFromDaily";
+import { queryActivityFromDailyPeriod } from "./messages/queryActivityFromDailyPeriod";
+import { handleUserActivity } from "./users/handle-user-activity";
+import { updateMessagesRetentionHandler } from "./userProjectsTokens/handlers/tokens/updateMessagesRetentionHandler";
+import { getFirstProjectTokenHandler } from "./projectRoutes/handlers/getFirstProjectTokenHandler";
+
+/**
+ * Глобальное хранилище активных процессов ботов
+ *
+ * @type {Map<string, ChildProcess>}
+ * @description
+ * Карта для хранения активных процессов ботов, где ключом является строка в формате `${projectId}_${tokenId}`,
+ * а значением - объект ChildProcess, представляющий запущенный процесс бота.
+ *
+ * @example
+ * ```typescript
+ * // Добавление процесса в хранилище
+ * botProcesses.set(`${projectId}_${tokenId}`, childProcess);
+ *
+ * // Получение процесса из хранилища
+ * const process = botProcesses.get(`${projectId}_${tokenId}`);
+ *
+ * // Удаление процесса из хранилища
+ * botProcesses.delete(`${projectId}_${tokenId}`);
+ * ```
+ */
+export const botProcesses = new Map<string, ChildProcess>();
+
+// Расширенная настройка multer для загрузки файлов
+const storage_multer = multer.diskStorage({
+  destination: (req, _file, cb) => {
+    const projectId = req.params.projectId;
+    const date = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+    const uploadDir = join(process.cwd(), 'uploads', projectId, date);
+
+    if (!existsSync(uploadDir)) {
+      mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: (_req, file, cb) => {
+    // Исправляем кодировку UTF-8 - декодируем URL-encoded имя
+    let originalname = file.originalname;
+    try {
+      // Сначала пробуем декодировать URL-encoded строку
+      originalname = decodeURIComponent(file.originalname);
+    } catch (e) {
+      // Если не URL-encoded, пробуем исправить mojibake
+      try {
+        if (file.originalname.includes('Ñ') || file.originalname.includes('Ã')) {
+          originalname = Buffer.from(file.originalname, 'latin1').toString('utf-8');
+        }
+      } catch (e2) {
+        console.error('Error fixing filename encoding:', e2);
+      }
+    }
+    
+    // Если имя всё ещё пустое или содержит только спецсимволы, используем дефолтное
+    const baseNameRaw = originalname
+      .split('.')[0]
+      .replace(/[^a-zA-Z0-9._-]/g, '_')
+      .substring(0, 50);
+    
+    const baseName = baseNameRaw && baseNameRaw !== '_' ? baseNameRaw : 'file';
+    
+    // Генерируем уникальное имя файла с временной меткой
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    const extension = originalname.split('.').pop()?.toLowerCase() || 'jpg';
+
+    cb(null, `${uniqueSuffix}-${baseName}.${extension}`);
+  }
+});
+
+// Получение расширения файла
+const getFileExtension = (filename: string): string => {
+  return '.' + filename.split('.').pop()?.toLowerCase() || '';
+};
+
+// Расширенная валидация файлов с детальными ограничениями
+const validateFileDetailed = (file: Express.Multer.File) => {
+  const fileValidation = new Map([
+    // Изображения
+    ['image/jpeg', { maxSize: 25 * 1024 * 1024, category: 'photo', description: 'JPEG изображение' }],
+    ['image/jpg', { maxSize: 25 * 1024 * 1024, category: 'photo', description: 'JPG изображение' }],
+    ['image/png', { maxSize: 25 * 1024 * 1024, category: 'photo', description: 'PNG изображение' }],
+    ['image/gif', { maxSize: 15 * 1024 * 1024, category: 'photo', description: 'GIF анимация' }],
+    ['image/webp', { maxSize: 20 * 1024 * 1024, category: 'photo', description: 'WebP изображение' }],
+    ['image/svg+xml', { maxSize: 5 * 1024 * 1024, category: 'photo', description: 'SVG векторное изображение' }],
+    ['image/bmp', { maxSize: 30 * 1024 * 1024, category: 'photo', description: 'BMP изображение' }],
+
+    // Видео
+    ['video/mp4', { maxSize: 200 * 1024 * 1024, category: 'video', description: 'MP4 видео' }],
+    ['video/webm', { maxSize: 200 * 1024 * 1024, category: 'video', description: 'WebM видео' }],
+    ['video/avi', { maxSize: 200 * 1024 * 1024, category: 'video', description: 'AVI видео' }],
+    ['video/mov', { maxSize: 200 * 1024 * 1024, category: 'video', description: 'QuickTime видео' }],
+    ['video/mkv', { maxSize: 200 * 1024 * 1024, category: 'video', description: 'MKV видео' }],
+    ['video/quicktime', { maxSize: 200 * 1024 * 1024, category: 'video', description: 'QuickTime видео' }],
+
+    // Аудио
+    ['audio/mp3', { maxSize: 50 * 1024 * 1024, category: 'audio', description: 'MP3 аудио' }],
+    ['audio/mpeg', { maxSize: 50 * 1024 * 1024, category: 'audio', description: 'MPEG аудио' }],
+    ['audio/wav', { maxSize: 100 * 1024 * 1024, category: 'audio', description: 'WAV аудио' }],
+    ['audio/ogg', { maxSize: 50 * 1024 * 1024, category: 'audio', description: 'OGG аудио' }],
+    ['audio/aac', { maxSize: 50 * 1024 * 1024, category: 'audio', description: 'AAC аудио' }],
+    ['audio/flac', { maxSize: 100 * 1024 * 1024, category: 'audio', description: 'FLAC аудио' }],
+    ['audio/m4a', { maxSize: 50 * 1024 * 1024, category: 'audio', description: 'M4A аудио' }],
+    ['audio/webm', { maxSize: 50 * 1024 * 1024, category: 'audio', description: 'WebM аудио' }],
+
+    // Документы
+    ['application/pdf', { maxSize: 50 * 1024 * 1024, category: 'document', description: 'PDF документ' }],
+    ['application/msword', { maxSize: 25 * 1024 * 1024, category: 'document', description: 'Word документ' }],
+    ['application/vnd.openxmlformats-officedocument.wordprocessingml.document', { maxSize: 25 * 1024 * 1024, category: 'document', description: 'Word документ (DOCX)' }],
+    ['application/vnd.ms-excel', { maxSize: 25 * 1024 * 1024, category: 'document', description: 'Excel таблица' }],
+    ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', { maxSize: 25 * 1024 * 1024, category: 'document', description: 'Excel таблица (XLSX)' }],
+    ['text/plain', { maxSize: 10 * 1024 * 1024, category: 'document', description: 'Текстовый файл' }],
+    ['text/csv', { maxSize: 25 * 1024 * 1024, category: 'document', description: 'CSV файл' }],
+
+    // Дополнительные форматы документов по расширению файла
+    ['.pdf', { maxSize: 50 * 1024 * 1024, category: 'document', description: 'PDF документ' }],
+    ['.doc', { maxSize: 25 * 1024 * 1024, category: 'document', description: 'Word документ' }],
+    ['.docx', { maxSize: 25 * 1024 * 1024, category: 'document', description: 'Word документ (DOCX)' }],
+    ['.txt', { maxSize: 10 * 1024 * 1024, category: 'document', description: 'Текстовый файл' }],
+    ['.xls', { maxSize: 25 * 1024 * 1024, category: 'document', description: 'Excel таблица' }],
+    ['.xlsx', { maxSize: 25 * 1024 * 1024, category: 'document', description: 'Excel таблица (XLSX)' }],
+
+    // Архивы
+    ['application/zip', { maxSize: 100 * 1024 * 1024, category: 'document', description: 'ZIP архив' }],
+    ['application/x-rar-compressed', { maxSize: 100 * 1024 * 1024, category: 'document', description: 'RAR архив' }],
+  ]);
+
+  // Сначала проверяем по MIME типу
+  let validation = fileValidation.get(file.mimetype);
+
+  // Если не найдено по MIME типу, проверяем по расширению файла
+  if (!validation) {
+    const extension = getFileExtension(file.originalname);
+    validation = fileValidation.get(extension);
+  }
+
+  if (!validation) {
+    const extension = getFileExtension(file.originalname);
+    return {
+      valid: false,
+      error: `Неподдерживаемый тип файла: ${file.mimetype} (${extension}). Поддерживаются изображения (jpg, png, gif), видео (mp4, webm), аудио (mp3, wav, ogg), документы (pdf, doc, txt).`
+    };
+  }
+
+  if (file.size > validation.maxSize) {
+    const maxSizeMB = Math.round(validation.maxSize / (1024 * 1024));
+    return {
+      valid: false,
+      error: `Файл "${file.originalname}" слишком большой. Максимальный размер для ${validation.description}: ${maxSizeMB}МБ`
+    };
+  }
+
+  // Проверка имени файла
+  if (file.originalname.length > 255) {
+    return {
+      valid: false,
+      error: 'Имя файла слишком длинное (максимум 255 символов)'
+    };
+  }
+
+  // Проверка на безопасность имени файла
+  const dangerousPatterns = [/\.\./g, /[<>:"|?*]/g, /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i];
+  if (dangerousPatterns.some(pattern => pattern.test(file.originalname))) {
+    return {
+      valid: false,
+      error: 'Небезопасное имя файла'
+    };
+  }
+
+  return { valid: true, category: validation.category };
+};
+
+// Упрощенный фильтр для multer
+const fileFilter = (_req: any, file: any, cb: any) => {
+  const validation = validateFileDetailed(file);
+  if (validation.valid) {
+    cb(null, true);
+  } else {
+    cb(new Error(validation.error), false);
+  }
+};
+
+const upload = multer({
+  storage: storage_multer,
+  fileFilter: fileFilter,
+  limits: {
+    fileSize: 200 * 1024 * 1024, // 200MB максимальный размер файла (для больших видео)
+    files: 20, // Максимум 20 файлов за раз
+    fieldSize: 10 * 1024 * 1024, // 10MB для полей формы
+    fieldNameSize: 300, // Максимальная длина имени поля
+    fields: 50 // Максимальное количество полей формы
+  }
+});
+
+/**
+ * Middleware для исправления кодировки UTF-8 в именах файлов
+ * Применяется только к маршрутам загрузки медиа
+ */
+function fixUtf8Encoding(req: any, res: any, next: any) {
+  if (req.file && req.file.originalname) {
+    try {
+      req.file.originalname = Buffer.from(req.file.originalname, 'latin1').toString('utf-8');
+    } catch (e) {
+      console.error('Error fixing filename encoding:', e);
+    }
+  }
+  if (req.files && Array.isArray(req.files)) {
+    req.files.forEach((file: any) => {
+      try {
+        file.originalname = Buffer.from(file.originalname, 'latin1').toString('utf-8');
+      } catch (e) {
+        console.error('Error fixing filename encoding:', e);
+      }
+    });
+  }
+  next();
+}
+
+/**
+ * Глобальные флаги готовности компонентов системы
+ *
+ * @typedef {Object} readinessFlags
+ * @property {boolean} isDbReady - Флаг, указывающий на готовность базы данных
+ * @property {boolean} areTemplatesReady - Флаг, указывающий на готовность шаблонов
+ */
+
+/**
+ * Флаг, указывающий на готовность базы данных
+ * @type {boolean}
+ */
+let isDbReady = false;
+
+/**
+ * Флаг, указывающий на готовность системных шаблонов
+ * @type {boolean}
+ */
+let areTemplatesReady = false;
+
+/**
+ * Асинхронная инициализация компонентов системы
+ *
+ * @function initializeComponents
+ * @description
+ * Функция выполняет асинхронную инициализацию критических компонентов системы:
+ * - Инициализирует базу данных
+ * - Создает проект по умолчанию
+ * - Очищает состояния ботов
+ * - Загружает системные шаблоны
+ *
+ * @returns {Promise<void>} Промис, который разрешается после завершения инициализации
+ *
+ * @example
+ * ```typescript
+ * // Запуск инициализации компонентов
+ * await initializeComponents();
+ *
+ * // Проверка готовности компонентов
+ * console.log('База данных готова:', isDbReady);
+ * console.log('Шаблоны готовы:', areTemplatesReady);
+ * ```
+ */
+async function initializeComponents() {
+  try {
+    // Инициализация базы данных
+    console.log('🔧 Initializing database...');
+    const dbInitSuccess = await initializeDatabaseTables();
+    if (dbInitSuccess) {
+      isDbReady = true;
+      console.log('✅ Database ready');
+
+      // Загрузка шаблонов в фоне (не блокирует готовность API)
+      // Используем force=false чтобы не пересоздавать шаблоны каждый раз
+      seedDefaultTemplates(false).then(() => {
+        areTemplatesReady = true;
+        console.log('✅ Templates ready');
+      }).catch(err => console.error('❌ Templates failed:', err));
+    } else {
+      console.error('❌ Database initialization failed');
+    }
+  } catch (error) {
+    console.error('❌ Critical initialization error:', error);
+  }
+}
+
+/**
+ * Регистрирует все маршруты API для приложения
+ *
+ * @function registerRoutes
+ * @param {Express} app - Экземпляр приложения Express
+ * @returns {Promise<Server>} Промис, который разрешается с экземпляром HTTP-сервера
+ *
+ * @description
+ * Функция регистрирует все маршруты API для приложения, включая:
+ * - Маршруты аутентификации
+ * - Маршруты управления проектами ботов
+ * - Маршруты управления экземплярами ботов
+ * - Маршруты управления токенами
+ * - Маршруты управления шаблонами
+ * - Маршруты управления медиафайлами
+ * - Маршруты управления пользовательскими данными
+ * - Маршруты управления группами ботов
+ * - Маршруты управления сообщениями
+ * - Маршруты управления медиафайлами сообщений
+ *
+ * Также настраивает:
+ * - Сессии с использованием PostgreSQL
+ * - Middleware аутентификации
+ * - Проверки готовности компонентов
+ * - Загрузку файлов с использованием multer
+ *
+ * @example
+ * ```typescript
+ * import express from 'express';
+ * import { registerRoutes } from './routes';
+ *
+ * const app = express();
+ * const server = await registerRoutes(app);
+ *
+ * server.listen(3000, () => {
+ *   console.log('Сервер запущен на порту 3000');
+ * });
+ * ```
+ */
+export async function registerRoutes(app: Express, httpServer?: Server): Promise<Server> {
+  // Создаём pgPool — нужен для session store (fallback) и других роутов
+  const pgPool = new (await import('pg')).Pool({
+    connectionString: process.env.DATABASE_URL
+  });
+
+  // Создаём store: Redis если доступен, иначе PostgreSQL (fallback)
+  // Ждём завершения инициализации Redis перед проверкой — иначе race condition
+  await waitForRedisInit();
+  let store: session.Store;
+  const redisClient = getRedisPublisher();
+  if (redisClient) {
+    const { RedisStore } = await import('connect-redis');
+    store = new RedisStore({ client: redisClient as any, prefix: 'sess:' });
+    console.log('[Session] Хранилище сессий: Redis');
+  } else {
+    const PostgresStoreConstructor = (PostgresStore as any)(session);
+    store = new PostgresStoreConstructor({ pool: pgPool });
+    console.log('[Session] Хранилище сессий: PostgreSQL (Redis недоступен)');
+  }
+
+  const sessionCookie = resolveSessionCookieOptions();
+  console.log(
+    `[Session] Cookie: secure=${sessionCookie.secure}, sameSite=${sessionCookie.sameSite}`,
+  );
+
+  const sessionMiddleware = session({
+    store: store,
+    secret: resolveSessionSecret(),
+    resave: false,
+    saveUninitialized: false,
+    // Secure только при реальном HTTPS: локальный npm start по http://localhost
+    // иначе теряет cookie → login 200, а /api/projects 401
+    cookie: sessionCookie,
+  });
+
+  app.use(sessionMiddleware);
+  // Экспортируем для использования в WebSocket (прикрепление сессии к WS запросам)
+  exportedSessionMiddleware = sessionMiddleware;
+
+  // Auth middleware для всех API роутов (устанавливает req.user если пользователь авторизован)
+  // ВАЖНО: должен быть подключен ПОСЛЕ session middleware
+  app.use("/api", setupGuard);
+  app.use("/api", authMiddleware);
+
+  // Резолвер личности по персональному токену агента (PAT) — Authorization: Bearer.
+  // Дополняет личность, если сессии нет (MCP/CLI). Не блокирует запрос.
+  app.use("/api", identifyAgent);
+
+  // Deny-by-default: все /api закрыты, кроме публичного allowlist.
+  // Подключается ПОСЛЕ identifyUser/identifyAgent — личность уже установлена.
+  app.use("/api", requireApiAuth);
+
+  // Отключаем HTTP-кеширование для API — ответы зависят от сессии.
+  // Успешные аватарки/telegram-file перезаписывают заголовки в setPrivateMediaCacheHeaders
+  // (снимают Pragma/Expires). Ошибки 4xx/5xx остаются no-store — иначе браузер кэширует 404.
+  app.use("/api", (_req, res, next) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+    next();
+  });
+
+  // Запускаем инициализацию в фоне без блокировки сервера
+  initializeComponents();
+
+  // API для проверки готовности компонентов (healthcheck для UI, Railway, балансировщиков)
+  app.get("/api/health", (_req, res) => {
+    res.json({
+      database: isDbReady,
+      templates: areTemplatesReady,
+      ready: isDbReady  // API готово когда готова БД
+    });
+  });
+
+  app.head("/api/health", (_req, res) => {
+    res.sendStatus(204);
+  });
+
+  /**
+ * Middleware для проверки готовности базы данных
+ *
+ * @function requireDbReady
+ * @param {any} _req - Объект запроса Express
+ * @param {any} res - Объект ответа Express
+ * @param {any} next - Функция перехода к следующему middleware
+ *
+ * @description
+ * Middleware проверяет, готова ли база данных к работе (isDbReady === true).
+ * Если база данных не готова, возвращает ошибку 503 с сообщением о том,
+ * что сервер еще загружается и предлагает повторить попытку позже.
+ *
+ * @returns {void} Ничего не возвращает, передает управление дальше через next() или отправляет ответ
+ *
+ * @example
+ * ```typescript
+ * // Использование middleware в маршруте
+ * app.get('/api/projects', requireDbReady, async (req, res) => {
+ *   // Этот код выполнится только если база данных готова
+ *   const projects = await storage.getAllBotProjects();
+ *   res.json(projects);
+ * });
+ * ```
+ */
+  const requireDbReady = (_req: any, res: any, next: any) => {
+    if (!isDbReady) {
+      return res.status(503).json({
+        message: "Сервер еще загружается, попробуйте через несколько секунд",
+        database: isDbReady,
+        ready: false
+      });
+    }
+    next();
+  };
+
+  // Get all bot projects (lightweight - without data field)
+  setupProjectRoutes(app, requireDbReady);
+
+  // Get all bot instances (без секрета token)
+  app.get("/api/bots", async (req, res) => {
+    try {
+      const instances = await storage.getAllBotInstances();
+      // Скоупинг под владельца: отдаём только инстансы проектов запросившего
+      const ownerId = getOwnerIdFromRequest(req);
+      if (ownerId === null) {
+        return res.json([]);
+      }
+      const ownProjects = await storage.getUserBotProjects(ownerId, { ignoreArchive: true });
+      const ownProjectIds = new Set(ownProjects.map(p => p.id));
+      const scoped = instances
+        .filter((inst) => ownProjectIds.has(inst.projectId))
+        .map(({ token: _token, ...safe }) => safe);
+      res.json(scoped);
+    } catch (error) {
+      res.status(500).json({ message: "Failed to fetch bot instances" });
+    }
+  });
+
+  // Template management endpoints (seed — только /admin/api/templates/*)
+  setupTemplatesRoutes(app, requireDbReady);
+  setupTokenEnvVariableRoutes(app);
+
+  // Token management endpoints
+
+  // Get all tokens for a project
+  app.get("/api/projects/:id/tokens", async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.id);
+
+      // Check project ownership if user is authenticated
+      const ownerId = getOwnerIdFromRequest(req);
+      if (ownerId !== null) {
+        const project = await storage.getBotProject(projectId);
+        if (!project) {
+          return res.status(404).json({ message: "Project not found" });
+        }
+        const hasAccess = await storage.hasProjectAccess(projectId, ownerId);
+        if (!hasAccess) {
+          return res.status(403).json({ message: "You don't have permission to view this project's tokens" });
+        }
+      }
+
+      const tokens = await storage.getBotTokensByProject(projectId);
+
+      const safeTokens = tokens.map((token) => {
+        const publicToken = toPublicBotToken(token);
+        const botId = token.token ? token.token.split(':')[0] : null;
+        return { ...publicToken, botId };
+      });
+
+      res.json(safeTokens);
+      return; // Явно указываем, что функция завершается
+    } catch (error) {
+      console.error("Failed to fetch tokens:", error);
+      res.status(500).json({ message: "Failed to fetch tokens", error: (error as any).message });
+      return; // Явно указываем, что функция завершается
+    }
+  });
+
+  // Parse bot information from Telegram API
+  app.post("/api/projects/:id/tokens/parse", async (req, res) => {
+    console.log(`\n[📋 Routes] ==========================================`);
+    console.log(`[📋 Routes] ЗАПРОС: POST /api/projects/:id/tokens/parse`);
+    console.log(`[📋 Routes] Файл: server/routes/routes.ts`);
+    console.log(`[📋 Routes] Время: ${new Date().toISOString()}`);
+    console.log(`[📋 Routes] ==========================================`);
+    
+    try {
+      const { token } = req.body;
+      console.log(`[📋 Routes] Получены данные из req.body:`);
+      console.log(`  - token: ${token ? 'есть' : 'НЕТ (ошибка!)'}`);
+      console.log(`  - длина токена: ${token?.length || 0}`);
+
+      if (!token) {
+        console.log(`[❌ Routes] Ошибка: токен не предоставлен`);
+        return res.status(400).json({ message: "Token is required" });
+      }
+
+      // Маскировка токена для логирования
+      const maskedToken = token.length > 12
+        ? `${token.slice(0, 8)}...${token.slice(-4)}`
+        : '***';
+
+      console.log(`[📋 Routes] Маскированный токен: ${maskedToken}`);
+      console.log(`[📋 Routes] Вызываем fetchWithProxy для getMe...`);
+
+      // Get bot information via Telegram Bot API
+      const telegramApiUrl = `https://api.telegram.org/bot${token}/getMe`;
+      const startTime = Date.now();
+      console.log(`[📋 Routes] URL запроса: ${telegramApiUrl}`);
+      console.log(`[📋 Routes] Таймаут: 10000ms`);
+
+      let response;
+      try {
+        console.log(`[📋 Routes] Вызов fetchWithProxy...`);
+        response = await fetchWithProxy(telegramApiUrl, {
+          method: 'GET',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          // Add timeout signal
+          signal: AbortSignal.timeout(10000),
+        });
+        console.log(`[📋 Routes] fetchWithProxy вернул ответ, статус: ${response.status}`);
+      } catch (fetchError) {
+        console.error(`[❌ Routes] fetchWithProxy выбросил ошибку!`);
+        const errorMessage = fetchError instanceof Error ? fetchError.message : 'Unknown fetch error';
+        const errorCause = fetchError instanceof Error && 'cause' in fetchError
+          ? (fetchError.cause as Error)?.message || fetchError.cause
+          : 'No cause';
+
+        console.error(`[❌ Telegram] Fetch failed for ${maskedToken}:`);
+        console.error(`  - Error: ${errorMessage}`);
+        console.error(`  - Cause: ${errorCause}`);
+        console.error(`  - Time: ${Date.now() - startTime}ms`);
+        console.error(`  - Possible reasons:`);
+        console.error(`    • Telegram API is blocked in your network/region`);
+        console.error(`    • DNS resolution failed`);
+        console.error(`    • Firewall/antivirus blocking connection`);
+        console.error(`    • Network connectivity issues`);
+        console.error(`  - Solution: Set TELEGRAM_PROXY_URL in .env file`);
+
+        return res.status(500).json({
+          message: "Failed to connect to Telegram API",
+          error: errorMessage,
+          details: "Telegram API may be blocked in your network. Set TELEGRAM_PROXY_URL in .env file.",
+          tokenMasked: maskedToken
+        });
+      }
+
+      const duration = Date.now() - startTime;
+      console.log(`[✅ Routes] Response received in ${duration}ms, status: ${response.status}`);
+
+      const result = await response.json();
+      console.log(`[📋 Routes] Распарсили JSON ответ:`);
+      console.log(`  - ok: ${result?.ok}`);
+      const resultPreview =
+        result?.result != null
+          ? JSON.stringify(result.result, null, 2).slice(0, 200)
+          : String(result?.description ?? result?.error ?? '(нет result)');
+      console.log(`  - result: ${resultPreview}...`);
+
+      // HTTP-ошибка Telegram или ok:false / пустой result → 400, не 500
+      if (!response.ok || !result?.ok || !result?.result) {
+        console.warn(
+          `[❌ Routes] Bot token validation failed for ${maskedToken}: ${result?.description || 'Unknown error'}`,
+        );
+        return res.status(400).json({
+          message: "Invalid bot token or failed to get bot info",
+          error: result?.description || "Unknown error",
+        });
+      }
+
+      console.log(`[✅ Routes] Bot info retrieved successfully: @${result.result.username}`);
+      const botInfo = result.result;
+
+      // Get bot description and short description
+      let botDescription = null;
+      let botShortDescription = null;
+
+      try {
+        // Get full description
+        const descStartTime = Date.now();
+        const descResponse = await fetchWithProxy(`https://api.telegram.org/bot${token}/getMyDescription`, {
+          signal: AbortSignal.timeout(5000),
+        });
+        console.log(`[Telegram API] Description response: ${descResponse.status} (${Date.now() - descStartTime}ms)`);
+        
+        if (descResponse.ok) {
+          const descResult = await descResponse.json();
+          if (descResult.ok && descResult.result && descResult.result.description) {
+            botDescription = descResult.result.description;
+            console.log(`[Telegram API] Bot description length: ${botDescription.length} chars`);
+          }
+        }
+
+        // Get short description
+        const shortDescStartTime = Date.now();
+        const shortDescResponse = await fetchWithProxy(`https://api.telegram.org/bot${token}/getMyShortDescription`, {
+          signal: AbortSignal.timeout(5000),
+        });
+        console.log(`[Telegram API] Short description response: ${shortDescResponse.status} (${Date.now() - shortDescStartTime}ms)`);
+        
+        if (shortDescResponse.ok) {
+          const shortDescResult = await shortDescResponse.json();
+          if (shortDescResult.ok && shortDescResult.result && shortDescResult.result.short_description) {
+            botShortDescription = shortDescResult.result.short_description;
+            console.log(`[Telegram API] Bot short description length: ${botShortDescription.length} chars`);
+          }
+        }
+      } catch (descError) {
+        const descErrorMessage = descError instanceof Error ? descError.message : 'Unknown error';
+        console.warn(`[Telegram API] Failed to get bot descriptions for ${maskedToken}: ${descErrorMessage}`);
+      }
+
+      // Get bot photo URL if exists
+      let photoUrl = null;
+      if (botInfo.photo && botInfo.photo.big_file_id) {
+        try {
+          const photoStartTime = Date.now();
+          const fileResponse = await fetchWithProxy(`https://api.telegram.org/bot${token}/getFile`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              file_id: botInfo.photo.big_file_id
+            }),
+            signal: AbortSignal.timeout(5000),
+          });
+
+          const fileResult = await fileResponse.json();
+          console.log(`[Telegram API] Photo file response: ${fileResponse.status} (${Date.now() - photoStartTime}ms)`);
+
+          if (fileResponse.ok && fileResult.result && fileResult.result.file_path) {
+            photoUrl = `https://api.telegram.org/file/bot${token}/${fileResult.result.file_path}`;
+            console.log(`[Telegram API] Bot photo URL obtained`);
+          }
+        } catch (photoError) {
+          const photoErrorMessage = photoError instanceof Error ? photoError.message : 'Unknown error';
+          console.warn(`[Telegram API] Failed to get bot photo URL for ${maskedToken}: ${photoErrorMessage}`);
+        }
+      }
+
+      // Return parsed bot information
+      const parsedBotInfo = {
+        botFirstName: botInfo.first_name,
+        botUsername: botInfo.username,
+        botDescription: botDescription,
+        botShortDescription: botShortDescription,
+        botPhotoUrl: photoUrl,
+        botCanJoinGroups: botInfo.can_join_groups ? 1 : 0,
+        botCanReadAllGroupMessages: botInfo.can_read_all_group_messages ? 1 : 0,
+        botSupportsInlineQueries: botInfo.supports_inline_queries ? 1 : 0,
+        botHasMainWebApp: botInfo.has_main_web_app ? 1 : 0,
+      };
+
+      console.log(`[Telegram API] Bot parsing completed successfully for @${botInfo.username}`);
+      res.json(parsedBotInfo);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      const errorStack = error instanceof Error ? error.stack : 'No stack trace';
+      const errorCause = error instanceof Error && 'cause' in error 
+        ? (error.cause as Error)?.message || error.cause 
+        : 'No cause';
+      
+      console.error(`[Telegram API] Critical error parsing bot info:`);
+      console.error(`  - Message: ${errorMessage}`);
+      console.error(`  - Cause: ${errorCause}`);
+      console.error(`  - Stack: ${errorStack}`);
+      
+      res.status(500).json({ 
+        message: "Failed to parse bot info",
+        error: errorMessage,
+        details: errorCause !== 'No cause' ? errorCause : undefined
+      });
+    }
+  });
+
+  // Update bot information via Telegram API
+  app.put("/api/projects/:id/tokens/:tokenId/bot-info", requireTokenOwnership, async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.id);
+      const tokenId = parseInt(req.params.tokenId);
+      const { field, value } = req.body;
+
+      if (!field || value === undefined) {
+        return res.status(400).json({ message: "Field and value are required" });
+      }
+
+      // Get bot token
+      const token = await storage.getBotToken(tokenId);
+      if (!token || token.projectId !== projectId) {
+        return res.status(404).json({ message: "Token not found" });
+      }
+
+      // Update bot information via Telegram API
+      let telegramApiMethod;
+      let requestBody: any = {};
+
+      switch (field) {
+        case 'name':
+          telegramApiMethod = 'setMyName';
+          requestBody = { name: value };
+          break;
+        case 'description':
+          telegramApiMethod = 'setMyDescription';
+          requestBody = { description: value };
+          break;
+        case 'shortDescription':
+          telegramApiMethod = 'setMyShortDescription';
+          requestBody = { short_description: value };
+          break;
+        default:
+          return res.status(400).json({ message: "Invalid field" });
+      }
+
+      // Call Telegram API
+      const telegramApiUrl = `https://api.telegram.org/bot${token.token}/${telegramApiMethod}`;
+
+      if (getTelegramProxyAgent()) {
+        console.log(`[Telegram API] Using proxy for update ${field}`);
+      }
+
+      const response = await fetchWithProxy(telegramApiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(requestBody),
+      });
+
+      const result = await response.json();
+
+      if (!response.ok) {
+        return res.status(400).json({
+          message: `Failed to update ${field}`,
+          error: result.description || "Unknown error"
+        });
+      }
+
+      // Update local database with new information
+      let updateData: Partial<any> = {};
+      switch (field) {
+        case 'name':
+          updateData.botFirstName = value;
+          break;
+        case 'description':
+          updateData.botDescription = value;
+          break;
+        case 'shortDescription':
+          updateData.botShortDescription = value;
+          break;
+      }
+
+      await storage.updateBotToken(tokenId, updateData);
+
+      res.json({ success: true, field, value });
+    } catch (error) {
+      console.error(`Failed to update bot ${req.body.field}:`, error);
+      res.status(500).json({ message: `Failed to update bot ${req.body.field}` });
+    }
+  });
+
+  // Create a new token
+  app.post("/api/projects/:id/tokens", async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.id);
+
+      // Check project ownership if user is authenticated
+      const ownerId = getOwnerIdFromRequest(req);
+      if (ownerId !== null) {
+        const project = await storage.getBotProject(projectId);
+        if (!project) {
+          return res.status(404).json({ message: "Project not found" });
+        }
+        const hasAccess = await storage.hasProjectAccess(projectId, ownerId);
+        if (!hasAccess) {
+          return res.status(403).json({ message: "You don't have permission to add tokens to this project" });
+        }
+      }
+
+      // Игнорируем ownerId из body, используем только из сессии
+      // Fallback: если сессия не читается — берём owner_id из проекта
+      const { ownerId: _ignored, ...bodyData } = req.body;
+      const sessionOwnerId = getOwnerIdFromRequest(req);
+      let resolvedOwnerId: number | null = sessionOwnerId;
+      if (resolvedOwnerId === null) {
+        const proj = await storage.getBotProject(projectId);
+        resolvedOwnerId = proj?.ownerId ?? null;
+      }
+      const tokenData = insertBotTokenSchema.parse({
+        ...bodyData,
+        projectId,
+        ownerId: resolvedOwnerId
+      }) as StorageBotTokenInput;
+
+      // Если botUsername не передан — автоматически получаем данные бота из Telegram
+      let enrichedTokenData: StorageBotTokenInput = { ...tokenData };
+      if (!tokenData.botUsername && tokenData.token) {
+        try {
+          const tgRes = await fetchWithProxy(`https://api.telegram.org/bot${tokenData.token}/getMe`, {
+            signal: AbortSignal.timeout(8000),
+          });
+          if (tgRes.ok) {
+            const tgData = await tgRes.json();
+            if (tgData.ok && tgData.result) {
+              const r = tgData.result;
+              enrichedTokenData = {
+                ...enrichedTokenData,
+                botUsername: r.username ?? enrichedTokenData.botUsername,
+                botFirstName: enrichedTokenData.botFirstName || r.first_name,
+                botCanJoinGroups: r.can_join_groups ? 1 : 0,
+                botCanReadAllGroupMessages: r.can_read_all_group_messages ? 1 : 0,
+                botSupportsInlineQueries: r.supports_inline_queries ? 1 : 0,
+                lastUsedAt: new Date(),
+              };
+            }
+          }
+        } catch {
+          // Не блокируем создание если Telegram недоступен
+        }
+      }
+
+      // Проверяем дубли: если токен с таким значением уже есть в проекте — возвращаем существующий
+      if (enrichedTokenData.token) {
+        const existingTokens = await storage.getBotTokensByProject(projectId);
+        const duplicate = existingTokens.find(t => t.token === enrichedTokenData.token);
+        if (duplicate) {
+          console.log(`[routes] Токен уже существует в проекте (id=${duplicate.id}), возвращаем существующий`);
+          return res.status(200).json(duplicate);
+        }
+      }
+
+      const token = await storage.createBotToken(enrichedTokenData);
+
+      broadcastProjectEvent(projectId, {
+        type: 'token-created',
+        projectId,
+        tokenId: token.id,
+        data: { tokenId: token.id, tokenName: token.name },
+        timestamp: new Date().toISOString(),
+      }).catch(err => console.error('[routes] broadcastProjectEvent error:', err));
+
+      res.status(201).json(token);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid data", errors: error.errors });
+      }
+      console.error('[routes] createBotToken error:', error);
+      res.status(500).json({ message: "Failed to create token" });
+    }
+  });
+
+  // Update a token by project and token ID
+  app.put("/api/projects/:id/tokens/:tokenId", async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.id);
+      const tokenId = parseInt(req.params.tokenId);
+
+      // Check project ownership if user is authenticated
+      const ownerId = getOwnerIdFromRequest(req);
+      if (ownerId !== null) {
+        const project = await storage.getBotProject(projectId);
+        if (!project) {
+          return res.status(404).json({ message: "Project not found" });
+        }
+        const hasAccess = await storage.hasProjectAccess(projectId, ownerId);
+        if (!hasAccess) {
+          return res.status(403).json({ message: "You don't have permission to modify tokens in this project" });
+        }
+
+        // Also verify that the token belongs to this project
+        const token = await storage.getBotToken(tokenId);
+        if (!token || token.projectId !== projectId) {
+          return res.status(404).json({ message: "Token not found in this project" });
+        }
+      }
+
+      const updateData = insertBotTokenSchema.partial().parse(req.body) as StorageBotTokenUpdate;
+      if (updateData.token && isMaskedOrPlaceholderToken(updateData.token)) {
+        delete (updateData as { token?: string }).token;
+      }
+      // Новый секрет токена снова делает бота доступным для рассылок
+      if (updateData.token) {
+        updateData.isActive = 1;
+      }
+
+      const updatedToken = await storage.updateBotToken(tokenId, updateData);
+      if (!updatedToken) {
+        return res.status(404).json({ message: "Token not found" });
+      }
+
+      void emitTokenUpdated({
+        projectId,
+        tokenId,
+        before: undefined,
+        source: 'api',
+      }).catch((err) => console.error('[put-project-token] emitTokenUpdated:', err));
+
+      res.json(toPublicBotToken(updatedToken));
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid data", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to update token" });
+    }
+  });
+
+  // Delete a token for a specific project (hasProjectAccess + сверка projectId)
+  app.delete(
+    "/api/projects/:projectId/tokens/:tokenId",
+    requireTokenOwnership,
+    deleteProjectTokenHandler,
+  );
+
+  /**
+   * Переключение настроек автоперезапуска для токена бота
+   * PUT /api/projects/:projectId/tokens/:tokenId/auto-restart
+   */
+  app.put("/api/projects/:projectId/tokens/:tokenId/auto-restart", requireTokenOwnership, async (req, res) => {
+    try {
+      const tokenId = parseInt(req.params.tokenId);
+      const projectId = parseInt(req.params.projectId);
+      const { autoRestart, maxRestartAttempts } = req.body as {
+        autoRestart: number;
+        maxRestartAttempts: number;
+      };
+
+      if (autoRestart !== 0 && autoRestart !== 1) {
+        return res.status(400).json({ message: "autoRestart должен быть 0 или 1" });
+      }
+      if (maxRestartAttempts < 1 || maxRestartAttempts > 10) {
+        return res.status(400).json({ message: "maxRestartAttempts должен быть от 1 до 10" });
+      }
+
+      const updated = await storage.updateBotToken(tokenId, { autoRestart, maxRestartAttempts });
+      if (!updated) {
+        return res.status(404).json({ message: "Токен не найден" });
+      }
+
+      void emitTokenUpdated({
+        projectId,
+        tokenId,
+        changedFields: ['autoRestart', 'maxRestartAttempts'],
+        source: 'api',
+      }).catch((err) => console.error('[auto-restart] emitTokenUpdated:', err));
+
+      res.json({ success: true, autoRestart, maxRestartAttempts });
+    } catch (error) {
+      res.status(500).json({ message: "Ошибка обновления настроек автоперезапуска" });
+    }
+  });
+
+  /**
+   * Обновление защиты контента для токена бота
+   * PUT /api/projects/:projectId/tokens/:tokenId/protect-content
+   */
+  app.put("/api/projects/:projectId/tokens/:tokenId/protect-content", requireTokenOwnership, async (req, res) => {
+    try {
+      const tokenId = parseInt(req.params.tokenId);
+      const projectId = parseInt(req.params.projectId);
+      const { protectContent } = req.body as { protectContent: number };
+
+      if (protectContent !== 0 && protectContent !== 1) {
+        return res.status(400).json({ message: "protectContent должен быть 0 или 1" });
+      }
+
+      const updated = await storage.updateBotToken(tokenId, { protectContent });
+      if (!updated) {
+        return res.status(404).json({ message: "Токен не найден" });
+      }
+
+      try {
+        const { existsSync, readFileSync, writeFileSync, readdirSync } = await import('fs');
+        const { join } = await import('path');
+        const botsDir = join(process.cwd(), 'bots');
+
+        if (existsSync(botsDir)) {
+          const dirs = readdirSync(botsDir, { withFileTypes: true });
+
+          for (const dir of dirs) {
+            if (!dir.isDirectory()) continue;
+
+            const envPath = join(botsDir, dir.name, '.env');
+            if (!existsSync(envPath)) continue;
+
+            const content = readFileSync(envPath, 'utf8');
+            if (!content.includes(`PROJECT_ID=${projectId}`)) continue;
+
+            const line = `PROTECT_CONTENT=${protectContent === 1 ? 'true' : 'false'}`;
+            let updatedContent = content;
+
+            if (/^PROTECT_CONTENT=.*/m.test(updatedContent)) {
+              updatedContent = updatedContent.replace(/^PROTECT_CONTENT=.*/m, line);
+            } else {
+              updatedContent = `${updatedContent.trim()}\n\n# Защита контента от копирования/пересылки в Telegram\n${line}\n`;
+            }
+
+            if (updatedContent !== content) {
+              writeFileSync(envPath, updatedContent, 'utf8');
+              console.log(`✅ PROTECT_CONTENT обновлён в ${envPath}: ${protectContent}`);
+            }
+          }
+        }
+      } catch (envErr) {
+        console.warn('⚠️ Не удалось обновить .env файл бота:', envErr);
+      }
+
+      void emitTokenUpdated({
+        projectId,
+        tokenId,
+        changedFields: ['protectContent'],
+        source: 'api',
+      }).catch((err) => console.error('[protect-content] emitTokenUpdated:', err));
+
+      res.json({ success: true, protectContent });
+    } catch (error) {
+      res.status(500).json({ message: "Ошибка обновления защиты контента" });
+    }
+  });
+
+  /**
+   * Срок хранения сообщений диалога для токена бота.
+   * 0 — без автоочистки; N — удалять bot_messages старше N дней (аналитика не трогается).
+   * @route PUT /api/projects/:projectId/tokens/:tokenId/messages-retention
+   */
+  app.put(
+    "/api/projects/:projectId/tokens/:tokenId/messages-retention",
+    requireTokenOwnership,
+    updateMessagesRetentionHandler,
+  );
+
+  /**
+   * Обновление настройки сохранения входящих медиафайлов для токена бота
+   * PUT /api/projects/:projectId/tokens/:tokenId/save-incoming-media
+   */
+  app.put("/api/projects/:projectId/tokens/:tokenId/save-incoming-media", requireTokenOwnership, async (req, res) => {
+    try {
+      const tokenId = parseInt(req.params.tokenId);
+      const projectId = parseInt(req.params.projectId);
+      const { saveIncomingMedia } = req.body as { saveIncomingMedia: number };
+
+      if (saveIncomingMedia !== 0 && saveIncomingMedia !== 1) {
+        return res.status(400).json({ message: "saveIncomingMedia должен быть 0 или 1" });
+      }
+
+      const updated = await storage.updateBotToken(tokenId, { saveIncomingMedia });
+      if (!updated) {
+        return res.status(404).json({ message: "Токен не найден" });
+      }
+
+      try {
+        const { existsSync, readFileSync, writeFileSync, readdirSync } = await import('fs');
+        const { join } = await import('path');
+        const botsDir = join(process.cwd(), 'bots');
+
+        if (existsSync(botsDir)) {
+          const dirs = readdirSync(botsDir, { withFileTypes: true });
+
+          for (const dir of dirs) {
+            if (!dir.isDirectory()) continue;
+
+            const envPath = join(botsDir, dir.name, '.env');
+            if (!existsSync(envPath)) continue;
+
+            const content = readFileSync(envPath, 'utf8');
+            if (!content.includes(`PROJECT_ID=${projectId}`)) continue;
+
+            const line = `SAVE_INCOMING_MEDIA=${saveIncomingMedia === 1 ? 'true' : 'false'}`;
+            let updatedContent = content;
+
+            if (/^SAVE_INCOMING_MEDIA=.*/m.test(updatedContent)) {
+              updatedContent = updatedContent.replace(/^SAVE_INCOMING_MEDIA=.*/m, line);
+            } else {
+              updatedContent = `${updatedContent.trim()}\n\n# Сохранение входящих медиафайлов от пользователей\n${line}\n`;
+            }
+
+            if (updatedContent !== content) {
+              writeFileSync(envPath, updatedContent, 'utf8');
+              console.log(`✅ SAVE_INCOMING_MEDIA обновлён в ${envPath}: ${saveIncomingMedia}`);
+            }
+          }
+        }
+      } catch (envErr) {
+        console.warn('⚠️ Не удалось обновить .env файл бота:', envErr);
+      }
+
+      void emitTokenUpdated({
+        projectId,
+        tokenId,
+        changedFields: ['saveIncomingMedia'],
+        source: 'api',
+      }).catch((err) => console.error('[save-incoming-media] emitTokenUpdated:', err));
+
+      res.json({ success: true, saveIncomingMedia });
+    } catch (error) {
+      res.status(500).json({ message: "Ошибка обновления настройки сохранения медиа" });
+    }
+  });
+
+  /**
+   * Обновление настройки catch-all обработчиков для токена бота
+   * PUT /api/projects/:projectId/tokens/:tokenId/catch-all-handlers
+   *
+   * Управляет генерацией универсальных catch-all обработчиков
+   * (handle_unhandled_message, handle_unhandled_photo, fallback_callback_handler).
+   * Значение в .env пишется как 0/1 (как USER_DATABASE), а не true/false.
+   */
+  app.put("/api/projects/:projectId/tokens/:tokenId/catch-all-handlers", requireTokenOwnership, async (req, res) => {
+    try {
+      const tokenId = parseInt(req.params.tokenId);
+      const projectId = parseInt(req.params.projectId);
+      const { catchAllHandlers } = req.body as { catchAllHandlers: number };
+
+      if (catchAllHandlers !== 0 && catchAllHandlers !== 1) {
+        return res.status(400).json({ message: "catchAllHandlers должен быть 0 или 1" });
+      }
+
+      const updated = await storage.updateBotToken(tokenId, { catchAllHandlers });
+      if (!updated) {
+        return res.status(404).json({ message: "Токен не найден" });
+      }
+
+      try {
+        const { existsSync, readFileSync, writeFileSync, readdirSync } = await import('fs');
+        const { join } = await import('path');
+        const botsDir = join(process.cwd(), 'bots');
+
+        if (existsSync(botsDir)) {
+          const dirs = readdirSync(botsDir, { withFileTypes: true });
+
+          for (const dir of dirs) {
+            if (!dir.isDirectory()) continue;
+
+            const envPath = join(botsDir, dir.name, '.env');
+            if (!existsSync(envPath)) continue;
+
+            const content = readFileSync(envPath, 'utf8');
+            if (!content.includes(`PROJECT_ID=${projectId}`)) continue;
+
+            const line = `CATCH_ALL_HANDLERS=${catchAllHandlers}`;
+            let updatedContent = content;
+
+            if (/^CATCH_ALL_HANDLERS=.*/m.test(updatedContent)) {
+              updatedContent = updatedContent.replace(/^CATCH_ALL_HANDLERS=.*/m, line);
+            } else {
+              updatedContent = `${updatedContent.trim()}\n\n# Генерация catch-all обработчиков (0/1)\n${line}\n`;
+            }
+
+            if (updatedContent !== content) {
+              writeFileSync(envPath, updatedContent, 'utf8');
+              console.log(`✅ CATCH_ALL_HANDLERS обновлён в ${envPath}: ${catchAllHandlers}`);
+            }
+          }
+        }
+      } catch (envErr) {
+        console.warn('⚠️ Не удалось обновить .env файл бота:', envErr);
+      }
+
+      void emitTokenUpdated({
+        projectId,
+        tokenId,
+        changedFields: ['catchAllHandlers'],
+        source: 'api',
+      }).catch((err) => console.error('[catch-all-handlers] emitTokenUpdated:', err));
+
+      res.json({ success: true, catchAllHandlers });
+    } catch (error) {
+      res.status(500).json({ message: "Ошибка обновления настройки catch-all обработчиков" });
+    }
+  });
+
+  /**
+   * Обновление настройки живого обновления контента для токена бота
+   * PUT /api/projects/:projectId/tokens/:tokenId/content-cache
+   *
+   * Управляет генерацией машинерии live-reload контента
+   * (load_content, reload_content, _content_reload_loop, _content_subscribe_redis).
+   * Аксессор get_content и кэш _content_cache генерируются всегда.
+   * Значение в .env пишется как 0/1 (как CATCH_ALL_HANDLERS), а не true/false.
+   */
+  app.put("/api/projects/:projectId/tokens/:tokenId/content-cache", requireTokenOwnership, async (req, res) => {
+    try {
+      const tokenId = parseInt(req.params.tokenId);
+      const projectId = parseInt(req.params.projectId);
+      const { contentCache } = req.body as { contentCache: number };
+
+      if (contentCache !== 0 && contentCache !== 1) {
+        return res.status(400).json({ message: "contentCache должен быть 0 или 1" });
+      }
+
+      const updated = await storage.updateBotToken(tokenId, { contentCache });
+      if (!updated) {
+        return res.status(404).json({ message: "Токен не найден" });
+      }
+
+      try {
+        const { existsSync, readFileSync, writeFileSync, readdirSync } = await import('fs');
+        const { join } = await import('path');
+        const botsDir = join(process.cwd(), 'bots');
+
+        if (existsSync(botsDir)) {
+          const dirs = readdirSync(botsDir, { withFileTypes: true });
+
+          for (const dir of dirs) {
+            if (!dir.isDirectory()) continue;
+
+            const envPath = join(botsDir, dir.name, '.env');
+            if (!existsSync(envPath)) continue;
+
+            const content = readFileSync(envPath, 'utf8');
+            if (!content.includes(`PROJECT_ID=${projectId}`)) continue;
+
+            const line = `CONTENT_CACHE=${contentCache}`;
+            let updatedContent = content;
+
+            if (/^CONTENT_CACHE=.*/m.test(updatedContent)) {
+              updatedContent = updatedContent.replace(/^CONTENT_CACHE=.*/m, line);
+            } else {
+              updatedContent = `${updatedContent.trim()}\n\n# Живое обновление контента из таблицы _content (0/1)\n${line}\n`;
+            }
+
+            if (updatedContent !== content) {
+              writeFileSync(envPath, updatedContent, 'utf8');
+              console.log(`✅ CONTENT_CACHE обновлён в ${envPath}: ${contentCache}`);
+            }
+          }
+        }
+      } catch (envErr) {
+        console.warn('⚠️ Не удалось обновить .env файл бота:', envErr);
+      }
+
+      void emitTokenUpdated({
+        projectId,
+        tokenId,
+        changedFields: ['contentCache'],
+        source: 'api',
+      }).catch((err) => console.error('[content-cache] emitTokenUpdated:', err));
+
+      res.json({ success: true, contentCache });
+    } catch (error) {
+      res.status(500).json({ message: "Ошибка обновления настройки живого обновления контента" });
+    }
+  });
+
+  /**
+   * Обновление настроек Telethon userbot для токена бота
+   * PUT /api/projects/:projectId/tokens/:tokenId/userbot
+   */
+  app.put("/api/projects/:projectId/tokens/:tokenId/userbot", requireTokenOwnership, async (req, res) => {
+    try {
+      const tokenId = parseInt(req.params.tokenId);
+      const projectId = parseInt(req.params.projectId);
+      const { userbotEnabled, userbotApiId, userbotApiHash, userbotSessionString } = req.body as {
+        userbotEnabled: number;
+        userbotApiId: string | null;
+        userbotApiHash: string | null;
+        userbotSessionString: string | null;
+      };
+
+      if (userbotEnabled !== 0 && userbotEnabled !== 1) {
+        return res.status(400).json({ message: "userbotEnabled должен быть 0 или 1" });
+      }
+
+      const updated = await storage.updateBotToken(tokenId, {
+        userbotEnabled,
+        userbotApiId,
+        userbotApiHash,
+        userbotSessionString,
+      });
+      if (!updated) {
+        return res.status(404).json({ message: "Токен не найден" });
+      }
+
+      try {
+        const { existsSync, readFileSync, writeFileSync, readdirSync } = await import('fs');
+        const { join } = await import('path');
+        const botsDir = join(process.cwd(), 'bots');
+
+        if (existsSync(botsDir)) {
+          const dirs = readdirSync(botsDir, { withFileTypes: true });
+
+          for (const dir of dirs) {
+            if (!dir.isDirectory()) continue;
+
+            const envPath = join(botsDir, dir.name, '.env');
+            if (!existsSync(envPath)) continue;
+
+            const content = readFileSync(envPath, 'utf8');
+            if (!content.includes(`PROJECT_ID=${projectId}`)) continue;
+
+            let updatedContent = content;
+
+            const envLines: Array<{ key: string; value: string; comment: string }> = [
+              { key: 'USERBOT_ENABLED', value: userbotEnabled === 1 ? 'true' : 'false', comment: '# Telethon userbot' },
+              { key: 'USERBOT_API_ID', value: userbotApiId ?? '', comment: '' },
+              { key: 'USERBOT_API_HASH', value: userbotApiHash ?? '', comment: '' },
+              { key: 'USERBOT_SESSION_STRING', value: userbotSessionString ?? '', comment: '' },
+            ];
+
+            for (const { key, value, comment } of envLines) {
+              const regex = new RegExp(`^${key}=.*`, 'm');
+              const line = `${key}=${value}`;
+              if (regex.test(updatedContent)) {
+                updatedContent = updatedContent.replace(regex, line);
+              } else if (value) {
+                const prefix = comment ? `\n${comment}\n` : '\n';
+                updatedContent = `${updatedContent.trim()}${prefix}${line}\n`;
+              }
+            }
+
+            if (updatedContent !== content) {
+              writeFileSync(envPath, updatedContent, 'utf8');
+              console.log(`✅ Userbot настройки обновлены в ${envPath}`);
+            }
+          }
+        }
+      } catch (envErr) {
+        console.warn('⚠️ Не удалось обновить .env файл бота:', envErr);
+      }
+
+      void emitTokenUpdated({
+        projectId,
+        tokenId,
+        changedFields: ['userbotEnabled'],
+        source: 'api',
+      }).catch((err) => console.error('[userbot] emitTokenUpdated:', err));
+
+      res.json({ success: true, userbotEnabled });
+    } catch (error) {
+      res.status(500).json({ message: "Ошибка обновления настроек юзербота" });
+    }
+  });
+
+  /**
+   * Авторизация Telethon userbot — шаг 1: отправка кода
+   * POST /api/projects/:projectId/tokens/:tokenId/userbot/send-code
+   */
+  app.post("/api/projects/:projectId/tokens/:tokenId/userbot/send-code", requireTokenOwnership, async (req, res) => {
+    try {
+      const tokenId = parseInt(req.params.tokenId);
+      const { apiId, apiHash, phone } = req.body as { apiId: string; apiHash: string; phone: string };
+
+      if (!apiId || !apiHash || !phone) {
+        return res.status(400).json({ ok: false, message: "Заполните API ID, API Hash и номер телефона" });
+      }
+
+      const { sendAuthCommand } = await import('../bots/userbotAuthManager');
+      const result = await sendAuthCommand(tokenId, 'send_code', {
+        api_id: apiId,
+        api_hash: apiHash,
+        phone,
+      });
+
+      res.json(result);
+    } catch (error: any) {
+      res.status(500).json({ ok: false, message: error.message || "Ошибка отправки кода" });
+    }
+  });
+
+  /**
+   * Авторизация Telethon userbot — шаг 2: ввод кода
+   * POST /api/projects/:projectId/tokens/:tokenId/userbot/sign-in
+   */
+  app.post("/api/projects/:projectId/tokens/:tokenId/userbot/sign-in", requireTokenOwnership, async (req, res) => {
+    try {
+      const tokenId = parseInt(req.params.tokenId);
+      const { phone, code } = req.body as { phone: string; code: string };
+
+      if (!phone || !code) {
+        return res.status(400).json({ ok: false, message: "Заполните номер телефона и код" });
+      }
+
+      const { sendAuthCommand } = await import('../bots/userbotAuthManager');
+      const result = await sendAuthCommand(tokenId, 'sign_in', { phone, code });
+
+      // Если получили session_string — сохраняем в БД
+      if (result.ok && result.session_string) {
+        await storage.updateBotToken(tokenId, {
+          userbotSessionString: result.session_string,
+          userbotEnabled: 1,
+        });
+      }
+
+      res.json(result);
+    } catch (error: any) {
+      res.status(500).json({ ok: false, message: error.message || "Ошибка авторизации" });
+    }
+  });
+
+  /**
+   * Авторизация Telethon userbot — шаг 3: ввод 2FA пароля
+   * POST /api/projects/:projectId/tokens/:tokenId/userbot/sign-in-2fa
+   */
+  app.post("/api/projects/:projectId/tokens/:tokenId/userbot/sign-in-2fa", requireTokenOwnership, async (req, res) => {
+    try {
+      const tokenId = parseInt(req.params.tokenId);
+      const { password } = req.body as { password: string };
+
+      if (!password) {
+        return res.status(400).json({ ok: false, message: "Введите пароль" });
+      }
+
+      const { sendAuthCommand } = await import('../bots/userbotAuthManager');
+      const result = await sendAuthCommand(tokenId, 'sign_in_2fa', { password });
+
+      // Если получили session_string — сохраняем в БД
+      if (result.ok && result.session_string) {
+        await storage.updateBotToken(tokenId, {
+          userbotSessionString: result.session_string,
+          userbotEnabled: 1,
+        });
+      }
+
+      res.json(result);
+    } catch (error: any) {
+      res.status(500).json({ ok: false, message: error.message || "Ошибка 2FA авторизации" });
+    }
+  });
+
+  /**
+   * Обновление уровня логирования для токена бота
+   * PUT /api/projects/:projectId/tokens/:tokenId/log-level
+   */
+  app.put("/api/projects/:projectId/tokens/:tokenId/log-level", requireTokenOwnership, async (req, res) => {
+    try {
+      const tokenId = parseInt(req.params.tokenId);
+      const projectId = parseInt(req.params.projectId);
+      const { logLevel } = req.body as { logLevel: string };
+      const valid = ['DEBUG', 'INFO', 'WARNING', 'ERROR'] as const;
+      if (!(valid as readonly string[]).includes(logLevel)) {
+        return res.status(400).json({ message: "Недопустимый уровень логирования" });
+      }
+      const updated = await storage.updateBotToken(tokenId, { logLevel: logLevel as StorageBotTokenInput["logLevel"] });
+      if (!updated) return res.status(404).json({ message: "Токен не найден" });
+
+      // Обновляем .env файл бота если существует
+      try {
+        const { existsSync, readFileSync, writeFileSync, readdirSync } = await import('fs');
+        const { join } = await import('path');
+        const botsDir = join(process.cwd(), 'bots');
+        if (existsSync(botsDir)) {
+          const dirs = readdirSync(botsDir, { withFileTypes: true });
+          for (const dir of dirs) {
+            if (!dir.isDirectory()) continue;
+            const envPath = join(botsDir, dir.name, '.env');
+            if (!existsSync(envPath)) continue;
+            const content = readFileSync(envPath, 'utf8');
+            // Проверяем что это .env нужного проекта по PROJECT_ID
+            if (!content.includes(`PROJECT_ID=${projectId}`)) continue;
+            const updatedContent = content.replace(/^LOG_LEVEL=.*/m, `LOG_LEVEL=${logLevel}`);
+            if (updatedContent !== content) {
+              writeFileSync(envPath, updatedContent, 'utf8');
+              console.log(`✅ LOG_LEVEL обновлён в ${envPath}: ${logLevel}`);
+            }
+          }
+        }
+      } catch (envErr) {
+        console.warn('⚠️ Не удалось обновить .env файл бота:', envErr);
+      }
+
+      void emitTokenUpdated({
+        projectId,
+        tokenId,
+        changedFields: ['logLevel'],
+        source: 'api',
+      }).catch((err) => console.error('[log-level] emitTokenUpdated:', err));
+
+      res.json({ success: true, logLevel });
+    } catch (error) {
+      res.status(500).json({ message: "Ошибка обновления уровня логирования" });
+    }
+  });
+
+  /**
+   * Обновление настроек режима запуска для токена бота
+   * PUT /api/projects/:projectId/tokens/:tokenId/launch-settings
+   */
+  app.put("/api/projects/:projectId/tokens/:tokenId/launch-settings", requireTokenOwnership, async (req, res) => {
+    try {
+      const tokenId = parseInt(req.params.tokenId);
+      const projectId = parseInt(req.params.projectId);
+      const { launchMode, webhookBaseUrl, webhookSecretToken } = req.body as {
+        launchMode: 'polling' | 'webhook';
+        webhookBaseUrl?: string | null;
+        webhookSecretToken?: string | null;
+      };
+
+      if (launchMode !== 'polling' && launchMode !== 'webhook') {
+        return res.status(400).json({ message: "launchMode должен быть 'polling' или 'webhook'" });
+      }
+
+      // Читаем текущий режим до обновления
+      const currentToken = await storage.getBotToken(tokenId);
+      const previousMode = currentToken?.launchMode ?? 'polling';
+
+      const updated = await storage.updateBotToken(tokenId, {
+        launchMode,
+        webhookBaseUrl: webhookBaseUrl ?? null,
+        webhookSecretToken: webhookSecretToken ?? null,
+      });
+
+      if (!updated) {
+        return res.status(404).json({ message: "Токен не найден" });
+      }
+
+      // Если переключились с webhook на polling — снимаем webhook в Telegram
+      // чтобы не было конфликта между активным webhook и polling
+      if (previousMode === 'webhook' && launchMode === 'polling' && currentToken?.token) {
+        try {
+          const deleteUrl = `https://api.telegram.org/bot${currentToken.token}/deleteWebhook`;
+          await fetchWithProxy(deleteUrl, { signal: AbortSignal.timeout(5000) });
+          console.log(`🔗 Webhook удалён при смене режима на polling для токена ${tokenId}`);
+        } catch (webhookError) {
+          // Не критично — при следующем запуске бота deleteWebhook вызовется снова
+          console.log(`⚠️ Не удалось удалить webhook при смене режима для токена ${tokenId}:`, webhookError);
+        }
+      }
+
+      void emitTokenUpdated({
+        projectId,
+        tokenId,
+        changedFields: ['launchMode', 'webhookBaseUrl'],
+        source: 'api',
+      }).catch((err) => console.error('[launch-settings] emitTokenUpdated:', err));
+
+      res.json({ success: true, launchMode, webhookBaseUrl, webhookSecretToken });
+    } catch (error) {
+      res.status(500).json({ message: "Ошибка обновления настроек запуска" });
+    }
+  });
+
+  // Get default/first token for .env generation (raw secret + id)
+  app.get(
+    "/api/projects/:id/tokens/first",
+    requireProjectAccess,
+    getFirstProjectTokenHandler,
+  );
+
+  // === МЕДИАФАЙЛЫ ===
+
+  // Загрузка медиафайла (одиночная) с улучшенной обработкой
+  app.post("/api/media/upload/:projectId", requireProjectAccess, upload.single('file'), fixUtf8Encoding, async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.projectId);
+      const file = req.file;
+      const { description, tags, isPublic, storageConfigId } = req.body;
+
+      if (!file) {
+        return res.status(400).json({
+          message: "Файл не выбран",
+          code: "NO_FILE"
+        });
+      }
+
+      // Проверяем, что проект существует
+      const project = await storage.getBotProject(projectId);
+      if (!project) {
+        // Удаляем загруженный файл если проект не найден
+        if (existsSync(file.path)) {
+          unlinkSync(file.path);
+        }
+        return res.status(404).json({
+          message: "Проект не найден",
+          code: "PROJECT_NOT_FOUND"
+        });
+      }
+
+      // Дополнительная валидация файла
+      const validation = validateFileDetailed(file);
+      if (!validation.valid) {
+        // Удаляем файл при ошибке валидации
+        if (existsSync(file.path)) {
+          unlinkSync(file.path);
+        }
+        return res.status(400).json({
+          message: validation.error,
+          code: "VALIDATION_ERROR"
+        });
+      }
+
+      // Создаем относительный путь для file_path и URL (исторический локальный путь)
+      // file.path имеет вид: C:\...\uploads\{projectId}\{date}\{filename}
+      // Нам нужно: uploads/{projectId}/{date}/{filename} для file_path
+      // и /uploads/{projectId}/{date}/{filename} для url
+      const uploadsDir = join(process.cwd(), 'uploads');
+      const relativePath = file.path.replace(uploadsDir, 'uploads').replace(/\\/g, '/');
+      const fileUrl = relativePath.startsWith('/') ? relativePath : `/${relativePath}`;
+
+      // Выбираем целевой бэкенд: запрошенный writable storageConfigId либо активный (Req 11.7)
+      const registry = await ensureStorageRegistryLoaded();
+      const targetBackend = resolveUploadBackend(registry, storageConfigId);
+
+      // Записываем файл в целевой бэкенд (локальный дефолт остаётся на диске; S3 — через put)
+      let persisted;
+      try {
+        persisted = await persistUploadToBackend(targetBackend, file, file.path, fileUrl);
+      } catch (storageError) {
+        // Сбой записи во внешнее хранилище (например, недоступность S3) → 502 + очистка (Req 12.6)
+        if (storageError instanceof StorageBackendWriteError && storageError.backend === "s3") {
+          if (existsSync(file.path)) {
+            try { unlinkSync(file.path); } catch { /* очистка best-effort */ }
+          }
+          return res.status(502).json({
+            message: "Хранилище S3 недоступно, файл не сохранён",
+            code: "STORAGE_UNREACHABLE",
+          });
+        }
+        throw storageError;
+      }
+
+      // Обрабатываем теги
+      const processedTags = tags ?
+        (Array.isArray(tags) ? tags : tags.split(','))
+          .map((tag: string) => tag.trim().toLowerCase())
+          .filter((tag: string) => tag.length > 0 && tag.length <= 50)
+          .slice(0, 10) // Максимум 10 тегов
+        : [];
+
+      // Автоматически добавляем теги на основе типа файла
+      const autoTags = [];
+      if (validation.category) {
+        autoTags.push(validation.category);
+      }
+      if (file.mimetype.includes('gif')) {
+        autoTags.push('анимация');
+      }
+      if (file.size > 10 * 1024 * 1024) {
+        autoTags.push('большой_файл');
+      }
+
+      const finalTags = Array.from(new Set([...processedTags, ...autoTags]));
+
+      // Определяем тип файла
+      const fileType = getFileType(file.mimetype);
+
+      // ID загрузившего коллаборатора (telegram_users.id) либо null для гостей (Req 9.2)
+      const uploadedBy = getOwnerIdFromRequest(req);
+
+      // Сохраняем информацию о файле в базе данных
+      const mediaFile = await storage.createMediaFile({
+        projectId,
+        fileName: file.originalname,
+        fileType: fileType,
+        filePath: persisted.filePath,
+        fileSize: file.size,
+        mimeType: file.mimetype,
+        url: persisted.url,
+        description: description || `${validation.category || 'Файл'} - ${file.originalname}`,
+        tags: finalTags,
+        isPublic: isPublic === 'true' || isPublic === true ? 1 : 0,
+        uploadedBy: uploadedBy ?? undefined,
+        storageBackend: persisted.storageBackend,
+        storageConfigId: persisted.storageConfigId,
+      });
+
+      // Мягкая квота локального хранилища: считаем флаг, но не блокируем загрузку (Req 4.7)
+      const usedBytes = await computeLocalUsedBytes(projectId);
+      const quotaExceeded = isQuotaExceeded(usedBytes, readStorageLimitBytes());
+
+      // Возвращаем подробную информацию о загруженном файле
+      res.json({
+        ...mediaFile,
+        quotaExceeded,
+        uploadInfo: {
+          category: validation.category,
+          sizeMB: Math.round(file.size / (1024 * 1024) * 100) / 100,
+          autoTagsAdded: autoTags.length,
+          uploadDate: new Date().toISOString()
+        }
+      });
+    } catch (error) {
+      console.error("Ошибка при загрузке файла:", error);
+
+      // Удаляем файл в случае ошибки
+      if (req.file && existsSync(req.file.path)) {
+        try {
+          unlinkSync(req.file.path);
+        } catch (unlinkError) {
+          console.error("Ошибка при удалении файла:", unlinkError);
+        }
+      }
+
+      const errorMessage = error instanceof Error ? error.message : "Неизвестная ошибка";
+      res.status(500).json({
+        message: "Ошибка при загрузке файла",
+        error: errorMessage,
+        code: "UPLOAD_ERROR"
+      });
+    }
+  });
+
+  // Загрузка множественных медиафайлов с улучшенной обработкой
+  app.post("/api/media/upload-multiple/:projectId", requireProjectAccess, upload.array('files', 20), async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.projectId);
+      const files = req.files as Express.Multer.File[];
+
+      const { isPublic, defaultDescription } = req.body;
+
+      if (!files || files.length === 0) {
+        return res.status(400).json({
+          message: "Файлы не выбраны",
+          code: "NO_FILES"
+        });
+      }
+
+      // Проверяем, что проект существует
+      const project = await storage.getBotProject(projectId);
+      if (!project) {
+        // Удаляем все файлы если проект не найден
+        files.forEach(file => {
+          if (existsSync(file.path)) {
+            unlinkSync(file.path);
+          }
+        });
+        return res.status(404).json({
+          message: "Проект не найден",
+          code: "PROJECT_NOT_FOUND"
+        });
+      }
+
+      const uploadedFiles = [];
+      const errors = [];
+      const warnings: string[] = [];
+
+      // Группируем файлы по типам для статистики
+      const fileStats = {
+        photo: 0,
+        video: 0,
+        audio: 0,
+        document: 0
+      };
+
+      for (const file of files) {
+        try {
+          // Проверяем размер файла в зависимости от типа
+          const maxSize = file.mimetype.startsWith('video/') ? 100 * 1024 * 1024 : 50 * 1024 * 1024;
+          if (file.size > maxSize) {
+            // Удаляем файл, если он превышает лимит
+            unlinkSync(file.path);
+            errors.push({
+              fileName: file.originalname,
+              error: `Файл слишком большой. Максимальный размер: ${file.mimetype.startsWith('video/') ? '100' : '50'}МБ`
+            });
+            continue;
+          }
+
+          // Создаем URL для доступа к файлу
+          const fileUrl = `/uploads/${file.filename}`;
+
+          // Сохраняем информацию о файле в базе данных
+          const mediaFile = await storage.createMediaFile({
+            projectId,
+            fileName: file.originalname,
+            fileType: getFileType(file.mimetype),
+            filePath: file.path,
+            fileSize: file.size,
+            mimeType: file.mimetype,
+            url: fileUrl,
+            description: defaultDescription || '',
+            tags: [],
+            isPublic: isPublic ? 1 : 0
+          });
+
+          // Обновляем статистику по типам файлов
+          const fileType = getFileType(file.mimetype);
+          fileStats[fileType]++;
+
+          uploadedFiles.push(mediaFile);
+        } catch (fileError) {
+          console.error(`Ошибка при обработке файла ${file.originalname}:`, fileError);
+
+          // Удаляем файл в случае ошибки
+          if (existsSync(file.path)) {
+            try {
+              unlinkSync(file.path);
+            } catch (unlinkError) {
+              console.error("Ошибка при удалении файла:", unlinkError);
+            }
+          }
+
+          errors.push({
+            fileName: file.originalname,
+            error: "Ошибка при сохранении файла"
+          });
+        }
+      }
+
+      // Собираем дополнительную статистику
+      const totalSize = uploadedFiles.reduce((sum, file) => sum + file.fileSize, 0);
+
+      res.json({
+        success: uploadedFiles.length,
+        errors: errors.length,
+        uploadedFiles,
+        errorDetails: errors,
+        statistics: {
+          totalFiles: files.length,
+          totalSize,
+          fileTypes: fileStats,
+          averageSize: uploadedFiles.length > 0 ? Math.round(totalSize / uploadedFiles.length) : 0
+        },
+        warnings: warnings.length > 0 ? warnings : undefined
+      });
+    } catch (error) {
+      console.error("Ошибка при загрузке файлов:", error);
+
+      // Удаляем все файлы в случае ошибки
+      if (req.files) {
+        (req.files as Express.Multer.File[]).forEach(file => {
+          if (existsSync(file.path)) {
+            try {
+              unlinkSync(file.path);
+            } catch (unlinkError) {
+              console.error("Ошибка при удалении файла:", unlinkError);
+            }
+          }
+        });
+      }
+
+      res.status(500).json({ message: "Ошибка при загрузке файлов" });
+    }
+  });
+
+  // Проверка доступности URL перед загрузкой
+  app.post("/api/media/check-url", async (req, res) => {
+    try {
+      const { url } = req.body;
+
+      if (!url || typeof url !== 'string') {
+        return res.status(400).json({
+          message: "URL не указан",
+          code: "MISSING_URL"
+        });
+      }
+
+      // Защита от SSRF: блокируем внутренние адреса
+      const urlValidation = validateExternalUrl(url, req.headers.host);
+      if (!urlValidation.valid) {
+        return res.status(400).json({
+          message: urlValidation.reason,
+          code: "BLOCKED_URL"
+        });
+      }
+
+      const result = await checkUrlAccessibility(url);
+
+      if (!result.accessible) {
+        return res.status(400).json({
+          accessible: false,
+          error: result.error,
+          code: "URL_NOT_ACCESSIBLE"
+        });
+      }
+
+      // Проверяем тип файла
+      const validation = validateFileDetailed({
+        mimetype: result.mimeType || 'application/octet-stream',
+        size: result.size || 0,
+        originalname: result.fileName || 'file'
+      } as any);
+
+      if (!validation.valid) {
+        return res.status(400).json({
+          accessible: false,
+          error: validation.error,
+          code: "UNSUPPORTED_FILE_TYPE"
+        });
+      }
+
+      res.json({
+        accessible: true,
+        fileInfo: {
+          mimeType: result.mimeType,
+          size: result.size,
+          fileName: result.fileName,
+          fileType: result.mimeType ? getFileType(result.mimeType) : 'document',
+          category: validation.category,
+          sizeMB: result.size ? Math.round(result.size / (1024 * 1024) * 100) / 100 : 0
+        }
+      });
+
+    } catch (error) {
+      console.error('Ошибка проверки URL:', error);
+      res.status(500).json({
+        accessible: false,
+        error: "Ошибка при проверке URL",
+        code: "CHECK_ERROR"
+      });
+    }
+  });
+
+  // Загрузка файла по URL с расширенными возможностями
+  app.post("/api/media/download-url/:projectId", requireProjectAccess, async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.projectId);
+      const { url, description, tags, isPublic, customFileName } = req.body;
+
+      if (!url || typeof url !== 'string') {
+        return res.status(400).json({
+          message: "URL не указан",
+          code: "MISSING_URL"
+        });
+      }
+
+      // Проверяем, что проект существует
+      const project = await storage.getBotProject(projectId);
+      if (!project) {
+        return res.status(404).json({
+          message: "Проект не найден",
+          code: "PROJECT_NOT_FOUND"
+        });
+      }
+
+      // Сначала проверяем доступность файла
+      const urlCheck = await checkUrlAccessibility(url);
+      if (!urlCheck.accessible) {
+        return res.status(400).json({
+          message: "Файл недоступен по указанной ссылке",
+          error: urlCheck.error,
+          code: "URL_NOT_ACCESSIBLE"
+        });
+      }
+
+      // Создаем путь для сохранения
+      const date = new Date().toISOString().split('T')[0];
+      const uploadDir = join(process.cwd(), 'uploads', projectId.toString(), date);
+
+      if (!existsSync(uploadDir)) {
+        mkdirSync(uploadDir, { recursive: true });
+      }
+
+      // Генерируем уникальное имя файла
+      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+      const originalFileName = customFileName || urlCheck.fileName || 'downloaded-file';
+      const extension = originalFileName.split('.').pop()?.toLowerCase() || 'bin';
+      const baseName = originalFileName
+        .split('.')[0]
+        .replace(/[^a-zA-Z0-9._-]/g, '_')
+        .substring(0, 50);
+
+      const fileName = `${uniqueSuffix}-${baseName}.${extension}`;
+      const filePath = join(uploadDir, fileName);
+
+      // Загружаем файл
+      const downloadResult = await downloadFileFromUrl(url, filePath);
+
+      if (!downloadResult.success) {
+        return res.status(400).json({
+          message: "Ошибка загрузки файла",
+          error: downloadResult.error,
+          code: "DOWNLOAD_FAILED"
+        });
+      }
+
+      // Проверяем загруженный файл
+      const validation = validateFileDetailed({
+        mimetype: downloadResult.mimeType || 'application/octet-stream',
+        size: downloadResult.size || 0,
+        originalname: originalFileName,
+        path: filePath
+      } as any);
+
+      if (!validation.valid) {
+        // Удаляем файл если он не прошел валидацию
+        if (existsSync(filePath)) {
+          unlinkSync(filePath);
+        }
+        return res.status(400).json({
+          message: validation.error,
+          code: "VALIDATION_FAILED"
+        });
+      }
+
+      // Создаем URL для доступа к файлу
+      const fileUrl = `/uploads/${projectId}/${date}/${fileName}`;
+
+      // Обрабатываем теги
+      const processedTags = tags
+        ? tags
+          .split(',')
+          .map((tag: string) => tag.trim().toLowerCase())
+          .filter((tag: string) => tag.length > 0 && tag.length <= 50)
+          .slice(0, 10)
+        : [];
+
+      // Автоматически добавляем теги
+      const autoTags = ['загружено_по_url'];
+      if (validation.category) {
+        autoTags.push(validation.category);
+      }
+      if (downloadResult.mimeType?.includes('gif')) {
+        autoTags.push('анимация');
+      }
+      if (downloadResult.size && downloadResult.size > 10 * 1024 * 1024) {
+        autoTags.push('большой_файл');
+      }
+
+      const finalTags = Array.from(new Set([...processedTags, ...autoTags]));
+
+      // Сохраняем информацию о файле в базе данных
+      const mediaFile = await storage.createMediaFile({
+        projectId,
+        fileName: originalFileName,
+        fileType: getFileType(downloadResult.mimeType || 'application/octet-stream'),
+        filePath: filePath,
+        fileSize: downloadResult.size || 0,
+        mimeType: downloadResult.mimeType || 'application/octet-stream',
+        url: fileUrl,
+        description: description || `Файл загружен по ссылке: ${originalFileName}`,
+        tags: finalTags,
+        isPublic: isPublic === 'true' || isPublic === true ? 1 : 0
+      });
+
+      // Возвращаем подробную информацию о загруженном файле
+      res.json({
+        ...mediaFile,
+        downloadInfo: {
+          sourceUrl: url,
+          category: validation.category,
+          sizeMB: Math.round((downloadResult.size || 0) / (1024 * 1024) * 100) / 100,
+          autoTagsAdded: autoTags.length,
+          downloadDate: new Date().toISOString(),
+          method: 'url_download'
+        }
+      });
+
+    } catch (error) {
+      console.error('Ошибка при загрузке файла по URL:', error);
+
+      const errorMessage = error instanceof Error ? error.message : "Неизвестная ошибка";
+      res.status(500).json({
+        message: "Ошибка при загрузке файла по URL",
+        error: errorMessage,
+        code: "DOWNLOAD_ERROR"
+      });
+    }
+  });
+
+  // Пакетная загрузка файлов по URL (множественная загрузка)
+  app.post("/api/media/download-urls/:projectId", requireProjectAccess, async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.projectId);
+      const { urls, isPublic, defaultDescription } = req.body;
+
+      if (!urls || !Array.isArray(urls) || urls.length === 0) {
+        return res.status(400).json({
+          message: "URLs не указаны",
+          code: "MISSING_URLS"
+        });
+      }
+
+      if (urls.length > 10) {
+        return res.status(400).json({
+          message: "Максимум 10 URL за раз",
+          code: "TOO_MANY_URLS"
+        });
+      }
+
+      // Проверяем, что проект существует
+      const project = await storage.getBotProject(projectId);
+      if (!project) {
+        return res.status(404).json({
+          message: "Проект не найден",
+          code: "PROJECT_NOT_FOUND"
+        });
+      }
+
+      const downloadedFiles = [];
+      const errors = [];
+
+      // Создаем путь для сохранения
+      const date = new Date().toISOString().split('T')[0];
+      const uploadDir = join(process.cwd(), 'uploads', projectId.toString(), date);
+
+      if (!existsSync(uploadDir)) {
+        mkdirSync(uploadDir, { recursive: true });
+      }
+
+      // Обра��атываем каждый URL
+      for (let i = 0; i < urls.length; i++) {
+        const urlData = urls[i];
+        const url = typeof urlData === 'string' ? urlData : urlData.url;
+        const customFileName = typeof urlData === 'object' ? urlData.fileName : undefined;
+        const customDescription = typeof urlData === 'object' ? urlData.description : undefined;
+
+        try {
+          // Проверяем доступность
+          const urlCheck = await checkUrlAccessibility(url);
+          if (!urlCheck.accessible) {
+            errors.push({
+              url: url,
+              error: `Файл недоступен: ${urlCheck.error}`
+            });
+            continue;
+          }
+
+          // Генерируем путь для ��айла
+          const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+          const originalFileName = customFileName || urlCheck.fileName || `file-${i + 1}`;
+          const extension = originalFileName.split('.').pop()?.toLowerCase() || 'bin';
+          const baseName = originalFileName
+            .split('.')[0]
+            .replace(/[^a-zA-Z0-9._-]/g, '_')
+            .substring(0, 50);
+
+          const fileName = `${uniqueSuffix}-${baseName}.${extension}`;
+          const filePath = join(uploadDir, fileName);
+
+          // Загружаем файл
+          const downloadResult = await downloadFileFromUrl(url, filePath);
+
+          if (!downloadResult.success) {
+            errors.push({
+              url: url,
+              error: `Ошибка загрузки: ${downloadResult.error}`
+            });
+            continue;
+          }
+
+          // Валидация
+          const validation = validateFileDetailed({
+            mimetype: downloadResult.mimeType || 'application/octet-stream',
+            size: downloadResult.size || 0,
+            originalname: originalFileName,
+            path: filePath
+          } as any);
+
+          if (!validation.valid) {
+            if (existsSync(filePath)) {
+              unlinkSync(filePath);
+            }
+            errors.push({
+              url: url,
+              error: `Валидация не пройдена: ${validation.error}`
+            });
+            continue;
+          }
+
+          // Создаем URL для доступа
+          const fileUrl = `/uploads/${projectId}/${date}/${fileName}`;
+
+          // Сохраняем в базе данных
+          const mediaFile = await storage.createMediaFile({
+            projectId,
+            fileName: originalFileName,
+            fileType: getFileType(downloadResult.mimeType || 'application/octet-stream'),
+            filePath: filePath,
+            fileSize: downloadResult.size || 0,
+            mimeType: downloadResult.mimeType || 'application/octet-stream',
+            url: fileUrl,
+            description: customDescription || defaultDescription || `Файл загружен по ссылке: ${originalFileName}`,
+            tags: ['загружено_по_url', validation.category || 'файл'],
+            isPublic: isPublic ? 1 : 0
+          });
+
+          downloadedFiles.push({
+            ...mediaFile,
+            sourceUrl: url
+          });
+
+        } catch (error) {
+          console.error(`Ошибка обработки URL ${url}:`, error);
+          errors.push({
+            url: url,
+            error: error instanceof Error ? error.message : 'Неизвестная ошибка'
+          });
+        }
+      }
+
+      res.json({
+        success: downloadedFiles.length,
+        errors: errors.length,
+        downloadedFiles,
+        errorDetails: errors,
+        summary: {
+          total: urls.length,
+          successful: downloadedFiles.length,
+          failed: errors.length,
+          totalSize: downloadedFiles.reduce((sum, file) => sum + file.fileSize, 0)
+        }
+      });
+
+    } catch (error) {
+      console.error('Ошибка пакетной загрузки по URL:', error);
+      res.status(500).json({
+        message: "Ошибка при пакетной загрузке файлов по URL",
+        code: "BATCH_DOWNLOAD_ERROR"
+      });
+    }
+  });
+
+  // Получение всех медиафайлов проекта (+ fileIdsByToken из media_file_tokens)
+  app.get("/api/media/project/:projectId", requireProjectAccess, async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.projectId);
+      const fileType = req.query.type as string;
+
+      let mediaFiles;
+      if (fileType && ['photo', 'video', 'audio', 'document'].includes(fileType)) {
+        mediaFiles = await storage.getMediaFilesByType(projectId, fileType);
+      } else {
+        mediaFiles = await storage.getMediaFilesByProject(projectId);
+      }
+
+      res.json(await enrichMediaFilesWithTokens(mediaFiles));
+    } catch (error) {
+      console.error("Ошибка при получении медиафайлов:", error);
+      res.status(500).json({ message: "Ошибка при получении медиафайлов" });
+    }
+  });
+
+  // Получение конкретного медиафайла
+  app.get("/api/media/:id", requireMediaOwnership, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const mediaFile = await storage.getMediaFile(id);
+
+      if (!mediaFile) {
+        return res.status(404).json({ message: "Файл не найден" });
+      }
+
+      res.json(mediaFile);
+    } catch (error) {
+      console.error("Ошибка при получении файла:", error);
+      res.status(500).json({ message: "Ошибка при получении файла" });
+    }
+  });
+
+  // Обно��ление медиафайла
+  app.put("/api/media/:id", requireMediaOwnership, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const updates = req.body;
+
+      const mediaFile = await storage.updateMediaFile(id, updates);
+
+      if (!mediaFile) {
+        return res.status(404).json({ message: "Файл не найден" });
+      }
+
+      res.json(mediaFile);
+    } catch (error) {
+      console.error("Ошибка при обновлении файла:", error);
+      res.status(500).json({ message: "Ошибка при обновлении файла" });
+    }
+  });
+
+  // Удаление медиафайла
+  app.delete("/api/media/:id", requireMediaOwnership, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+
+      // Получаем информацию о файле перед удалением
+      const mediaFile = await storage.getMediaFile(id);
+      if (!mediaFile) {
+        return res.status(404).json({ message: "Файл не найден" });
+      }
+
+      // Удал��ем файл с диска
+      try {
+        unlinkSync(mediaFile.filePath);
+      } catch (error) {
+        console.warn("Не удалось удалить файл с диска:", error);
+      }
+
+      // Удаляем запись из базы данных
+      const success = await storage.deleteMediaFile(id);
+
+      if (!success) {
+        return res.status(404).json({ message: "Фай�� не найден в базе данных" });
+      }
+
+      res.json({ message: "Файл успешно удален" });
+    } catch (error) {
+      console.error("Ошибка при удалении файла:", error);
+      res.status(500).json({ message: "Ошибка при удалении файла" });
+    }
+  });
+
+  // Поиск медиафайлов
+  app.get("/api/media/search/:projectId", requireProjectAccess, async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.projectId);
+      const query = req.query.q as string;
+
+      if (!query) {
+        return res.status(400).json({ message: "Поисковый запрос не может быть пустым" });
+      }
+
+      const mediaFiles = await storage.searchMediaFiles(projectId, query);
+      res.json(mediaFiles);
+    } catch (error) {
+      console.error("Оши������ка при п����иске ������������йлов:", error);
+      res.status(500).json({ message: "Ошибка при поиске файлов" });
+    }
+  });
+
+  // Увеличение счетчика использования файла
+  app.post("/api/media/:id/use", requireMediaOwnership, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const success = await storage.incrementMediaFileUsage(id);
+
+      if (!success) {
+        return res.status(404).json({ message: "Файл не найден" });
+      }
+
+      res.json({ message: "Использование файла отмечено" });
+    } catch (error) {
+      console.error("Ошибка при обновлении использования файла:", error);
+      res.status(500).json({ message: "Ошибка при обновлении использования файла" });
+    }
+  });
+
+  // User Bot Data Management endpoints
+
+  // Get all user data for a project
+  app.get("/api/projects/:id/users", async (req, res) => {
+    const projectId = parseInt(req.params.id);
+    const tokenId = getRequestTokenId(req);
+
+    // Проверяем права доступа к проекту для авторизованных пользователей
+    const ownerId = getOwnerIdFromRequest(req);
+    if (ownerId !== null) {
+      const hasAccess = await storage.hasProjectAccess(projectId, ownerId);
+      if (!hasAccess) {
+        return res.status(403).json({ message: "Нет прав доступа к проекту" });
+      }
+    }
+
+    // Параметры пагинации: если limit не передан — обратная совместимость (массив)
+    const limit = req.query.limit ? parseInt(req.query.limit as string) : null;
+    const offset = req.query.offset ? parseInt(req.query.offset as string) : 0;
+
+    // Параметры серверного поиска, фильтрации и сортировки (только для пагинированного режима)
+    const search = req.query.search as string | undefined;
+    const filterActive = req.query.filterActive as string | undefined;
+    const sortBy = req.query.sortBy as string | undefined;
+    const sortDir = req.query.sortDir as string | undefined;
+
+    // Белый список колонок для ORDER BY (защита от SQL injection)
+    const sortColumnMap: Record<string, string> = {
+      lastInteraction: 'u.last_interaction',
+      createdAt: 'u.registered_at',
+      interactionCount: 'u.interaction_count',
+      firstName: 'u.first_name',
+      userName: 'u.username',
+    };
+    const sortColumn = sortColumnMap[sortBy as string] ?? 'u.last_interaction';
+    const sortOrder = sortDir === 'asc' ? 'ASC' : 'DESC';
+
+    const selectBase = `
+      SELECT
+        ROW_NUMBER() OVER (ORDER BY u.last_interaction DESC) AS id,
+        u.user_id::text AS "userId",
+        u.username AS "userName",
+        u.first_name AS "firstName",
+        u.last_name AS "lastName",
+        u.avatar_url AS "avatarUrl",
+        u.registered_at AS "registeredAt",
+        u.registered_at AS "createdAt",
+        u.last_interaction AS "lastInteraction",
+        COALESCE(u.interaction_count, 0)::integer AS "interactionCount",
+        CASE WHEN u.is_active = 1 THEN TRUE ELSE FALSE END AS "isActive",
+        CASE WHEN u.is_premium = 1 THEN TRUE ELSE FALSE END AS "isPremium",
+        CASE WHEN COALESCE(u.is_blocked, 0) = 1 THEN TRUE ELSE FALSE END AS "isBlocked",
+        CASE WHEN COALESCE(u.is_deleted, 0) = 1 THEN TRUE ELSE FALSE END AS "isDeleted",
+        CASE WHEN u.is_bot = 1 THEN TRUE ELSE FALSE END AS "isBot",
+        u.language_code AS "languageCode",
+        u.deep_link_param AS "deepLinkParam",
+        u.referrer_id AS "referrerId",
+        u.user_data AS "userData",
+        lm.message_text AS "lastMessageText",
+        lm.created_at AS "lastMessageAt",
+        FALSE AS "isGroup",
+        NULL AS "chatType"
+      FROM bot_users u
+      LEFT JOIN LATERAL (
+        SELECT message_text, created_at
+        FROM bot_messages
+        WHERE user_id = u.user_id::text
+          AND project_id = u.project_id
+        ORDER BY created_at DESC
+        LIMIT 1
+      ) lm ON true
+      WHERE u.is_bot = 0
+        AND u.project_id = $1
+        AND ($2::integer IS NULL OR u.token_id = $2)
+    `;
+
+    // Фильтр вкладки «Диалоги»: all | users | groups | channels (includeGroups — legacy)
+    const dialogKind = resolveDialogKind(req.query as Record<string, unknown>);
+    const includeUsers = wantsUsers(dialogKind);
+    const includeGroupsPart = wantsGroups(dialogKind);
+    const groupsSelectSql = buildGroupsSelectSql(groupChatTypesSql(dialogKind));
+    const groupsUnionSql = includeGroupsPart ? ` UNION ALL ${groupsSelectSql}` : '';
+
+    try {
+      if (limit !== null) {
+        // Режим пагинации: строим динамические условия WHERE
+        const params: any[] = [projectId, tokenId];
+        let paramIdx = 3;
+        const conditions: string[] = [];
+
+        if (search && includeUsers) {
+          const searchParam = `%${search}%`;
+          /**
+           * Ищем не только по данным пользователя, но и по тексту сообщений диалога.
+           * EXISTS сохраняет корректную пагинацию без дублирования строк пользователя.
+           */
+          conditions.push(`
+            (
+              u.first_name ILIKE $${paramIdx}
+              OR u.username ILIKE $${paramIdx}
+              OR u.user_id::text ILIKE $${paramIdx}
+              OR EXISTS (
+                SELECT 1
+                FROM bot_messages bm
+                WHERE bm.project_id = u.project_id
+                  AND bm.user_id = u.user_id::text
+                  AND ($2::integer IS NULL OR bm.token_id = $2)
+                  AND COALESCE(bm.message_text, '') ILIKE $${paramIdx}
+              )
+            )
+          `);
+          params.push(searchParam);
+          paramIdx++;
+        }
+        if (filterActive === 'true') conditions.push('u.is_active = 1');
+        if (filterActive === 'false') conditions.push('u.is_active = 0');
+
+        const whereExtra = conditions.length ? ' AND ' + conditions.join(' AND ') : '';
+
+        /** Поиск по названию группы/канала (внешний WHERE после GROUP BY) */
+        let groupsSearchOuter = '';
+        if (search && includeGroupsPart && !includeUsers) {
+          groupsSearchOuter = ` WHERE dialogs."firstName" ILIKE $${paramIdx}`;
+          params.push(`%${search}%`);
+          paramIdx++;
+        }
+
+        let dataSql: string;
+        let countSql: string;
+
+        if (includeUsers && includeGroupsPart) {
+          dataSql = `SELECT * FROM (${selectBase}${whereExtra}${groupsUnionSql}) AS dialogs ORDER BY "lastInteraction" DESC NULLS LAST LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`;
+          countSql = `SELECT COUNT(*)::integer AS total FROM (${selectBase}${whereExtra}${groupsUnionSql}) AS dialogs`;
+        } else if (includeGroupsPart) {
+          dataSql = `SELECT * FROM (${groupsSelectSql}) AS dialogs${groupsSearchOuter} ORDER BY "lastInteraction" DESC NULLS LAST LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`;
+          countSql = `SELECT COUNT(*)::integer AS total FROM (${groupsSelectSql}) AS dialogs${groupsSearchOuter}`;
+        } else {
+          dataSql = `${selectBase}${whereExtra} ORDER BY ${sortColumn} ${sortOrder} LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`;
+          countSql = `SELECT COUNT(*)::integer AS total FROM bot_users u WHERE u.is_bot = 0 AND u.project_id = $1 AND ($2::integer IS NULL OR u.token_id = $2)${whereExtra}`;
+        }
+
+        const dataParams = [...params, limit, offset];
+        const countParams = [...params];
+
+        const [dataResult, countResult] = await Promise.all([
+          dbPool.query(dataSql, dataParams),
+          dbPool.query(countSql, countParams),
+        ]);
+
+        const total: number = countResult.rows[0]?.total ?? 0;
+        const users = dataResult.rows;
+        console.log(`Paginated: project ${projectId}, kind=${dialogKind}, offset=${offset}, limit=${limit}, total=${total}`);
+        return res.json({ users, total, hasMore: offset + users.length < total });
+      }
+
+      // Обратная совместимость: возвращаем массив без пагинации (без фильтров)
+      const selectSql =
+        includeUsers && includeGroupsPart
+          ? `SELECT * FROM (${selectBase}${groupsUnionSql}) AS dialogs ORDER BY "lastInteraction" DESC NULLS LAST`
+          : includeGroupsPart
+            ? `SELECT * FROM (${groupsSelectSql}) AS dialogs ORDER BY "lastInteraction" DESC NULLS LAST`
+            : `${selectBase} ORDER BY u.last_interaction DESC`;
+      const result = await dbPool.query(selectSql, [projectId, tokenId]);
+      console.log(`Found ${result.rows.length} users for project ${projectId} (kind=${dialogKind})`);
+      res.json(result.rows);
+    } catch (error) {
+      console.error("Error fetching user data:", error);
+      // Fallback: прямой запрос к bot_users если основной запрос не сработал
+      try {
+        const fallbackResult = await dbPool.query(
+          `SELECT user_id AS "userId", username AS "userName", first_name AS "firstName",
+                  last_name AS "lastName", registered_at AS "registeredAt",
+                  last_interaction AS "lastInteraction", interaction_count AS "interactionCount",
+                  user_data AS "userData", is_active AS "isActive", avatar_url AS "avatarUrl",
+                  is_bot AS "isBot", project_id AS "projectId", token_id AS "tokenId",
+                  is_premium AS "isPremium", language_code AS "languageCode"
+           FROM bot_users WHERE project_id = $1 AND token_id = $2
+           ORDER BY last_interaction DESC`,
+          [parseInt(req.params.id), tokenId]
+        );
+        const users = fallbackResult.rows;
+        const projectId = parseInt(req.params.id);
+        console.log(`Found ${users.length} users for project ${projectId} from fallback`);
+        res.json(limit !== null ? { users, total: users.length, hasMore: false } : users);
+      } catch (fallbackError) {
+        res.status(500).json({ message: "Failed to fetch user data" });
+      }
+    }
+  });
+
+  // Get user data stats for a project
+  app.get("/api/projects/:id/users/stats", async (req, res) => {
+    const projectId = parseInt(req.params.id);
+    const tokenId = getRequestTokenId(req);
+
+    // Проверяем права доступа к проекту для авторизованных пользователей
+    const ownerId = getOwnerIdFromRequest(req);
+    if (ownerId !== null) {
+      const hasAccess = await storage.hasProjectAccess(projectId, ownerId);
+      if (!hasAccess) {
+        return res.status(403).json({ message: "Нет прав доступа к проекту" });
+      }
+    }
+
+    try {
+      // Используем общий пул соединений для запроса к bot_users.
+      // totalInteractions — COUNT(*) из bot_messages (входящие + исходящие).
+      const result = await dbPool.query(`
+        SELECT
+          COUNT(*) as "totalUsers",
+          COUNT(*) FILTER (WHERE is_active = 1) as "activeUsers",
+          COUNT(*) FILTER (WHERE is_active = 0) as "blockedUsers",
+          COUNT(*) FILTER (WHERE COALESCE(is_blocked, 0) = 1) as "blockedBotUsers",
+          COUNT(*) FILTER (WHERE COALESCE(is_deleted, 0) = 1) as "deletedUsers",
+          COUNT(*) FILTER (WHERE is_premium = 1) as "premiumUsers",
+          COUNT(*) FILTER (WHERE user_data IS NOT NULL AND user_data != '{}') as "usersWithResponses",
+          (SELECT COALESCE(COUNT(*), 0) FROM bot_messages bm
+           WHERE bm.project_id = $1
+             AND ($2::integer IS NULL OR bm.token_id = $2)) as "totalInteractions",
+          CASE WHEN COUNT(*) > 0
+            THEN (SELECT COALESCE(COUNT(*), 0)::float FROM bot_messages bm
+                  WHERE bm.project_id = $1
+                    AND ($2::integer IS NULL OR bm.token_id = $2)) / COUNT(*)
+            ELSE 0
+          END as "avgInteractionsPerUser",
+          COUNT(DISTINCT language_code) FILTER (WHERE language_code IS NOT NULL) as "uniqueLanguages",
+          COUNT(*) FILTER (WHERE deep_link_param IS NOT NULL AND deep_link_param != 'direct') as "deepLinkUsers",
+          COUNT(*) FILTER (WHERE referrer_id IS NOT NULL) as "referralUsers"
+        FROM bot_users
+        WHERE project_id = $1
+          AND ($2::integer IS NULL OR token_id = $2)
+      `, [projectId, tokenId]);
+
+      const stats = result.rows[0];
+      // Convert strings to numbers
+      Object.keys(stats).forEach(key => {
+        if (typeof stats[key] === 'string' && !isNaN(stats[key] as any)) {
+          stats[key] = parseInt(stats[key] as any);
+        }
+      });
+
+      res.json(stats);
+    } catch (error) {
+      console.error("Error fetching user stats:", error);
+      res.status(500).json({ message: "Failed to fetch user stats" });
+    }
+  });
+
+  /**
+   * Эндпоинт для получения данных трафика: источники и языки пользователей
+   * @route GET /api/projects/:id/users/traffic
+   * @param id - Идентификатор проекта
+   * @returns Объект с массивами sources и languages
+   */
+  app.get("/api/projects/:id/users/traffic", async (req, res) => {
+    const projectId = parseInt(req.params.id);
+    const tokenId = getRequestTokenId(req);
+
+    // Проверяем права доступа к проекту для авторизованных пользователей
+    const ownerId = getOwnerIdFromRequest(req);
+    if (ownerId !== null) {
+      const hasAccess = await storage.hasProjectAccess(projectId, ownerId);
+      if (!hasAccess) {
+        return res.status(403).json({ message: "Нет прав доступа к проекту" });
+      }
+    }
+
+    try {
+      // Запрос источников трафика по deep_link_param.
+      // Пользователи без deep_link_param (прямой /start) учитываются как "direct".
+      const sourcesResult = await dbPool.query(`
+        SELECT
+          COALESCE(deep_link_param, 'direct') as param,
+          COUNT(*) as count,
+          ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1) as percentage
+        FROM bot_users
+        WHERE project_id = $1
+          AND ($2::integer IS NULL OR token_id = $2)
+        GROUP BY COALESCE(deep_link_param, 'direct')
+        ORDER BY count DESC
+      `, [projectId, tokenId]);
+
+      // Запрос распределения по языкам
+      const languagesResult = await dbPool.query(`
+        SELECT
+          COALESCE(language_code, 'unknown') as code,
+          COUNT(*) as count,
+          ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1) as percentage
+        FROM bot_users
+        WHERE project_id = $1
+          AND ($2::integer IS NULL OR token_id = $2)
+          AND language_code IS NOT NULL
+        GROUP BY language_code
+        ORDER BY count DESC
+        LIMIT 20
+      `, [projectId, tokenId]);
+
+      res.json({
+        sources: sourcesResult.rows,
+        languages: languagesResult.rows,
+      });
+    } catch (error) {
+      console.error("Error fetching traffic data:", error);
+      res.status(500).json({ message: "Ошибка при получении данных трафика" });
+    }
+  });
+
+  /**
+   * Эндпоинт активности пользователей (уникальные люди за слот)
+   * @route GET /api/projects/:id/users/activity
+   * @query granularity - 1m|5m|1h|1w|1d|7d|30d
+   * @returns { points, activeInWindow, newInWindow }
+   */
+  app.get("/api/projects/:id/users/activity", async (req, res) => {
+    const projectId = parseInt(req.params.id);
+    const tokenId = getRequestTokenId(req);
+
+    const ownerId = getOwnerIdFromRequest(req);
+    if (ownerId !== null) {
+      const hasAccess = await storage.hasProjectAccess(projectId, ownerId);
+      if (!hasAccess) {
+        return res.status(403).json({ message: "Нет прав доступа к проекту" });
+      }
+    }
+
+    await handleUserActivity(req, res, dbPool, projectId, tokenId);
+  });
+
+  /**
+   * Эндпоинт для получения данных прироста пользователей с поддержкой гранулярности
+   * @route GET /api/projects/:id/users/growth
+   * @param id - Идентификатор проекта
+   * @query granularity - Гранулярность: "1h"|"1d"|"7d"|"30d" (новый параметр)
+   * @query period - Период: "7d"|"30d"|"90d" (старый параметр, обратная совместимость)
+   * @returns Массив объектов [{date, count}] — дата в ISO формате
+   */
+  app.get("/api/projects/:id/users/growth", async (req, res) => {
+    const projectId = parseInt(req.params.id);
+    const tokenId = getRequestTokenId(req);
+    const granularity = req.query.granularity as string | undefined;
+    const period = (req.query.period as string) || "30d";
+
+    const ownerId = getOwnerIdFromRequest(req);
+    if (ownerId !== null) {
+      const hasAccess = await storage.hasProjectAccess(projectId, ownerId);
+      if (!hasAccess) {
+        return res.status(403).json({ message: "Нет прав доступа к проекту" });
+      }
+    }
+
+    try {
+      // Режим гранулярности — новый параметр
+      if (granularity) {
+        const cfg = getChartSeriesGranularity(granularity);
+
+        const queryText = `
+          WITH series AS (
+            SELECT generate_series(
+              DATE_TRUNC('${cfg.truncate}', NOW() - INTERVAL '${cfg.window}'),
+              DATE_TRUNC('${cfg.truncate}', NOW()),
+              INTERVAL '${cfg.step}'
+            ) AS slot
+          ),
+          users AS (
+            SELECT
+              DATE_TRUNC('${cfg.truncate}', registered_at) AS slot,
+              COUNT(*) AS cnt
+            FROM bot_users
+            WHERE project_id = $1
+              AND ($2::integer IS NULL OR token_id = $2)
+              AND registered_at >= NOW() - INTERVAL '${cfg.window}'
+            GROUP BY 1
+          )
+          SELECT s.slot AS date, COALESCE(u.cnt, 0) AS count
+          FROM series s
+          LEFT JOIN users u ON u.slot = s.slot
+          ORDER BY s.slot ASC
+        `;
+
+        const result = await dbPool.query(queryText, [projectId, tokenId]);
+        return res.json(result.rows.map(row => ({
+          date: row.date instanceof Date ? row.date.toISOString() : String(row.date),
+          count: Number(row.count),
+        })));
+      }
+
+      // Режим period — старый параметр (обратная совместимость)
+      const intervalMap: Record<string, string> = {
+        "7d": "7 days",
+        "30d": "30 days",
+        "90d": "90 days",
+      };
+      const interval = intervalMap[period] ?? "30 days";
+
+      let result = await dbPool.query(`
+        SELECT
+          DATE(registered_at) as date,
+          COUNT(*) as count
+        FROM bot_users
+        WHERE project_id = $1
+          AND ($2::integer IS NULL OR token_id = $2)
+          AND registered_at >= NOW() - INTERVAL '${interval}'
+        GROUP BY DATE(registered_at)
+        ORDER BY date ASC
+      `, [projectId, tokenId]);
+
+      // Если данных нет — берём весь доступный диапазон (до 90 дней)
+      if (result.rows.length === 0) {
+        result = await dbPool.query(`
+          SELECT
+            DATE(registered_at) as date,
+            COUNT(*) as count
+          FROM bot_users
+          WHERE project_id = $1
+            AND ($2::integer IS NULL OR token_id = $2)
+            AND registered_at >= NOW() - INTERVAL '90 days'
+          GROUP BY DATE(registered_at)
+          ORDER BY date ASC
+        `, [projectId, tokenId]);
+      }
+
+      res.json(result.rows.map(row => ({
+        date: row.date instanceof Date
+          ? row.date.toISOString().split('T')[0]
+          : String(row.date),
+        count: Number(row.count),
+      })));
+    } catch (error) {
+      console.error("Error fetching growth data:", error);
+      res.status(500).json({ message: "Ошибка при получении данных прироста" });
+    }
+  });
+
+  /**
+   * Эндпоинт для получения данных прироста пользователей с разбивкой по источникам трафика
+   * @route GET /api/projects/:id/users/growth-by-source
+   * @param id - Идентификатор проекта
+   * @query granularity - Гранулярность: "1m"|"5m"|"1h"|"1w"|"1d"|"7d"|"30d" (обязательный)
+   * @query tokenId - Фильтр по боту (опциональный)
+   * @returns Массив объектов [{date, sources}] где sources — объект с количеством пользователей по источникам
+   */
+  app.get("/api/projects/:id/users/growth-by-source", async (req, res) => {
+    const projectId = parseInt(req.params.id);
+    const tokenId = getRequestTokenId(req);
+    const granularity = req.query.granularity as string | undefined;
+
+    // Проверка прав доступа к проекту
+    const ownerId = getOwnerIdFromRequest(req);
+    if (ownerId !== null) {
+      const hasAccess = await storage.hasProjectAccess(projectId, ownerId);
+      if (!hasAccess) {
+        return res.status(403).json({ message: "Нет прав доступа к проекту" });
+      }
+    }
+
+    // Проверка обязательного параметра granularity
+    if (!granularity) {
+      return res.status(400).json({ message: "Параметр granularity обязателен" });
+    }
+
+    try {
+      const cfg = getChartSeriesGranularity(granularity);
+
+      // Специальная обработка для 5-минутной гранулярности
+      let queryText: string;
+      if (granularity === "5m") {
+        queryText = `
+          WITH series AS (
+            SELECT generate_series(
+              DATE_TRUNC('hour', NOW() - INTERVAL '${cfg.window}'),
+              DATE_TRUNC('hour', NOW()) + INTERVAL '55 minutes',
+              INTERVAL '${cfg.step}'
+            ) AS slot
+          ),
+          users_by_source AS (
+            SELECT
+              DATE_TRUNC('hour', registered_at) + INTERVAL '5 min' * FLOOR(EXTRACT(MINUTE FROM registered_at) / 5) AS slot,
+              COALESCE(deep_link_param, 'direct') AS source,
+              COUNT(*) AS cnt
+            FROM bot_users
+            WHERE project_id = $1
+              AND ($2::integer IS NULL OR token_id = $2)
+              AND registered_at >= NOW() - INTERVAL '${cfg.window}'
+            GROUP BY 1, 2
+          )
+          SELECT 
+            s.slot AS date,
+            COALESCE(jsonb_object_agg(u.source, u.cnt) FILTER (WHERE u.source IS NOT NULL), '{}'::jsonb) AS sources
+          FROM series s
+          LEFT JOIN users_by_source u ON u.slot = s.slot
+          GROUP BY s.slot
+          ORDER BY s.slot ASC
+        `;
+      } else {
+        queryText = `
+          WITH series AS (
+            SELECT generate_series(
+              DATE_TRUNC('${cfg.truncate}', NOW() - INTERVAL '${cfg.window}'),
+              DATE_TRUNC('${cfg.truncate}', NOW()),
+              INTERVAL '${cfg.step}'
+            ) AS slot
+          ),
+          users_by_source AS (
+            SELECT
+              DATE_TRUNC('${cfg.truncate}', registered_at) AS slot,
+              COALESCE(deep_link_param, 'direct') AS source,
+              COUNT(*) AS cnt
+            FROM bot_users
+            WHERE project_id = $1
+              AND ($2::integer IS NULL OR token_id = $2)
+              AND registered_at >= NOW() - INTERVAL '${cfg.window}'
+            GROUP BY 1, 2
+          )
+          SELECT 
+            s.slot AS date,
+            COALESCE(jsonb_object_agg(u.source, u.cnt) FILTER (WHERE u.source IS NOT NULL), '{}'::jsonb) AS sources
+          FROM series s
+          LEFT JOIN users_by_source u ON u.slot = s.slot
+          GROUP BY s.slot
+          ORDER BY s.slot ASC
+        `;
+      }
+
+      const result = await dbPool.query(queryText, [projectId, tokenId]);
+      
+      // Преобразование результата в нужный формат
+      return res.json(result.rows.map(row => ({
+        date: row.date instanceof Date ? row.date.toISOString() : String(row.date),
+        sources: typeof row.sources === 'object' && row.sources !== null 
+          ? row.sources 
+          : {},
+      })));
+    } catch (error) {
+      console.error("Error fetching growth by source data:", error);
+      res.status(500).json({ message: "Ошибка при получении данных прироста по источникам" });
+    }
+  });
+
+  /**
+   * Эндпоинт получения топ-10 самых популярных inline-кнопок проекта.
+   * Считает нажатия кнопок (message_data.button_clicked = true) за окно времени.
+   * @route GET /api/projects/:id/users/popular-buttons
+   * @param id - Идентификатор проекта
+   * @query granularity - Гранулярность периода: "1m"|"5m"|"1h"|"1w"|"1d"|"7d"|"30d" (опциональный, по умолчанию "1d")
+   * @returns Массив объектов [{label, count}] — топ-10 кнопок по числу нажатий
+   */
+  app.get("/api/projects/:id/users/popular-buttons", async (req, res) => {
+    const projectId = parseInt(req.params.id);
+    const tokenId = getRequestTokenId(req);
+    const granularity = req.query.granularity as string | undefined;
+
+    // Проверка прав доступа к проекту
+    const ownerId = getOwnerIdFromRequest(req);
+    if (ownerId !== null) {
+      const hasAccess = await storage.hasProjectAccess(projectId, ownerId);
+      if (!hasAccess) {
+        return res.status(403).json({ message: "Нет прав доступа к проекту" });
+      }
+    }
+
+    try {
+      const windowInterval =
+        CHART_WINDOW_INTERVAL[granularity ?? "1d"] ?? "30 days";
+
+      const queryText = `
+        SELECT
+          COALESCE(NULLIF(message_data->>'button_text',''), message_data->>'callback_data') AS label,
+          COUNT(*) AS count
+        FROM bot_messages
+        WHERE project_id = $1
+          AND ($2::integer IS NULL OR token_id = $2)
+          AND message_type = 'user'
+          AND message_data->>'button_clicked' = 'true'
+          AND created_at >= NOW() - INTERVAL '${windowInterval}'
+        GROUP BY label
+        HAVING COALESCE(NULLIF(message_data->>'button_text',''), message_data->>'callback_data') IS NOT NULL
+        ORDER BY count DESC
+        LIMIT 10
+      `;
+
+      const result = await dbPool.query(queryText, [projectId, tokenId]);
+      res.json(result.rows.map(r => ({ label: r.label, count: Number(r.count) })));
+    } catch (error) {
+      console.error("Error fetching popular buttons data:", error);
+      res.status(500).json({ message: "Ошибка при получении популярных кнопок" });
+    }
+  });
+
+  /**
+   * Эндпоинт получения логов бота для проекта (системная таблица)
+   * @route GET /api/projects/:id/logs/all
+   * @returns Массив логов [{level, message, timestamp}]
+   */
+  app.get("/api/projects/:id/logs/all", requireProjectAccess, async (req, res) => {
+    const projectId = parseInt(req.params.id);
+    const limit = req.query.limit ? parseInt(req.query.limit as string) : 200;
+    const tokenId = getRequestTokenId(req);
+
+    try {
+      const result = await dbPool.query(
+        `SELECT bl.type AS level, SUBSTRING(bl.content, 1, 150) AS message, bl.timestamp AS "createdAt"
+         FROM bot_logs bl
+         WHERE bl.project_id = $1
+           AND ($2::integer IS NULL OR bl.token_id = $2)
+         ORDER BY bl.timestamp DESC
+         LIMIT $3`,
+        [projectId, tokenId, limit]
+      );
+      res.json(result.rows);
+    } catch (error) {
+      console.error("Error fetching logs:", error);
+      res.json([]);
+    }
+  });
+
+  /**
+   * Эндпоинт получения истории запусков бота для проекта
+   * @route GET /api/projects/:id/launches/all
+   * @returns Массив запусков [{status, started_at, stopped_at, error_message}]
+   */
+  app.get("/api/projects/:id/launches/all", requireProjectAccess, async (req, res) => {
+    const projectId = parseInt(req.params.id);
+
+    try {
+      const result = await dbPool.query(
+        `SELECT blh.status, blh.started_at AS "startedAt", blh.stopped_at AS "stoppedAt",
+                SUBSTRING(blh.error_message, 1, 100) AS "errorMessage"
+         FROM bot_launch_history blh
+         JOIN bot_tokens bt ON bt.id = blh.token_id
+         WHERE bt.project_id = $1
+         ORDER BY blh.started_at DESC
+         LIMIT 100`,
+        [projectId]
+      );
+      res.json(result.rows);
+    } catch (error) {
+      res.json([]);
+    }
+  });
+
+  /**
+   * Эндпоинт получения переменных пользователей (user_data развёрнутый в колонки)
+   * @route GET /api/projects/:id/users/variables
+   * @param id - Идентификатор проекта
+   * @query limit - Лимит записей (по умолчанию 200)
+   * @returns {columns: string[], rows: Array<{user_id, ...переменные}>}
+   */
+  app.get("/api/projects/:id/users/variables", requireProjectAccess, async (req, res) => {
+    const projectId = parseInt(req.params.id);
+    const tokenId = getRequestTokenId(req);
+    const limit = req.query.limit ? parseInt(req.query.limit as string) : 200;
+
+    try {
+      const result = await dbPool.query(
+        `SELECT user_id, username, first_name, user_data
+         FROM bot_users 
+         WHERE project_id = $1 
+           AND ($2::integer IS NULL OR token_id = $2)
+           AND user_data IS NOT NULL 
+           AND user_data != '{}'
+         ORDER BY last_interaction DESC
+         LIMIT $3`,
+        [projectId, tokenId, limit]
+      );
+
+      // Базовые колонки, которые не дублируем из user_data
+      const baseColumns = new Set(['user_id', 'username', 'user_name', 'first_name', 'last_name']);
+
+      // Собираем все уникальные ключи из user_data (исключая базовые и служебные)
+      const allKeys = new Set<string>();
+      for (const row of result.rows) {
+        if (row.user_data && typeof row.user_data === 'object') {
+          Object.keys(row.user_data).forEach(k => {
+            if (!k.startsWith('_') && !k.startsWith('waiting_') && !k.startsWith('input_') && !baseColumns.has(k)) {
+              allKeys.add(k);
+            }
+          });
+        }
+      }
+
+      const columns = ['user_id', 'username', ...Array.from(allKeys).sort()];
+      const rows = result.rows.map((r: any) => {
+        const row: Record<string, string> = {
+          user_id: String(r.user_id),
+          username: r.username || '',
+        };
+        for (const key of allKeys) {
+          const val = r.user_data?.[key];
+          row[key] = val != null ? (typeof val === 'object' ? JSON.stringify(val) : String(val)) : '';
+        }
+        return row;
+      });
+
+      res.json({ columns, rows });
+    } catch (error) {
+      console.error("Error fetching user variables:", error);
+      res.status(500).json({ message: "Ошибка при получении переменных" });
+    }
+  });
+
+  /**
+   * Эндпоинт получения всех сообщений проекта (для системной таблицы)
+   * @route GET /api/projects/:id/messages/all
+   * @param id - Идентификатор проекта
+   * @query limit - Лимит записей (по умолчанию 200)
+   * @query offset - Смещение (по умолчанию 0)
+   * @returns Массив сообщений [{id, userId, messageType, messageText, chatType, createdAt}]
+   */
+  app.get("/api/projects/:id/messages/all", requireProjectAccess, async (req, res) => {
+    const projectId = parseInt(req.params.id);
+    const tokenId = getRequestTokenId(req);
+    const limit = req.query.limit ? parseInt(req.query.limit as string) : 200;
+    const offset = req.query.offset ? parseInt(req.query.offset as string) : 0;
+
+    try {
+      const result = await dbPool.query(
+        `SELECT id, user_id AS "userId", message_type AS "messageType", 
+                COALESCE(SUBSTRING(message_text, 1, 100), '') AS "messageText",
+                chat_type AS "chatType", chat_id AS "chatId",
+                created_at AS "createdAt"
+         FROM bot_messages 
+         WHERE project_id = $1 AND ($2::integer IS NULL OR token_id = $2)
+         ORDER BY created_at DESC 
+         LIMIT $3 OFFSET $4`,
+        [projectId, tokenId, limit, offset]
+      );
+      res.json(result.rows);
+    } catch (error) {
+      console.error("Error fetching all messages:", error);
+      res.status(500).json({ message: "Ошибка при получении сообщений" });
+    }
+  });
+
+  /**
+   * Эндпоинт активности сообщений с поддержкой гранулярности и разбивки по направлению
+   * @route GET /api/projects/:id/messages/activity
+   * @param id - Идентификатор проекта
+   * @query granularity - Гранулярность: "1m"|"5m"|"1h"|"1w"|"1d"|"7d"|"30d" (новый параметр)
+   * @query period - Период: "7d"|"30d"|"90d" (старый параметр, для обратной совместимости)
+   * @query split - "true" — вернуть [{date, incoming, outgoing}] вместо [{date, count}]
+   * @returns Массив объектов [{date, count}] или [{date, incoming, outgoing}] при split=true
+   */
+  app.get("/api/projects/:id/messages/activity", requireProjectAccess, async (req, res) => {
+    const projectId = parseInt(req.params.id);
+    const tokenId = getRequestTokenId(req);
+    const granularity = req.query.granularity as string | undefined;
+    const period = (req.query.period as string) || "30d";
+    const split = req.query.split === "true";
+
+    try {
+      // Режим гранулярности — новый параметр
+      if (granularity) {
+        // Длинные окна — immutable дневные агрегаты (не зависят от удаления bot_messages)
+        if (isDailyActivityGranularity(granularity)) {
+          const points = await queryActivityFromDaily(
+            dbPool,
+            projectId,
+            tokenId,
+            granularity,
+            split,
+          );
+          return res.json(points);
+        }
+
+        /**
+         * Маппинг гранулярности на SQL-параметры для активности сообщений.
+         * 1m  — последний час с шагом 1 минута (60 точек)
+         * 5m  — последние 3 часа с шагом 5 минут (36 точек)
+         * 1h  — последние 24 часа с шагом 1 час (24 точки)
+         * fillGaps=true означает заполнение пустых интервалов нулями через generate_series.
+         */
+        const granularityConfig: Record<string, { window: string; truncate: string | null; step: string; fillGaps: boolean }> = {
+          "1m":  { window: "1 hour",   truncate: "minute", step: "1 minute",  fillGaps: true },
+          "5m":  { window: "3 hours",  truncate: null,     step: "5 minutes", fillGaps: true },
+          "1h":  { window: "24 hours", truncate: "hour",   step: "1 hour",    fillGaps: true },
+        };
+        const cfg = granularityConfig[granularity] ?? granularityConfig["1h"];
+
+        let queryText: string;
+
+        if (split) {
+          // Режим split: группируем по слоту И message_type, затем pivot через FILTER
+          if (granularity === "5m") {
+            queryText = `
+              WITH series AS (
+                SELECT generate_series(
+                  DATE_TRUNC('hour', NOW() - INTERVAL '${cfg.window}'),
+                  DATE_TRUNC('hour', NOW()) + INTERVAL '55 minutes',
+                  INTERVAL '${cfg.step}'
+                ) AS slot
+              ),
+              msgs AS (
+                SELECT
+                  DATE_TRUNC('hour', created_at) + INTERVAL '5 min' * FLOOR(EXTRACT(MINUTE FROM created_at) / 5) AS slot,
+                  COUNT(*) FILTER (WHERE message_type = 'user') AS incoming,
+                  COUNT(*) FILTER (WHERE message_type = 'bot')  AS outgoing
+                FROM bot_messages
+                WHERE project_id = $1
+                  AND ($2::integer IS NULL OR token_id = $2)
+                  AND created_at >= NOW() - INTERVAL '${cfg.window}'
+                GROUP BY 1
+              )
+              SELECT s.slot AS date,
+                     COALESCE(m.incoming, 0) AS incoming,
+                     COALESCE(m.outgoing, 0) AS outgoing
+              FROM series s
+              LEFT JOIN msgs m ON m.slot = s.slot
+              ORDER BY s.slot ASC
+            `;
+          } else {
+            queryText = `
+              WITH series AS (
+                SELECT generate_series(
+                  DATE_TRUNC('${cfg.truncate}', NOW() - INTERVAL '${cfg.window}'),
+                  DATE_TRUNC('${cfg.truncate}', NOW()),
+                  INTERVAL '${cfg.step}'
+                ) AS slot
+              ),
+              msgs AS (
+                SELECT
+                  DATE_TRUNC('${cfg.truncate}', created_at) AS slot,
+                  COUNT(*) FILTER (WHERE message_type = 'user') AS incoming,
+                  COUNT(*) FILTER (WHERE message_type = 'bot')  AS outgoing
+                FROM bot_messages
+                WHERE project_id = $1
+                  AND ($2::integer IS NULL OR token_id = $2)
+                  AND created_at >= NOW() - INTERVAL '${cfg.window}'
+                GROUP BY 1
+              )
+              SELECT s.slot AS date,
+                     COALESCE(m.incoming, 0) AS incoming,
+                     COALESCE(m.outgoing, 0) AS outgoing
+              FROM series s
+              LEFT JOIN msgs m ON m.slot = s.slot
+              ORDER BY s.slot ASC
+            `;
+          }
+          const result = await dbPool.query(queryText, [projectId, tokenId]);
+          return res.json(result.rows.map(row => ({
+            date: row.date instanceof Date ? row.date.toISOString() : String(row.date),
+            incoming: Number(row.incoming),
+            outgoing: Number(row.outgoing),
+          })));
+        }
+
+        if (granularity === "5m") {
+          // Группировка по 5-минутным интервалам через FLOOR + generate_series для заполнения пустых слотов
+          queryText = `
+            WITH series AS (
+              SELECT generate_series(
+                DATE_TRUNC('hour', NOW() - INTERVAL '${cfg.window}'),
+                DATE_TRUNC('hour', NOW()) + INTERVAL '55 minutes',
+                INTERVAL '${cfg.step}'
+              ) AS slot
+            ),
+            msgs AS (
+              SELECT
+                DATE_TRUNC('hour', created_at) + INTERVAL '5 min' * FLOOR(EXTRACT(MINUTE FROM created_at) / 5) AS slot,
+                COUNT(*) AS cnt
+              FROM bot_messages
+              WHERE project_id = $1
+                AND ($2::integer IS NULL OR token_id = $2)
+                AND created_at >= NOW() - INTERVAL '${cfg.window}'
+              GROUP BY 1
+            )
+            SELECT s.slot AS date, COALESCE(m.cnt, 0) AS count
+            FROM series s
+            LEFT JOIN msgs m ON m.slot = s.slot
+            ORDER BY s.slot ASC
+          `;
+        } else {
+          // Для всех остальных гранулярностей — generate_series + LEFT JOIN для заполнения нулями
+          queryText = `
+            WITH series AS (
+              SELECT generate_series(
+                DATE_TRUNC('${cfg.truncate}', NOW() - INTERVAL '${cfg.window}'),
+                DATE_TRUNC('${cfg.truncate}', NOW()),
+                INTERVAL '${cfg.step}'
+              ) AS slot
+            ),
+            msgs AS (
+              SELECT
+                DATE_TRUNC('${cfg.truncate}', created_at) AS slot,
+                COUNT(*) AS cnt
+              FROM bot_messages
+              WHERE project_id = $1
+                AND ($2::integer IS NULL OR token_id = $2)
+                AND created_at >= NOW() - INTERVAL '${cfg.window}'
+              GROUP BY 1
+            )
+            SELECT s.slot AS date, COALESCE(m.cnt, 0) AS count
+            FROM series s
+            LEFT JOIN msgs m ON m.slot = s.slot
+            ORDER BY s.slot ASC
+          `;
+        }
+
+        const result = await dbPool.query(queryText, [projectId, tokenId]);
+        return res.json(result.rows.map(row => ({
+          date: row.date instanceof Date ? row.date.toISOString() : String(row.date),
+          count: Number(row.count),
+        })));
+      }
+
+      // Режим period — старый параметр (обратная совместимость) из дневных агрегатов
+      const points = await queryActivityFromDailyPeriod(dbPool, projectId, tokenId, period);
+      res.json(points);
+    } catch (error) {
+      console.error("Error fetching messages activity:", error);
+      res.status(500).json({ message: "Ошибка при получении данных активности сообщений" });
+    }
+  });
+
+  app.put(
+    "/api/projects/:projectId/users/:userId",
+    requireProjectAccess,
+    updateBotUserHandler,
+  );
+  app.delete(
+    "/api/projects/:projectId/users/:userId",
+    requireProjectAccess,
+    deleteBotUserHandler,
+  );
+
+  // Delete all user data for a project
+  app.delete("/api/projects/:id/users", async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.id);
+      const tokenId = getRequestTokenId(req);
+
+      // Проверяем права доступа к проекту для авторизованных пользователей
+      const ownerId = getOwnerIdFromRequest(req);
+      if (ownerId !== null) {
+        const hasAccess = await storage.hasProjectAccess(projectId, ownerId);
+        if (!hasAccess) {
+          return res.status(403).json({ message: "Нет прав доступа к проекту" });
+        }
+      }
+
+      let totalDeleted = 0;
+
+      try {
+        // Удаляем всех пользователей из таблицы bot_users для данного проекта
+        const deleteResult = await dbPool.query(
+          tokenId
+            ? `DELETE FROM bot_users WHERE project_id = $1 AND token_id = $2`
+            : `DELETE FROM bot_users WHERE project_id = $1`,
+          tokenId ? [projectId, tokenId] : [projectId]
+        );
+
+        totalDeleted += deleteResult.rowCount || 0;
+        console.log(`Deleted ${deleteResult.rowCount || 0} users from bot_users for project ${projectId}`);
+      } catch (dbError) {
+        console.log("bot_users table not found or error:", (dbError as any).message);
+      }
+
+      // Удаляем сообщения из таблицы bot_messages
+      try {
+        const deleteMessagesResult = await dbPool.query(
+          tokenId
+            ? `DELETE FROM bot_messages WHERE project_id = $1 AND token_id = $2`
+            : `DELETE FROM bot_messages WHERE project_id = $1`,
+          tokenId ? [projectId, tokenId] : [projectId]
+        );
+
+        totalDeleted += deleteMessagesResult.rowCount || 0;
+        console.log(`Deleted ${deleteMessagesResult.rowCount || 0} messages from bot_messages for project ${projectId}`);
+      } catch (dbError) {
+        console.log("bot_messages table not found or error:", (dbError as any).message);
+      }
+
+      res.json({
+        message: "All user data deleted successfully",
+        deleted: true,
+        deletedCount: totalDeleted
+      });
+    } catch (error) {
+      console.error("Failed to delete user data:", error);
+      res.status(500).json({ message: "Failed to delete user data" });
+    }
+  });
+
+  // Bot Messages endpoints
+
+  // Get message history for a user with media
+  setupBotIntegrationRoutes(app);
+
+  // HTML страница со встроенным Telegram Login Widget для авторизации в отдельном окне
+  setupAuthRoutes(app);
+
+  // User-specific endpoints
+  // Get user's projects
+  setupUserProjectAndTokenRoutes(app);
+
+  // Персональные токены агента (PAT) для MCP
+  setupAgentTokenRoutes(app);
+
+  // Remote Streamable HTTP MCP (/mcp) — без клона репо
+  setupMcpRoutes(app);
+
+  // CRUD реестра хранилищ (/api/storage-configs)
+  setupStorageConfigRoutes(app);
+
+  // Webhook роут: приём апдейтов от Telegram и проксирование в Python-процесс бота
+  setupWebhookRoutes(app);
+
+  // HTTP hooks: внешние интеграции → Python api_trigger
+  setupHooksRoutes(app);
+
+  // OpenAPI / Swagger UI — после всех маршрутов, до Vite catch-all
+  setupSwagger(app);
+
+  // Если сервер передан извне, используем его, иначе создаем новый
+  if (httpServer) {
+    return httpServer;
+  } else {
+    const { createServer } = await import('http');
+    const newHttpServer = createServer(app);
+    return newHttpServer;
+  }
+}
+
+
+
+
+
+
+
+
+
+
+function setupTokenEnvVariableRoutes(app: Express) {
+  // ─── Переменные окружения бота (веб-клиент, без telegram_id) ───
+
+  /**
+   * Получение списка переменных окружения токена
+   * GET /api/projects/:projectId/tokens/:tokenId/env-variables
+   */
+  app.get("/api/projects/:projectId/tokens/:tokenId/env-variables", requireTokenOwnership, async (req, res) => {
+    try {
+      const tokenId = parseInt(req.params.tokenId);
+      const items = await storage.getEnvVariables(tokenId);
+      const masked = items.map(item => ({
+        ...item,
+        value: item.isSecret ? "••••••••" : item.value,
+      }));
+      res.json({ items: masked, count: masked.length });
+    } catch (error) {
+      res.status(500).json({ message: "Ошибка получения переменных окружения" });
+    }
+  });
+
+  /**
+   * Создание переменной окружения
+   * POST /api/projects/:projectId/tokens/:tokenId/env-variables
+   */
+  app.post("/api/projects/:projectId/tokens/:tokenId/env-variables", requireTokenOwnership, async (req, res) => {
+    try {
+      const tokenId = parseInt(req.params.tokenId);
+      const { key, value, isSecret } = req.body as { key: string; value?: string; isSecret?: number };
+
+      if (!key || !/^[A-Z][A-Z0-9_]*$/.test(key)) {
+        return res.status(400).json({ message: "Некорректное имя переменной (A-Z, 0-9, _)" });
+      }
+
+      const existing = await storage.getEnvVariables(tokenId);
+      if (existing.some(v => v.key === key)) {
+        return res.status(409).json({ message: `Переменная ${key} уже существует` });
+      }
+
+      const variable = await storage.createEnvVariable({
+        tokenId,
+        key,
+        value: value ?? "",
+        isSecret: isSecret ?? 0,
+      });
+      res.status(201).json(variable);
+    } catch (error) {
+      res.status(500).json({ message: "Ошибка создания переменной окружения" });
+    }
+  });
+
+  /**
+   * Обновление переменной окружения
+   * PUT /api/projects/:projectId/tokens/:tokenId/env-variables/:id
+   */
+  app.put("/api/projects/:projectId/tokens/:tokenId/env-variables/:id", requireTokenOwnership, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      // Пропускаем если это batch-запрос (обрабатывается отдельным роутом)
+      if (isNaN(id)) return res.status(400).json({ message: "Некорректный id" });
+      const { key, value, isSecret } = req.body as { key?: string; value?: string; isSecret?: number };
+
+      if (key && !/^[A-Z][A-Z0-9_]*$/.test(key)) {
+        return res.status(400).json({ message: "Некорректное имя переменной" });
+      }
+
+      const variable = await storage.getEnvVariable(id);
+      if (!variable) return res.status(404).json({ message: "Переменная не найдена" });
+      // Переменная должна принадлежать токену из URL (защита от подмены чужого id)
+      if (variable.tokenId !== parseInt(req.params.tokenId, 10)) {
+        return res.status(404).json({ message: "Переменная не найдена" });
+      }
+
+      if (key && key !== variable.key) {
+        const existing = await storage.getEnvVariables(variable.tokenId);
+        if (existing.some(v => v.key === key && v.id !== id)) {
+          return res.status(409).json({ message: `Переменная ${key} уже существует` });
+        }
+      }
+
+      const updateData: Record<string, any> = {};
+      if (key !== undefined) updateData.key = key;
+      if (value !== undefined) updateData.value = value;
+      if (isSecret !== undefined) updateData.isSecret = isSecret;
+
+      const updated = await storage.updateEnvVariable(id, updateData);
+      if (!updated) return res.status(404).json({ message: "Не удалось обновить" });
+      res.json(updated);
+    } catch (error) {
+      res.status(500).json({ message: "Ошибка обновления переменной окружения" });
+    }
+  });
+
+  /**
+   * Удаление переменной окружения
+   * DELETE /api/projects/:projectId/tokens/:tokenId/env-variables/:id
+   */
+  app.delete("/api/projects/:projectId/tokens/:tokenId/env-variables/:id", requireTokenOwnership, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      // Переменная должна принадлежать токену из URL (защита от подмены чужого id)
+      const variable = await storage.getEnvVariable(id);
+      if (!variable || variable.tokenId !== parseInt(req.params.tokenId, 10)) {
+        return res.status(404).json({ message: "Переменная не найдена" });
+      }
+      const deleted = await storage.deleteEnvVariable(id);
+      if (!deleted) return res.status(404).json({ message: "Переменная не найдена" });
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ message: "Ошибка удаления переменной окружения" });
+    }
+  });
+
+  /**
+   * Раскрытие секретного значения переменной
+   * GET /api/projects/:projectId/tokens/:tokenId/env-variables/:id/reveal
+   */
+  app.get("/api/projects/:projectId/tokens/:tokenId/env-variables/:id/reveal", requireTokenOwnership, async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const variable = await storage.getEnvVariable(id);
+      if (!variable) return res.status(404).json({ message: "Переменная не найдена" });
+      // Защита от раскрытия секрета чужого токена: переменная должна принадлежать токену из URL
+      if (variable.tokenId !== parseInt(req.params.tokenId, 10)) {
+        return res.status(404).json({ message: "Переменная не найдена" });
+      }
+      res.json({ value: variable.value });
+    } catch (error) {
+      res.status(500).json({ message: "Ошибка получения значения" });
+    }
+  });
+
+  /**
+   * Список ключей серверных переменных для подстановки в env бота (${{KEY}}).
+   * GET /api/server/env-keys — только имена из whitelist, без значений.
+   */
+  app.get("/api/server/env-keys", (_req, res) => {
+    const items = ALLOWED_SERVER_ENV_KEYS
+      .filter((key) => process.env[key] !== undefined && process.env[key] !== '')
+      .map((key) => ({ key }));
+
+    res.json({ items });
+  });
+
+  /**
+   * Batch-обновление переменных окружения (единый эндпоинт)
+   * PUT /api/projects/:projectId/tokens/:tokenId/env-batch
+   *
+   * Принимает массив изменений и маппит каждое на нужное хранилище:
+   * - BOT_TOKEN → bot_tokens.token
+   * - ADMIN_IDS → bot_projects.adminIds
+   * - USER_DATABASE → bot_projects.userDatabaseEnabled
+   * - LOG_LEVEL → bot_tokens.logLevel
+   * - PROTECT_CONTENT → bot_tokens.protectContent
+   * - SAVE_INCOMING_MEDIA → bot_tokens.saveIncomingMedia
+   * - MESSAGES_RETENTION_DAYS → bot_tokens.messagesRetentionDays
+   * - CATCH_ALL_HANDLERS → bot_tokens.catchAllHandlers
+   * - AUTO_RESTART → bot_tokens.autoRestart
+   * - MAX_RESTART_ATTEMPTS → bot_tokens.maxRestartAttempts
+   * - Остальные → bot_env_variables (CRUD)
+   */
+  app.put("/api/projects/:projectId/tokens/:tokenId/env-batch", requireTokenOwnership, async (req, res) => {
+    try {
+      const projectId = parseInt(req.params.projectId);
+      const tokenId = parseInt(req.params.tokenId);
+      const { changes } = req.body as { changes: Array<{ action: string; key: string; value?: string; id?: number; isSecret?: number }> };
+
+      console.log(`[env-batch] projectId=${projectId} tokenId=${tokenId} changes=${changes?.length ?? 0}`);
+
+      if (!Array.isArray(changes) || changes.length === 0) {
+        return res.status(400).json({ message: "Массив changes обязателен" });
+      }
+
+      /** Маппинг системных ключей на поля bot_tokens */
+      const tokenFieldMap: Record<string, string> = {
+        BOT_TOKEN: 'token',
+        LOG_LEVEL: 'logLevel',
+        PROTECT_CONTENT: 'protectContent',
+        SAVE_INCOMING_MEDIA: 'saveIncomingMedia',
+        MESSAGES_RETENTION_DAYS: 'messagesRetentionDays',
+        CATCH_ALL_HANDLERS: 'catchAllHandlers',
+        CONTENT_CACHE: 'contentCache',
+        AUTO_RESTART: 'autoRestart',
+        MAX_RESTART_ATTEMPTS: 'maxRestartAttempts',
+        LAUNCH_MODE: 'launchMode',
+        WEBHOOK_BASE_URL: 'webhookBaseUrl',
+        WEBHOOK_SECRET_TOKEN: 'webhookSecretToken',
+      };
+
+      /** Ключи, которые хранятся в bot_env_variables */
+      const envVarKeys = new Set([
+        'API_BASE_URL', 'API_PORT', 'API_USE_SSL', 'API_TIMEOUT',
+        'DISABLE_ASYNC_LOG', 'REDIS_URL', 'DATABASE_URL',
+        'MAX_UPDATE_AGE_SECONDS', 'WEBHOOK_PORT',
+      ]);
+
+      /** Секретные ключи */
+      const secretKeys = new Set(['REDIS_URL', 'DATABASE_URL']);
+
+      const results: string[] = [];
+
+      for (const change of changes) {
+        const { action, key, value, id, isSecret } = change;
+        console.log(`[env-batch]   ${action} ${key}${id ? ` id=${id}` : ''}`);
+
+        if (action === 'delete' && id) {
+          await storage.deleteEnvVariable(id);
+          results.push(`deleted:${key || id}`);
+          continue;
+        }
+
+        if (action === 'create' && key && value !== undefined) {
+          await storage.createEnvVariable({ tokenId, key, value, isSecret: isSecret ?? 0 });
+          results.push(`created:${key}`);
+          continue;
+        }
+
+        if (action === 'update' && key && value !== undefined) {
+          // ADMIN_IDS → обновляем проект
+          if (key === 'ADMIN_IDS') {
+            await storage.updateBotProject(projectId, { adminIds: value });
+            results.push(`updated:ADMIN_IDS`);
+            continue;
+          }
+
+          // USER_DATABASE → обновляем проект
+          if (key === 'USER_DATABASE') {
+            await storage.updateBotProject(projectId, { userDatabaseEnabled: value === '1' ? 1 : 0 });
+            results.push(`updated:USER_DATABASE`);
+            continue;
+          }
+
+          // Поля bot_tokens (BOT_TOKEN, LOG_LEVEL, PROTECT_CONTENT, SAVE_INCOMING_MEDIA, AUTO_RESTART, MAX_RESTART_ATTEMPTS)
+          if (tokenFieldMap[key]) {
+            const field = tokenFieldMap[key];
+            // Маска из GET (botId:••••••••) нельзя писать в bot_tokens.token —
+            // иначе старт бота читает из БД невалидный токен.
+            if (key === 'BOT_TOKEN' && isMaskedOrPlaceholderToken(value)) {
+              results.push(`skipped:${key}:masked`);
+              continue;
+            }
+            if (
+              key === 'WEBHOOK_SECRET_TOKEN'
+              && (value.includes('•') || value.includes('*') || value.includes('…'))
+            ) {
+              results.push(`skipped:${key}:masked`);
+              continue;
+            }
+            let dbValue: any = value;
+            if (key === 'PROTECT_CONTENT' || key === 'SAVE_INCOMING_MEDIA' || key === 'AUTO_RESTART' || key === 'CATCH_ALL_HANDLERS' || key === 'CONTENT_CACHE') {
+              dbValue = value === 'true' || value === '1' ? 1 : 0;
+            }
+            if (key === 'MAX_RESTART_ATTEMPTS') {
+              dbValue = parseInt(value!) || 3;
+            }
+            if (key === 'MESSAGES_RETENTION_DAYS') {
+              dbValue = parseInt(value!, 10);
+              if (Number.isNaN(dbValue)) dbValue = 0;
+            }
+            if (key === 'WEBHOOK_BASE_URL' || key === 'WEBHOOK_SECRET_TOKEN') {
+              dbValue = value || null;
+            }
+            await storage.updateBotToken(tokenId, { [field]: dbValue });
+            results.push(`updated:${key}`);
+            continue;
+          }
+
+          // Переменные из bot_env_variables
+          if (envVarKeys.has(key)) {
+            const existing = await storage.getEnvVariables(tokenId);
+            const found = existing.find(v => v.key === key);
+            if (found) {
+              await storage.updateEnvVariable(found.id, { value });
+            } else {
+              await storage.createEnvVariable({ tokenId, key, value, isSecret: secretKeys.has(key) ? 1 : 0 });
+            }
+            results.push(`updated:${key}`);
+            continue;
+          }
+
+          // Кастомная переменная по ID
+          if (id) {
+            await storage.updateEnvVariable(id, { value });
+            results.push(`updated:${key || id}`);
+            continue;
+          }
+
+          results.push(`skipped:${key}`);
+        }
+      }
+
+      const tokenFieldUpdated = results.some((r) =>
+        r.startsWith('updated:') && !r.includes('ADMIN_IDS') && !r.includes('USER_DATABASE'),
+      );
+      if (tokenFieldUpdated) {
+        void emitTokenUpdated({
+          projectId,
+          tokenId,
+          source: 'api',
+        }).catch((err) => console.error('[env-batch] emitTokenUpdated:', err));
+      }
+
+      res.json({ success: true, applied: results.length, results });
+    } catch (error: any) {
+      console.error("[env-batch] Ошибка:", error?.message || error);
+      res.status(500).json({ message: "Ошибка batch обновления переменных" });
+    }
+  });
+}
+

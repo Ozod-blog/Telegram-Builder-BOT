@@ -1,0 +1,175 @@
+{#
+  Шаблон middleware триггеров входящих callback_query
+
+  @param {array} incomingCallbackTriggerEntries - Массив IncomingCallbackTriggerEntry:
+    - nodeId: string          — ID узла incoming_callback_trigger
+    - targetNodeId: string    — ID целевого узла
+    - targetNodeType: string  — тип целевого узла
+
+  @param {array} allNodes - Все узлы проекта [{id, safeName}] для навигации
+    в waiting_callback_input_middleware
+
+  @fsm Middleware получает state из data["state"] и сохраняет callback_data в FSM.
+       Передаёт state целевому обработчику для сквозной передачи по цепочке.
+#}
+
+# Middleware триггеров входящих callback_query
+{% for entry in incomingCallbackTriggerEntries -%}
+{%- set sanitized_node_id = entry.nodeId | safe_name -%}
+{%- set sanitized_target_id = entry.targetNodeId | safe_name -%}
+
+async def incoming_callback_trigger_{{ sanitized_node_id }}_middleware(handler, event: types.CallbackQuery, data: dict):
+    """Срабатывает на нажатие инлайн-кнопки пользователем{% if entry.callbackPattern %} (фильтр: {{ entry.callbackMatchType }} "{{ entry.callbackPattern }}"){% endif %}"""
+    try:
+        user_id = event.from_user.id
+        _cb_data = event.data or ""
+        {%- if entry.callbackPattern %}
+        # Фильтрация по паттерну — пропускаем неподходящие callbacks
+        {%- if entry.callbackMatchType == "startsWith" %}
+        if not _cb_data.startswith("{{ entry.callbackPattern }}"):
+            return await handler(event, data)
+        {%- elif entry.callbackMatchType == "equals" %}
+        if _cb_data != "{{ entry.callbackPattern }}":
+            return await handler(event, data)
+        {%- elif entry.callbackMatchType == "contains" %}
+        if "{{ entry.callbackPattern }}" not in _cb_data:
+            return await handler(event, data)
+        {%- endif %}
+        {%- endif %}
+        logging.info(f"Нажатие кнопки от {user_id} — триггер узла {{ entry.nodeId }}")
+        # Сразу убираем анимацию загрузки — до выполнения любой логики
+        try:
+            await event.answer()
+        except Exception:
+            pass
+        # Сохраняем данные нажатой кнопки
+        if user_id not in user_data:
+            user_data[user_id] = {}
+        {%- set _save_var = entry.callbackDataSaveAs if entry.callbackDataSaveAs else "callback_data" %}
+        _ict_cb_value = event.data or ""
+        {%- if entry.callbackDataStripPrefix %}
+        # Убираем префикс "{{ entry.callbackDataStripPrefix }}" из callback_data
+        if _ict_cb_value.startswith("{{ entry.callbackDataStripPrefix }}"):
+            _ict_cb_value = _ict_cb_value[{{ entry.callbackDataStripPrefix | length }}:]
+        {%- endif %}
+        user_data[user_id]["{{ _save_var }}"] = _ict_cb_value
+        user_data[user_id]["callback_data"] = event.data or ""
+        # Читаем текст кнопки из reply_markup
+        _ict_btn_text = ""
+        try:
+            if event.data and event.message and hasattr(event.message, "reply_markup"):
+                _rm = event.message.reply_markup
+                if _rm and hasattr(_rm, "inline_keyboard"):
+                    for _row in _rm.inline_keyboard:
+                        for _btn in _row:
+                            if getattr(_btn, "callback_data", None) == event.data:
+                                _ict_btn_text = _btn.text or ""
+                                break
+                        if _ict_btn_text:
+                            break
+        except Exception:
+            pass
+        user_data[user_id]["button_text"] = _ict_btn_text
+        # Синхронизируем callback_data в FSM если state доступен в контексте middleware
+        try:
+            _fsm_state = data.get("state")
+            if _fsm_state is not None:
+                _fsm_data = await _fsm_state.get_data()
+                _fsm_data["callback_data"] = event.data or ""
+                await _fsm_state.set_data(_fsm_data)
+        except Exception:
+            pass
+
+        class MockCallback:
+            def __init__(self, data, user, msg):
+                self.data = data
+                self.from_user = user
+                self.message = msg
+                self._is_fake = True
+
+            async def answer(self, *args, **kwargs):
+                pass
+
+            async def edit_text(self, text, **kwargs):
+                try:
+                    return await self.message.edit_text(text, **kwargs)
+                except Exception as e:
+                    logging.warning(f"Не удалось отредактировать сообщение: {e}")
+                    return await self.message.answer(text, **kwargs)
+
+        mock_callback = MockCallback("{{ entry.targetNodeId }}", event.from_user, event.message)
+        # Передаём state целевому обработчику для сквозной передачи по цепочке
+        _state_for_target = data.get("state")
+        await handle_callback_{{ sanitized_target_id }}(mock_callback, state=_state_for_target)
+    except Exception as e:
+        logging.error(f"Ошибка в incoming_callback_trigger middleware: {e}")
+
+    return await handler(event, data)
+
+dp.callback_query.middleware(incoming_callback_trigger_{{ sanitized_node_id }}_middleware)
+
+{% endfor %}
+
+{% if allNodes %}
+# Глобальный обработчик callback_query для waiting_for_input типа "callback"
+async def waiting_callback_input_middleware(handler, event: types.CallbackQuery, data: dict):
+    """Обрабатывает нажатие кнопки когда input нода ожидает callback."""
+    try:
+        user_id = event.from_user.id
+        if user_id in user_data and "waiting_for_input" in user_data[user_id]:
+            _wfi = user_data[user_id]["waiting_for_input"]
+            if isinstance(_wfi, dict) and ("callback" in _wfi.get("modes", []) or _wfi.get("type") == "callback"):
+                _cb_variable = _wfi.get("variable", "callback_response")
+                _cb_next_node = _wfi.get("next_node_id", "")
+                _cb_raw = event.data or ""
+                # Пытаемся извлечь текст кнопки из reply_markup по callback_data
+                _cb_btn_text = ""
+                try:
+                    if event.message and hasattr(event.message, "reply_markup"):
+                        _rm = event.message.reply_markup
+                        if _rm and hasattr(_rm, "inline_keyboard"):
+                            for _row in _rm.inline_keyboard:
+                                for _btn in _row:
+                                    if getattr(_btn, "callback_data", None) == _cb_raw:
+                                        _cb_btn_text = _btn.text or ""
+                                        break
+                                if _cb_btn_text:
+                                    break
+                except Exception:
+                    pass
+                # Сохраняем текст кнопки если нашли, иначе callback_data
+                _cb_data = _cb_btn_text if _cb_btn_text else _cb_raw
+                await set_user_var(user_id, _cb_variable, _cb_data)
+                logging.info(f"✅ Callback ответ сохранён: {_cb_variable} = {_cb_data}")
+                # Очищаем состояние ожидания
+                del user_data[user_id]["waiting_for_input"]
+                # Отвечаем на callback чтобы убрать анимацию загрузки
+                try:
+                    await event.answer()
+                except Exception:
+                    pass
+                # Переходим к следующему узлу если указан
+                if _cb_next_node:
+                    logging.info(f"🚀 Callback input: переходим к узлу {_cb_next_node}")
+                    _cb_fake_callback = SimpleNamespace(
+                        id="callback_input_nav",
+                        from_user=event.from_user,
+                        chat_instance="",
+                        data=_cb_next_node,
+                        message=event.message,
+                        _is_fake=True,
+                        answer=lambda *_a, **_kw: asyncio.sleep(0)
+                    )
+                    _cb_state = data.get("state")
+{% for node in allNodes %}
+                    if _cb_next_node == "{{ node.id }}":
+                        await handle_callback_{{ node.safeName }}(_cb_fake_callback, state=_cb_state)
+                        return
+{% endfor %}
+                return
+    except Exception as _e:
+        logging.error(f"Ошибка в waiting_callback_input_middleware: {_e}")
+    return await handler(event, data)
+
+dp.callback_query.middleware(waiting_callback_input_middleware)
+{% endif %}

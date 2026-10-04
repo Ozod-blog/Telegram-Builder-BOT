@@ -1,0 +1,243 @@
+/**
+ * @fileoverview Карточка кнопки
+ *
+ * Основной компонент карточки кнопки, объединяющий все подкомпоненты.
+ * Корневой div помечается атрибутом data-button-id для скролла из панели свойств.
+ */
+
+import { Input } from '@/components/ui/input';
+import { ButtonTextField } from './button-text-field';
+import { ButtonActionSelector } from './button-action-selector';
+import { ButtonCallbackField } from './button-callback-field';
+import { ButtonHideAfterClickToggle } from './button-hide-after-click-toggle';
+import { GotoTargetSection } from '../navigation/goto-target-section';
+import { InvoicePayTargetSection } from '../navigation/invoice-pay-target-section';
+import { ButtonRequestManagedBotFields } from './button-request-managed-bot-fields';
+import { ButtonSelectionGroupField } from './button-selection-group-field';
+import type { Button } from '@shared/schema';
+import type { ProjectVariable } from '../../utils/variables-utils';
+import type { Node } from '@shared/schema';
+import type { ButtonActionType } from './button-action-options';
+
+/** Пропсы карточки кнопки */
+interface ButtonCardProps {
+  /** ID узла */
+  nodeId: string;
+  /** Объект кнопки */
+  button: Button;
+  /** Текстовые переменные */
+  textVariables: ProjectVariable[];
+  /** Все узлы для навигации */
+  getAllNodesFromAllSheets: any[];
+  /** Функция обновления кнопки */
+  onButtonUpdate: (nodeId: string, buttonId: string, updates: Partial<Button>) => void;
+  /** Функция удаления кнопки */
+  onButtonDelete: (nodeId: string, buttonId: string) => void;
+  /** Функция дублирования кнопки */
+  onButtonDuplicate: (nodeId: string, button: Button) => void;
+  /** Выбранный узел */
+  selectedNode: Node;
+  /** Тип клавиатуры (inline/reply/none) */
+  keyboardType?: string;
+  /** Белый список разрешённых действий (пробрасывается в селектор) */
+  allowedActions?: ButtonActionType[];
+  /** Скрыть дополнительные поля (стиль, callback, hideAfterClick); цель goto остаётся видимой */
+  hideExtras?: boolean;
+  /** Показывать селектор стиля даже при hideExtras */
+  showStyle?: boolean;
+  /** Заблокировать удаление/дублирование/смену типа (кнопка «Оплатить») */
+  lockPayButton?: boolean;
+  /** Цель после оплаты (autoTransitionTo счёта) — только для pay */
+  invoiceAfterPayTarget?: string;
+  /** Обновление цели после оплаты на send_invoice */
+  onInvoiceAfterPayTargetChange?: (targetNodeId: string) => void;
+}
+
+/**
+ * Компонент карточки кнопки
+ * 
+ * @param {ButtonCardProps} props - Пропсы компонента
+ * @returns {JSX.Element} Карточка кнопки
+ */
+export function ButtonCard({
+  nodeId,
+  button,
+  textVariables,
+  getAllNodesFromAllSheets,
+  onButtonUpdate,
+  onButtonDelete,
+  onButtonDuplicate,
+  selectedNode,
+  keyboardType,
+  allowedActions,
+  hideExtras = false,
+  showStyle = false,
+  lockPayButton = false,
+  invoiceAfterPayTarget,
+  onInvoiceAfterPayTargetChange,
+}: ButtonCardProps) {
+  return (
+    <div
+      className="space-y-2.5 sm:space-y-3 p-2.5 sm:p-3 md:p-4 rounded-lg sm:rounded-xl bg-gradient-to-br from-blue-50/40 to-cyan-50/30 dark:from-blue-950/20 dark:to-cyan-950/10 border border-blue-200/40 dark:border-blue-800/30 hover:border-blue-300/60 dark:hover:border-blue-700/60 hover:bg-blue-50/60 dark:hover:bg-blue-950/30 transition-all duration-200 group"
+      data-button-id={button.id}
+    >
+      <ButtonTextField
+        nodeId={nodeId}
+        button={button}
+        textVariables={textVariables}
+        onButtonUpdate={onButtonUpdate}
+        onDelete={lockPayButton ? undefined : () => onButtonDelete(nodeId, button.id)}
+        onDuplicate={lockPayButton ? undefined : () => onButtonDuplicate(nodeId, button)}
+      />
+
+      <div className="border-t border-border/20 my-3"></div>
+
+      <ButtonActionSelector
+        nodeId={nodeId}
+        button={button}
+        onButtonUpdate={onButtonUpdate}
+        allowMultipleSelection={selectedNode.data.allowMultipleSelection ?? false}
+        keyboardType={keyboardType}
+        allowedActions={allowedActions}
+        disabled={lockPayButton}
+      />
+
+      {selectedNode.data.allowMultipleSelection && (
+        <ButtonSelectionGroupField
+          nodeId={nodeId}
+          button={button}
+          onButtonUpdate={onButtonUpdate}
+        />
+      )}
+
+      {/* Селектор стиля кнопки (Bot API 9.4) */}
+      {(!hideExtras || showStyle) && (
+      <>
+      <div className="border-t border-border/20 my-3"></div>
+      <div className="space-y-1.5">
+        <span className="text-xs text-gray-500 dark:text-gray-400">Стиль кнопки</span>
+        <div className="flex gap-2">
+          {([
+            { value: undefined, label: 'Авто', className: 'border-gray-300 text-gray-600' },
+            { value: 'primary', label: 'Синий', className: 'border-blue-400 text-blue-600 bg-blue-50 dark:bg-blue-900/20' },
+            { value: 'success', label: 'Зелёный', className: 'border-green-400 text-green-600 bg-green-50 dark:bg-green-900/20' },
+            { value: 'danger', label: 'Красный', className: 'border-red-400 text-red-600 bg-red-50 dark:bg-red-900/20' },
+          ] as const).map(({ value, label, className }) => (
+            <button
+              key={label}
+              onClick={() => onButtonUpdate(nodeId, button.id, { style: value } as any)}
+              className={`text-xs px-2 py-1 rounded border transition-all ${className} ${
+                (button as any).style === value ? 'ring-2 ring-offset-1 ring-current' : 'opacity-60 hover:opacity-100'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+      </>
+      )}
+
+      {button.action === 'goto' && (
+        <>
+          <div className="border-t border-border/20 my-3"></div>
+          <GotoTargetSection
+            selectedNode={selectedNode}
+            button={button}
+            getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+            onButtonUpdate={onButtonUpdate}
+          />
+        </>
+      )}
+
+      {button.action === 'pay' && onInvoiceAfterPayTargetChange && (
+        <>
+          <div className="border-t border-border/20 my-3"></div>
+          <InvoicePayTargetSection
+            keyboardNodeId={nodeId}
+            targetNodeId={invoiceAfterPayTarget || ''}
+            getAllNodesFromAllSheets={getAllNodesFromAllSheets}
+            onTargetChange={onInvoiceAfterPayTargetChange}
+          />
+        </>
+      )}
+
+      {/* Поле callback_data: скрыто для url/contact/location/copy_text/web_app/request_managed_bot.
+          В обычной панели (hideExtras=false) показывается как раньше; в диалоге (hideExtras=true)
+          появляется только для действия default — у goto уже есть селектор цели. */}
+      {!['url', 'contact', 'location', 'copy_text', 'web_app', 'request_managed_bot', 'pay'].includes(button.action) &&
+        (!hideExtras || button.action === 'default') && (
+        <>
+          <div className="border-t border-border/20 my-3"></div>
+          <ButtonCallbackField
+            nodeId={nodeId}
+            button={button}
+            keyboardType={keyboardType}
+            onButtonUpdate={onButtonUpdate}
+            textVariables={textVariables}
+          />
+        </>
+      )}
+
+      {button.action === 'url' && (
+        <>
+          <div className="border-t border-border/20 my-3"></div>
+          <Input
+            value={button.url || ''}
+            onChange={(e) => onButtonUpdate(nodeId, button.id, { url: e.target.value })}
+            className="text-xs sm:text-sm bg-white/60 dark:bg-slate-950/60 border border-blue-300/40 dark:border-blue-700/40 text-blue-900 dark:text-blue-50 placeholder:text-blue-500/50 dark:placeholder:text-blue-400/50 focus:border-blue-500 focus:ring-2 focus:ring-blue-400/30 rounded-lg"
+            placeholder="https://example.com"
+          />
+        </>
+      )}
+
+      {button.action === 'copy_text' && (
+        <>
+          <div className="border-t border-border/20 my-3"></div>
+          <Input
+            value={(button as any).copyText || ''}
+            onChange={(e) => onButtonUpdate(nodeId, button.id, { copyText: e.target.value } as any)}
+            className="text-xs sm:text-sm bg-white/60 dark:bg-slate-950/60 border border-blue-300/40 dark:border-blue-700/40 text-blue-900 dark:text-blue-50 placeholder:text-blue-500/50 dark:placeholder:text-blue-400/50 focus:border-blue-500 focus:ring-2 focus:ring-blue-400/30 rounded-lg"
+            placeholder="Текст для копирования"
+          />
+        </>
+      )}
+
+      {button.action === 'web_app' && (
+        <>
+          <div className="border-t border-border/20 my-3"></div>
+          <Input
+            value={(button as any).webAppUrl || ''}
+            onChange={(e) => onButtonUpdate(nodeId, button.id, { webAppUrl: e.target.value } as any)}
+            className="text-xs sm:text-sm bg-white/60 dark:bg-slate-950/60 border border-blue-300/40 dark:border-blue-700/40 text-blue-900 dark:text-blue-50 placeholder:text-blue-500/50 dark:placeholder:text-blue-400/50 focus:border-blue-500 focus:ring-2 focus:ring-blue-400/30 rounded-lg"
+            placeholder="https://example.com"
+          />
+        </>
+      )}
+
+      {button.action === 'request_managed_bot' && (
+        <>
+          <div className="border-t border-border/20 my-3"></div>
+          <ButtonRequestManagedBotFields
+            nodeId={nodeId}
+            button={button}
+            onButtonUpdate={onButtonUpdate}
+            keyboardType={keyboardType}
+          />
+        </>
+      )}
+
+      {!hideExtras && (
+        <>
+          <div className="border-t border-border/20 my-3"></div>
+          <ButtonHideAfterClickToggle
+            nodeId={nodeId}
+            button={button}
+            onButtonUpdate={onButtonUpdate}
+            keyboardType={keyboardType as 'inline' | 'reply' | 'none' | undefined}
+          />
+        </>
+      )}
+    </div>
+  );
+}

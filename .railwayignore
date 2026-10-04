@@ -1,0 +1,24 @@
+# Игнорируем ненужные файлы при деплое на Railway
+node_modules
+.git
+.vscode
+.idea
+__pycache__
+.pytest_cache
+.venv
+storybook-static
+.gigaide
+.local
+.nixpacks
+*.log
+.env.local
+.env.*.local
+README*.md
+docs/*
+!docs/database
+!docs/api
+assets/images/
+comparison_report.txt
+DEPENDENCY_UPDATE_REPORT.md
+Dockerfile.backup
+npm-dev-archive.tar.gz

@@ -1,0 +1,121 @@
+/**
+ * @fileoverview OpenAPI-схемы персональных токенов агента (PAT).
+ * @module server/swagger/schemas/agent-tokens
+ */
+
+import "./common";
+import { z } from "zod";
+
+/** Права токена агента */
+export const AgentTokenScopesSchema = z
+  .enum(["read", "read,write", "read,write,bot_manager", "bot_manager"])
+  .openapi({
+    example: "read,write",
+    description:
+      "read | read,write — обычный PAT. " +
+      "…,bot_manager — impersonation на `/api/bot/*` через query telegram_id " +
+      "(выдача в production только BOT_MANAGER_ADMIN_IDS).",
+  });
+
+/** Безопасные метаданные токена (без секрета и ownerId) */
+export const AgentTokenDtoSchema = z
+  .object({
+    /** ID записи токена */
+    id: z.number().openapi({ example: 1 }),
+    /** Пользовательское имя */
+    label: z.string().openapi({ example: "Cursor MCP" }),
+    /** Публичный префикс mcp_… */
+    prefix: z.string().openapi({ example: "mcp_a1b2" }),
+    /** Права через запятую */
+    scopes: z.string().openapi({ example: "read,write" }),
+    /** Дата создания */
+    createdAt: z.union([z.string(), z.date()]).nullable().optional(),
+    /** Последнее использование */
+    lastUsedAt: z.union([z.string(), z.date()]).nullable().optional(),
+    /** Истечение (null — бессрочный) */
+    expiresAt: z.union([z.string(), z.date()]).nullable().optional(),
+    /** Отзыв (null — активен) */
+    revokedAt: z.union([z.string(), z.date()]).nullable().optional(),
+  })
+  .openapi("AgentToken");
+
+/** Тело POST /api/agent-tokens */
+export const CreateAgentTokenRequestSchema = z
+  .object({
+    /** Название токена */
+    label: z.string().min(1).openapi({ example: "Cursor MCP" }),
+    /** Права доступа */
+    scopes: AgentTokenScopesSchema.optional().default("read,write"),
+    /** Срок действия в днях (не указан — бессрочный) */
+    expiresInDays: z.number().int().positive().optional().openapi({ example: 90 }),
+  })
+  .openapi("CreateAgentTokenRequest");
+
+/** Ответ POST /api/agent-tokens — секрет показывается один раз */
+export const CreateAgentTokenResponseSchema = z
+  .object({
+    /** Полный секрет PAT (mcp_…) — сохраните сразу, повторно не отдаётся */
+    token: z.string().openapi({ example: "mcp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" }),
+    /** Метаданные созданной записи */
+    record: AgentTokenDtoSchema,
+  })
+  .openapi("CreateAgentTokenResponse");
+
+/** Ответ GET /api/agent-tokens */
+export const AgentTokenListSchema = z.array(AgentTokenDtoSchema).openapi("AgentTokenList");
+
+/** Ошибка agent-tokens API */
+export const AgentTokenErrorSchema = z
+  .object({
+    /** Текст ошибки */
+    error: z.string().openapi({ example: "Пользователь не аутентифицирован" }),
+  })
+  .openapi("AgentTokenError");
+
+/** Ошибка валидации при создании токена */
+export const CreateAgentTokenValidationErrorSchema = z
+  .object({
+    error: z.string().openapi({ example: "Некорректные данные" }),
+    /** Детали Zod issues */
+    details: z.array(z.unknown()).optional(),
+  })
+  .openapi("CreateAgentTokenValidationError");
+
+/** Ответ DELETE /api/agent-tokens/{id} */
+export const RevokeAgentTokenResponseSchema = z
+  .object({
+    success: z.literal(true),
+  })
+  .openapi("RevokeAgentTokenResponse");
+
+/** Path-параметр id токена агента */
+export const AgentTokenIdParamsSchema = z.object({
+  id: z.string().openapi({
+    example: "1",
+    description: "ID записи agent_tokens в БД",
+    param: {
+      description: "ID записи agent_tokens в БД",
+      example: "1",
+    },
+  }),
+});
+
+/**
+ * Session cookie для /api/agent-tokens/* (или Bearer PAT через Authorize).
+ * Без cookie и без Bearer — 401.
+ */
+export const AgentTokensCookiesSchema = z.object({
+  "connect.sid": z
+    .string()
+    .optional()
+    .openapi({
+      description:
+        "Session cookie Studio. Не нужна, если уже задан Bearer PAT (Authorize). Без обоих — 401.",
+      example: "s%3Axxxx.yyyy",
+      param: {
+        description:
+          "Session cookie Studio. Не нужна при Bearer PAT (Authorize). Без cookie и без PAT — 401.",
+        example: "s%3Axxxx.yyyy",
+      },
+    }),
+});

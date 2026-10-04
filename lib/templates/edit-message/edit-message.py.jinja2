@@ -1,0 +1,226 @@
+{#
+  Шаблон обработчиков действия edit_message.
+  Редактирует текст или клавиатуру уже отправленного сообщения.
+
+  @param {array} entries - Массив EditMessageEntry:
+    - nodeId: string              — ID узла
+    - targetNodeId: string        — ID следующего узла
+    - editMode: string            — 'text' | 'markup' | 'both'
+    - editMessageText: string     — новый текст (поддерживает {var})
+    - editFormatMode: string      — 'html' | 'markdown' | 'none'
+    - editMessageIdSource: string — 'last_bot_message' | 'custom'
+    - editMessageIdManual: string — ID или {переменная}
+    - editKeyboardMode: string    — 'keep' | 'remove' | 'node'
+    - editKeyboardNodeId: string  — ID keyboard-узла
+#}
+
+# Обработчики узлов edit_message
+{% for entry in entries -%}
+{%- set sanitized_node_id = entry.nodeId | safe_name -%}
+{%- set sanitized_target_id = entry.targetNodeId | safe_name -%}
+{%- set _cb_pattern = entry.callbackPattern if entry.callbackPattern else entry.nodeId -%}
+{%- set _cb_is_dynamic = entry.callbackPattern and '{' in entry.callbackPattern -%}
+
+{%- if _cb_is_dynamic %}
+{%- set _cb_static_prefix = entry.callbackPattern.split('{')[0] %}
+@dp.callback_query(lambda c: c.data and c.data.startswith("{{ _cb_static_prefix }}"))
+{%- else %}
+@dp.callback_query(lambda c: c.data == "{{ _cb_pattern }}")
+{%- endif %}
+async def handle_callback_{{ sanitized_node_id }}(callback_query: types.CallbackQuery, state: FSMContext = None):
+    """Редактирование сообщения"""
+    try:
+        user_id = callback_query.from_user.id
+        logging.info(f"✏️ edit_message узел {{ entry.nodeId }} для пользователя {user_id}")
+        {%- if _cb_is_dynamic %}
+        # Извлекаем динамическую часть callback_data (ID заявителя)
+        if user_id not in user_data:
+            user_data[user_id] = {}
+        _cb_suffix = (callback_query.data or "").replace("{{ _cb_static_prefix }}", "", 1)
+        if _cb_suffix:
+            user_data[user_id]["_cb_dynamic_id"] = _cb_suffix
+            await set_user_var(user_id, "_cb_dynamic_id", _cb_suffix)
+        {%- endif %}
+
+        {% if entry.editMessageIdSource == 'last_bot_message' %}
+        _msg_id = user_data.get(user_id, {}).get('_last_sent_msg_id')
+        if _msg_id:
+            _msg_id = int(_msg_id)
+        if not _msg_id and hasattr(callback_query, 'message') and callback_query.message:
+            _msg_id = callback_query.message.message_id
+        {% else %}
+        _all_vars = await init_all_user_vars(user_id)
+        {%- set _raw = entry.editMessageIdManual | trim %}
+        {%- if _raw | int(-1) != -1 %}
+        _msg_id = {{ _raw | int }}
+        {%- elif '{' in _raw %}
+        _msg_id_raw = {{ _raw | format_python_text }}
+        _msg_id_str = replace_variables_in_text(_msg_id_raw, _all_vars, {})
+        try:
+            _msg_id = int(_msg_id_str)
+        except (ValueError, TypeError):
+            _msg_id = _msg_id_str
+        {%- else %}
+        _msg_id_str = str(_all_vars.get("{{ _raw }}", ""))
+        try:
+            _msg_id = int(_msg_id_str)
+        except (ValueError, TypeError):
+            _msg_id = None
+            logging.warning(f"edit_message: не удалось получить message_id из переменной '{{ _raw }}' для пользователя {user_id}")
+        {%- endif %}
+        {% endif %}
+
+        _chat_id = callback_query.message.chat.id
+
+        {% if entry.editMode == 'both' %}
+        _all_vars = await init_all_user_vars(user_id)
+        _new_text = replace_variables_in_text({{ entry.editMessageText | format_python_text }}, _all_vars, {})
+        {% if entry.editKeyboardMode == 'remove' %}
+        _edit_markup = None
+        {% elif entry.editKeyboardMode == 'node' %}
+        # Строим клавиатуру из keyboard-узла {{ entry.editKeyboardNodeId }}
+        {% if entry.keyboardLayout and not entry.keyboardLayout.autoLayout %}
+        _edit_btn_map = {}
+        {% for btn in entry.keyboardButtons %}
+        {% if btn.action == 'url' %}
+        _edit_btn_map["{{ btn.id }}"] = InlineKeyboardButton(text=replace_variables_in_text({{ btn.text | format_python_text }}, _all_vars, {}), url="{{ btn.url or '#' }}"{% if btn.style %}, style="{{ btn.style }}"{% endif %})
+        {% elif btn.action == 'goto' or btn.action == 'complete' %}
+        _edit_btn_map["{{ btn.id }}"] = InlineKeyboardButton(text=replace_variables_in_text({{ btn.text | format_python_text }}, _all_vars, {}), callback_data={% if btn.customCallbackData and '{' in btn.customCallbackData %}replace_variables_in_text("{{ btn.customCallbackData }}", _all_vars, {}){% else %}"{{ btn.customCallbackData or btn.target or btn.id or 'btn' }}"{% endif %}{% if btn.style %}, style="{{ btn.style }}"{% endif %})
+        {% else %}
+        _edit_btn_map["{{ btn.id }}"] = InlineKeyboardButton(text=replace_variables_in_text({{ btn.text | format_python_text }}, _all_vars, {}), callback_data="{{ btn.id or 'btn' }}"{% if btn.style %}, style="{{ btn.style }}"{% endif %})
+        {% endif %}
+        {% endfor %}
+        _edit_rows = []
+        {% for row in entry.keyboardLayout.rows %}
+        _edit_row = [_edit_btn_map[bid] for bid in {{ row.buttonIds | tojson }} if bid in _edit_btn_map]
+        if _edit_row:
+            _edit_rows.append(_edit_row)
+        {% endfor %}
+        _edit_markup = InlineKeyboardMarkup(inline_keyboard=_edit_rows)
+        {% else %}
+        _edit_builder = InlineKeyboardBuilder()
+        {% if entry.keyboardEnableDynamicButtons and entry.keyboardDynamicButtons %}
+        import json as _json_edit
+        _edit_source = _all_vars.get("{{ entry.keyboardDynamicButtons.sourceVariable }}")
+        if isinstance(_edit_source, str):
+            try:
+                _edit_source = _json_edit.loads(_edit_source)
+            except Exception:
+                _edit_source = None
+        _edit_items = []
+        if isinstance(_edit_source, dict):
+            _edit_items = _edit_source.get("{{ entry.keyboardDynamicButtons.arrayPath }}", []) if "{{ entry.keyboardDynamicButtons.arrayPath }}" else _edit_source
+        elif isinstance(_edit_source, list):
+            _edit_items = _edit_source
+        for _edit_item in _edit_items:
+            if not isinstance(_edit_item, dict):
+                continue
+            _edit_text = replace_variables_in_text("{{ entry.keyboardDynamicButtons.textTemplate }}", _edit_item, {})
+            _edit_cb = replace_variables_in_text("{{ entry.keyboardDynamicButtons.callbackTemplate }}", _edit_item, {})
+            if _edit_text and _edit_cb:
+                _edit_builder.add(InlineKeyboardButton(text=_edit_text, callback_data=_edit_cb[:64]))
+        _edit_builder.adjust({{ entry.keyboardDynamicButtons.columns }})
+        {% endif %}
+        {% for btn in entry.keyboardButtons %}
+        {% if btn.action == 'url' %}
+        _edit_builder.add(InlineKeyboardButton(text=replace_variables_in_text({{ btn.text | format_python_text }}, _all_vars, {}), url="{{ btn.url or '#' }}"{% if btn.style %}, style="{{ btn.style }}"{% endif %}))
+        {% elif btn.action == 'goto' or btn.action == 'complete' %}
+        _edit_builder.add(InlineKeyboardButton(text=replace_variables_in_text({{ btn.text | format_python_text }}, _all_vars, {}), callback_data={% if btn.customCallbackData and '{' in btn.customCallbackData %}replace_variables_in_text("{{ btn.customCallbackData }}", _all_vars, {}){% else %}"{{ btn.customCallbackData or btn.target or btn.id or 'btn' }}"{% endif %}{% if btn.style %}, style="{{ btn.style }}"{% endif %}))
+        {% else %}
+        _edit_builder.add(InlineKeyboardButton(text=replace_variables_in_text({{ btn.text | format_python_text }}, _all_vars, {}), callback_data="{{ btn.id or 'btn' }}"{% if btn.style %}, style="{{ btn.style }}"{% endif %}))
+        {% endif %}
+        {% endfor %}
+        _edit_builder.adjust({{ entry.keyboardLayout.columns if entry.keyboardLayout else 2 }})
+        _edit_markup = _edit_builder.as_markup()
+        {% endif %}
+        {% elif entry.editKeyboardMode == 'keep' %}
+        _edit_markup = callback_query.message.reply_markup if hasattr(callback_query, 'message') and callback_query.message else None
+        {% else %}
+        _edit_markup = None
+        {% endif %}
+        {% if entry.editFormatMode == 'html' %}
+        await bot.edit_message_text(chat_id=_chat_id, message_id=_msg_id, text=_new_text, parse_mode="HTML", reply_markup=_edit_markup)
+        {% elif entry.editFormatMode == 'markdown' %}
+        await bot.edit_message_text(chat_id=_chat_id, message_id=_msg_id, text=_new_text, parse_mode="Markdown", reply_markup=_edit_markup)
+        {% else %}
+        await bot.edit_message_text(chat_id=_chat_id, message_id=_msg_id, text=_new_text, reply_markup=_edit_markup)
+        {% endif %}
+        {% if entry.nodeId == 'edit-progress-btc-par' %}
+        # #region agent log
+        try:
+            import json as _dbg_json, time as _dbg_time
+            _dbg_vars = await init_all_user_vars(user_id)
+            with open(r"c:\Users\1\Desktop\telegram-bot-builder\debug-4863c5.log", "a", encoding="utf-8") as _dbg_f:
+                _dbg_f.write(_dbg_json.dumps({"sessionId": "4863c5", "hypothesisId": "C", "location": "edit-message:edit-progress-btc-par", "message": "progress_ui_updated", "data": {"btc_done_count": _dbg_vars.get("btc_done_count"), "btc_flag_lucky": _dbg_vars.get("btc_flag_lucky"), "compare_elapsed": _dbg_vars.get("compare_elapsed")}, "timestamp": int(_dbg_time.time() * 1000)}) + "\n")
+        except Exception:
+            pass
+        # #endregion
+        {% endif %}
+
+        {% elif entry.editMode == 'text' %}
+        _all_vars = await init_all_user_vars(user_id)
+        _new_text = replace_variables_in_text({{ entry.editMessageText | format_python_text }}, _all_vars, {})
+        {% if entry.editFormatMode == 'html' %}
+        await bot.edit_message_text(chat_id=_chat_id, message_id=_msg_id, text=_new_text, parse_mode="HTML")
+        {% elif entry.editFormatMode == 'markdown' %}
+        await bot.edit_message_text(chat_id=_chat_id, message_id=_msg_id, text=_new_text, parse_mode="Markdown")
+        {% else %}
+        await bot.edit_message_text(chat_id=_chat_id, message_id=_msg_id, text=_new_text)
+        {% endif %}
+
+        {% elif entry.editMode == 'markup' %}
+        {% if entry.editKeyboardMode == 'remove' %}
+        await bot.edit_message_reply_markup(chat_id=_chat_id, message_id=_msg_id, reply_markup=None)
+        {% elif entry.editKeyboardMode == 'node' %}
+        _all_vars = await init_all_user_vars(user_id)
+        {% if entry.keyboardLayout and not entry.keyboardLayout.autoLayout %}
+        _edit_btn_map = {}
+        {% for btn in entry.keyboardButtons %}
+        {% if btn.action == 'url' %}
+        _edit_btn_map["{{ btn.id }}"] = InlineKeyboardButton(text=replace_variables_in_text({{ btn.text | format_python_text }}, _all_vars, {}), url="{{ btn.url or '#' }}"{% if btn.style %}, style="{{ btn.style }}"{% endif %})
+        {% elif btn.action == 'goto' or btn.action == 'complete' %}
+        _edit_btn_map["{{ btn.id }}"] = InlineKeyboardButton(text=replace_variables_in_text({{ btn.text | format_python_text }}, _all_vars, {}), callback_data={% if btn.customCallbackData and '{' in btn.customCallbackData %}replace_variables_in_text("{{ btn.customCallbackData }}", _all_vars, {}){% else %}"{{ btn.customCallbackData or btn.target or btn.id or 'btn' }}"{% endif %}{% if btn.style %}, style="{{ btn.style }}"{% endif %})
+        {% else %}
+        _edit_btn_map["{{ btn.id }}"] = InlineKeyboardButton(text=replace_variables_in_text({{ btn.text | format_python_text }}, _all_vars, {}), callback_data="{{ btn.id or 'btn' }}"{% if btn.style %}, style="{{ btn.style }}"{% endif %})
+        {% endif %}
+        {% endfor %}
+        _edit_rows = []
+        {% for row in entry.keyboardLayout.rows %}
+        _edit_row = [_edit_btn_map[bid] for bid in {{ row.buttonIds | tojson }} if bid in _edit_btn_map]
+        if _edit_row:
+            _edit_rows.append(_edit_row)
+        {% endfor %}
+        await bot.edit_message_reply_markup(chat_id=_chat_id, message_id=_msg_id, reply_markup=InlineKeyboardMarkup(inline_keyboard=_edit_rows))
+        {% else %}
+        _edit_builder = InlineKeyboardBuilder()
+        {% for btn in entry.keyboardButtons %}
+        {% if btn.action == 'url' %}
+        _edit_builder.add(InlineKeyboardButton(text=replace_variables_in_text({{ btn.text | format_python_text }}, _all_vars, {}), url="{{ btn.url or '#' }}"{% if btn.style %}, style="{{ btn.style }}"{% endif %}))
+        {% elif btn.action == 'goto' or btn.action == 'complete' %}
+        _edit_builder.add(InlineKeyboardButton(text=replace_variables_in_text({{ btn.text | format_python_text }}, _all_vars, {}), callback_data={% if btn.customCallbackData and '{' in btn.customCallbackData %}replace_variables_in_text("{{ btn.customCallbackData }}", _all_vars, {}){% else %}"{{ btn.customCallbackData or btn.target or btn.id or 'btn' }}"{% endif %}{% if btn.style %}, style="{{ btn.style }}"{% endif %}))
+        {% else %}
+        _edit_builder.add(InlineKeyboardButton(text=replace_variables_in_text({{ btn.text | format_python_text }}, _all_vars, {}), callback_data="{{ btn.id or 'btn' }}"{% if btn.style %}, style="{{ btn.style }}"{% endif %}))
+        {% endif %}
+        {% endfor %}
+        _edit_builder.adjust({{ entry.keyboardLayout.columns if entry.keyboardLayout else 2 }})
+        await bot.edit_message_reply_markup(chat_id=_chat_id, message_id=_msg_id, reply_markup=_edit_builder.as_markup())
+        {% endif %}
+        {% else %}
+        await bot.edit_message_reply_markup(chat_id=_chat_id, message_id=_msg_id, reply_markup=None)
+        {% endif %}
+        {% endif %}
+
+        {% if entry.targetNodeId %}
+        await handle_callback_{{ sanitized_target_id }}(callback_query, state=None)
+        {% endif %}
+    except Exception as e:
+        logging.error(f"Ошибка в edit_message {{ entry.nodeId }}: {e}")
+        {% if entry.targetNodeId %}
+        # При ошибке редактирования всё равно переходим к следующему узлу
+        try:
+            await handle_callback_{{ sanitized_target_id }}(callback_query, state=None)
+        except Exception:
+            pass
+        {% endif %}
+
+{% endfor %}

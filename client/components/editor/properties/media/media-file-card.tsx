@@ -1,0 +1,280 @@
+/**
+ * @fileoverview Карточка медиафайла
+ *
+ * Отображает информацию о файле с кнопками просмотра и удаления.
+ * Поддерживает переменные вида {var.path} — показывает иконку вместо img.
+ * File ID с подписью владельца-бота — через TelegramFileIdOwner.
+ * Для видео — отображает блок выбора обложки.
+ *
+ * @module MediaFileCard
+ */
+
+import { useState, useMemo, useEffect } from "react";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Eye, X } from "lucide-react";
+import { ThumbnailSelector } from "./thumbnail-selector";
+import { TelegramFileIdOwner } from "./telegram-file-id-owner";
+import { useProjectTokenLabels } from "./use-project-token-labels";
+
+/**
+ * Проверяет, является ли строка переменной вида {var.path}
+ * @param url - Строка для проверки
+ * @returns true если строка является переменной-плейсхолдером
+ */
+function isVariablePlaceholder(url: string): boolean {
+  return url.startsWith('{') && url.endsWith('}');
+}
+
+/**
+ * Строит URL прокси для превью Telegram file_id.
+ * Берёт первую доступную пару tokenId → fileId из маппинга —
+ * все они валидны, так как пользователь явно указал file_id для каждого токена.
+ * @param fileIdsByToken - Маппинг tokenId → file_id
+ * @param projectId - ID проекта
+ * @returns URL прокси или null
+ */
+function buildFileIdPreviewUrl(
+  fileIdsByToken: Record<string, string>,
+  projectId: number
+): string | null {
+  const entries = Object.entries(fileIdsByToken);
+  if (entries.length === 0) return null;
+
+  /** Берём первую доступную пару — все токены валидны */
+  const [tokenId, fileId] = entries[0];
+
+  return `/api/projects/${projectId}/telegram-file?fileId=${encodeURIComponent(fileId)}&tokenId=${tokenId}`;
+}
+
+/** Пропсы компонента MediaFileCard */
+export interface MediaFileCardProps {
+  /** URL файла */
+  url: string;
+  /** Имя файла */
+  fileName: string;
+  /** Тип файла */
+  fileType: string;
+  /** Описание файла */
+  description?: string;
+  /** Теги файла */
+  tags?: string[];
+  /** Кэшированный Telegram file_id (появляется после первой отправки ботом) */
+  telegramFileId?: string | null;
+  /** Маппинг tokenId → file_id для JSON file_id записей */
+  fileIdsByToken?: Record<string, string>;
+  /** Callback для предпросмотра */
+  onPreview?: () => void;
+  /** Callback для удаления */
+  onRemove?: () => void;
+  /** Флаг скрытого файла */
+  isHidden?: boolean;
+  /** ID видеофайла в БД (нужен для установки обложки) */
+  mediaFileId?: number;
+  /** ID текущей обложки */
+  thumbnailMediaId?: number | null;
+  /** URL текущей обложки */
+  thumbnailUrl?: string | null;
+  /** Прямой URL обложки (из поля thumbnailUrl, без FK) */
+  thumbnailDirectUrl?: string | null;
+  /** ID проекта (нужен для загрузки фото для выбора обложки) */
+  projectId?: number;
+  /** Callback при установке/сбросе обложки — передаёт URL видео и URL обложки */
+  onThumbnailSet?: (videoUrl: string, thumbnailUrl: string | null) => void;
+}
+
+/** Иконка для типа файла */
+const FILE_ICONS: Record<string, string> = {
+  image: '',
+  photo: '',
+  video: '🎥',
+  audio: '🎵',
+  document: '📄',
+  sticker: '📌'
+};
+
+/**
+ * Компонент карточки медиафайла
+ * @param props - Свойства компонента
+ * @returns JSX элемент
+ */
+export function MediaFileCard({
+  url,
+  fileName,
+  fileType,
+  description,
+  tags,
+  telegramFileId,
+  fileIdsByToken,
+  onPreview,
+  onRemove,
+  isHidden = false,
+  mediaFileId,
+  thumbnailMediaId,
+  thumbnailUrl,
+  thumbnailDirectUrl,
+  projectId,
+  onThumbnailSet,
+}: MediaFileCardProps) {
+  /** Флаг ошибки загрузки превью через прокси (fallback на иконку) */
+  const [previewError, setPreviewError] = useState(false);
+  /** Подписи ботов для блока File ID */
+  const tokenLabels = useProjectTokenLabels(projectId);
+
+  /** URL прокси для превью JSON file_id медиа (null если недоступно) */
+  const previewProxyUrl = useMemo(() => {
+    if (!fileIdsByToken || !projectId || Object.keys(fileIdsByToken).length === 0) return null;
+    return buildFileIdPreviewUrl(fileIdsByToken, projectId);
+  }, [fileIdsByToken, projectId]);
+
+  /** Сбрасываем ошибку превью при смене прокси URL */
+  useEffect(() => {
+    setPreviewError(false);
+  }, [previewProxyUrl]);
+
+  /**
+   * Открывает превью изображения
+   */
+  const handlePreview = () => {
+    if (onPreview) {
+      onPreview();
+    } else if (fileType === 'image' || fileType === 'photo') {
+      window.open(url, '_blank');
+    }
+  };
+
+  return (
+    <div className={`relative overflow-hidden rounded-lg border p-3 sm:p-4 ${
+      isHidden 
+        ? 'border-gray-300/60 dark:border-gray-700/60 bg-gradient-to-br from-gray-100/50 to-gray-50/30 dark:from-gray-900/30 dark:to-gray-800/20 opacity-60' 
+        : 'border-emerald-200/60 dark:border-emerald-800/60 bg-gradient-to-br from-emerald-50/50 to-green-50/30 dark:from-emerald-950/30 dark:to-green-900/20'
+    }`}>
+      <div className="flex items-start gap-3">
+        {/* Preview */}
+        <div className="w-10 sm:w-12 h-10 sm:h-12 rounded-lg bg-gradient-to-br from-emerald-100 to-green-100 dark:from-emerald-900/50 dark:to-green-900/50 flex items-center justify-center flex-shrink-0 overflow-hidden relative">
+          {/* Для JSON file_id — показываем превью через прокси если доступен */}
+          {fileIdsByToken && previewProxyUrl && !previewError ? (
+            (fileType === 'photo' || fileType === 'image') ? (
+              <img
+                src={previewProxyUrl}
+                alt={fileName}
+                className="w-full h-full object-cover"
+                onError={() => setPreviewError(true)}
+              />
+            ) : fileType === 'video' ? (
+              <video
+                src={`${previewProxyUrl}#t=0.1`}
+                className="w-full h-full object-cover"
+                muted
+                preload="metadata"
+                onError={() => setPreviewError(true)}
+              />
+            ) : (
+              // Для audio/document — иконка (нет визуального превью)
+              <span className="text-lg sm:text-xl">{FILE_ICONS[fileType] || '📎'}</span>
+            )
+          ) : fileType === 'image' || fileType === 'photo' ? (
+            isVariablePlaceholder(url) ? (
+              // Переменная — показываем иконку вместо img
+              <span className="text-lg">🖼️</span>
+            ) : (
+              <img src={url} alt={fileName} className="w-full h-full object-cover" />
+            )
+          ) : fileType === 'video' ? (
+            isVariablePlaceholder(url) ? (
+              // Переменная — показываем иконку вместо video
+              <span className="text-lg sm:text-xl">{FILE_ICONS.video}</span>
+            ) : (
+              // Превью видеофайла
+              <video
+                src={`${url}#t=0.1`}
+                className="w-full h-full object-cover"
+                muted
+                preload="metadata"
+                onError={(e) => { (e.target as HTMLVideoElement).style.display = 'none'; }}
+              />
+            )
+          ) : (
+            <span className="text-lg sm:text-xl">{FILE_ICONS[fileType]}</span>
+          )}
+          {isHidden && (
+            <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
+              <span className="text-xs text-white font-medium">Скрыт</span>
+            </div>
+          )}
+        </div>
+
+        {/* Info */}
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <p className={`text-xs sm:text-sm font-semibold truncate ${
+              isHidden ? 'text-gray-700 dark:text-gray-300' : 'text-emerald-900 dark:text-emerald-100'
+            }`}>{fileName}</p>
+            {isHidden && (
+              <Badge variant="outline" className="text-xs bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 border-gray-300 dark:border-gray-600">
+                Скрыт
+              </Badge>
+            )}
+          </div>
+          <p className="text-xs text-emerald-700/70 dark:text-emerald-300/70 truncate mt-0.5">{fileType.toUpperCase()}</p>
+          {/* Для JSON file_id записей не показываем сырой JSON — только краткое описание */}
+          {!fileIdsByToken ? (
+            <p className="text-xs text-emerald-600/50 dark:text-emerald-400/50 truncate mt-1">{url}</p>
+          ) : (
+            <p className="text-xs text-emerald-600/50 dark:text-emerald-400/50 mt-1">
+              file_id · {Object.keys(fileIdsByToken).length} {Object.keys(fileIdsByToken).length === 1 ? 'токен' : 'токена'}
+            </p>
+          )}
+        </div>
+
+        {/* Actions */}
+        <div className="flex items-center gap-1.5">
+          {fileType === 'image' && !isHidden && (
+            <Button size="sm" variant="ghost" onClick={handlePreview} className="h-8 w-8 p-0">
+              <Eye className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+            </Button>
+          )}
+          {onRemove && (
+            <Button size="sm" variant="ghost" onClick={onRemove} className="h-8 w-8 p-0">
+              <X className="w-4 h-4 text-red-600 dark:text-red-400" />
+            </Button>
+          )}
+        </div>
+      </div>
+
+      {/* Details */}
+      {(description || tags?.length || telegramFileId !== undefined || fileIdsByToken !== undefined) && (
+        <div className="mt-3 space-y-2 bg-slate-50/50 dark:bg-slate-900/30 rounded-lg p-2 border border-slate-200/40 dark:border-slate-800/40">
+          {description && (
+            <p className="text-xs sm:text-sm text-slate-700 dark:text-slate-300">
+              <i className="fas fa-quote-left mr-2 text-slate-400"></i>
+              {description}
+            </p>
+          )}
+          {tags?.map((tag, i) => (
+            <Badge key={i} variant="secondary" className="text-xs mr-1">
+              <i className="fas fa-tag text-xs mr-1"></i>{tag}
+            </Badge>
+          ))}
+          <TelegramFileIdOwner
+            telegramFileId={telegramFileId}
+            fileIdsByToken={fileIdsByToken}
+            tokenLabels={tokenLabels}
+          />
+        </div>
+      )}
+
+      {/* Выбор обложки для видео — только для обычных файлов, не для JSON file_id записей */}
+      {fileType === 'video' && projectId && !fileIdsByToken && (
+        <div className="mt-2">
+          <ThumbnailSelector
+            currentThumbnailUrl={thumbnailUrl}
+            projectId={projectId}
+            videoFileId={mediaFileId}
+            onThumbnailSet={(thumbUrl) => onThumbnailSet?.(url, thumbUrl)}
+          />
+        </div>
+      )}
+    </div>
+  );
+}

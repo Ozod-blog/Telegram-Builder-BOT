@@ -1,0 +1,173 @@
+/**
+ * @fileoverview Генерация обработчиков для типов узлов через шаблоны
+ * @module generate/generate-new-node-handlers
+ */
+
+import { Node } from '@shared/schema';
+import { generateBroadcastBotFromNode } from '../broadcast-bot/broadcast-bot.renderer';
+import { generateBroadcastClientFromNode } from '../broadcast-client/broadcast-client.renderer';
+import { generateSticker as generateStickerTemplate } from '../sticker/sticker.renderer';
+import { generateVoice as generateVoiceTemplate } from '../voice/voice.renderer';
+
+/**
+ * Определяет тип медиа по URL и возвращает объект с нужным полем.
+ */
+
+/**
+ * Проверяет является ли URL локальным путём к загруженному файлу.
+ * Только пути начинающиеся с /uploads/ считаются локальными.
+ * Внешние URL (http/https) содержащие /uploads/ в пути — не локальные.
+ * @param url - URL для проверки
+ * @returns true если это локальный /uploads/ путь
+ */
+export function isLocalUploadPath(url: string): boolean {
+  return typeof url === 'string' && url.startsWith('/uploads/');
+}
+export function resolveMediaUrls(data: any): {
+  imageUrl: string;
+  videoUrl: string;
+  audioUrl: string;
+  documentUrl: string;
+  attachedMediaUrls: string[];
+  /** Флаг: imageUrl является локальным путём /uploads/ */
+  isLocalImageUrl: boolean;
+  /** Флаг: videoUrl является локальным путём /uploads/ */
+  isLocalVideoUrl: boolean;
+  /** Флаг: audioUrl является локальным путём /uploads/ */
+  isLocalAudioUrl: boolean;
+  /** Флаг: documentUrl является локальным путём /uploads/ */
+  isLocalDocumentUrl: boolean;
+} {
+  const imageUrl = data?.imageUrl || '';
+  const videoUrl = data?.videoUrl || '';
+  const audioUrl = data?.audioUrl || '';
+  const documentUrl = data?.documentUrl || '';
+  const rawAttached: unknown[] = Array.isArray(data?.attachedMedia) ? data.attachedMedia : [];
+
+  if (imageUrl || videoUrl || audioUrl || documentUrl) {
+    return {
+      imageUrl,
+      videoUrl,
+      audioUrl,
+      documentUrl,
+      attachedMediaUrls: rawAttached as string[],
+      isLocalImageUrl: isLocalUploadPath(imageUrl),
+      isLocalVideoUrl: isLocalUploadPath(videoUrl),
+      isLocalAudioUrl: isLocalUploadPath(audioUrl),
+      isLocalDocumentUrl: isLocalUploadPath(documentUrl),
+    };
+  }
+
+  const urlStrings = (rawAttached as string[]).filter(u => typeof u === 'string' && (u.startsWith('http') || u.startsWith('/uploads/') || u.startsWith('{"__type":"file_id"') || (u.startsWith('{') && u.endsWith('}'))));
+
+  // Переменные вида {varName} — всегда остаются в attachedMediaUrls, не разбираются как URL
+  const hasVariableItems = urlStrings.some(u => u.startsWith('{') && u.endsWith('}') && !u.startsWith('{"__type"'));
+  if (hasVariableItems) {
+    return {
+      imageUrl: '',
+      videoUrl: '',
+      audioUrl: '',
+      documentUrl: '',
+      attachedMediaUrls: urlStrings,
+      isLocalImageUrl: false,
+      isLocalVideoUrl: false,
+      isLocalAudioUrl: false,
+      isLocalDocumentUrl: false,
+    };
+  }
+  if (urlStrings.length === 0) {
+    return {
+      imageUrl,
+      videoUrl,
+      audioUrl,
+      documentUrl,
+      attachedMediaUrls: [],
+      isLocalImageUrl: false,
+      isLocalVideoUrl: false,
+      isLocalAudioUrl: false,
+      isLocalDocumentUrl: false,
+    };
+  }
+
+  // Для определения типа медиа используем только обычные URL (не JSON file_id)
+  const regularUrls = urlStrings.filter(u => !u.startsWith('{"__type":"file_id"'));
+  const fileIdUrls = urlStrings.filter(u => u.startsWith('{"__type":"file_id"'));
+
+  // Если есть JSON file_id вместе с обычными URL — оставляем всё в attachedMediaUrls
+  // для генерации медиагруппы в шаблоне (не разбиваем на videoUrl/imageUrl)
+  if (fileIdUrls.length > 0 && regularUrls.length > 0) {
+    return {
+      imageUrl: '',
+      videoUrl: '',
+      audioUrl: '',
+      documentUrl: '',
+      attachedMediaUrls: urlStrings,
+      isLocalImageUrl: false,
+      isLocalVideoUrl: false,
+      isLocalAudioUrl: false,
+      isLocalDocumentUrl: false,
+    };
+  }
+
+  const firstForType = regularUrls.length > 0 ? regularUrls[0].toLowerCase() : '';
+  const isPhoto = firstForType ? /\.(jpg|jpeg|png|webp)(\?|#|$)/.test(firstForType) : false;
+  const isVideo = firstForType ? /\.(mp4|mov|avi|mkv|webm|3gp|flv)(\?|#|$)/.test(firstForType) : false;
+  const isAudio = firstForType ? /\.(mp3|ogg|oga|wav|m4a|flac|aac)(\?|#|$)/.test(firstForType) : false;
+  const isDoc = firstForType ? (!isPhoto && !isVideo && !isAudio) : false;
+
+  const resolvedImageUrl = isPhoto ? regularUrls[0] : '';
+  const resolvedVideoUrl = isVideo ? regularUrls[0] : '';
+  const resolvedAudioUrl = isAudio ? regularUrls[0] : '';
+  const resolvedDocumentUrl = isDoc ? regularUrls[0] : '';
+
+  return {
+    imageUrl: resolvedImageUrl,
+    videoUrl: resolvedVideoUrl,
+    audioUrl: resolvedAudioUrl,
+    documentUrl: resolvedDocumentUrl,
+    attachedMediaUrls: urlStrings,
+    isLocalImageUrl: isLocalUploadPath(resolvedImageUrl),
+    isLocalVideoUrl: isLocalUploadPath(resolvedVideoUrl),
+    isLocalAudioUrl: isLocalUploadPath(resolvedAudioUrl),
+    isLocalDocumentUrl: isLocalUploadPath(resolvedDocumentUrl),
+  };
+}
+
+/**
+ * Генерирует обработчик рассылки (broadcast)
+ */
+export function generateBroadcastHandler(
+  node: Node,
+  allNodes: Node[] = []
+): string {
+  return node.data?.broadcastApiType === 'client'
+    ? generateBroadcastClientFromNode(node, allNodes)
+    : generateBroadcastBotFromNode(node, allNodes);
+}
+
+/**
+ * Генерирует обработчик стикеров (sticker)
+ */
+export function generateStickerHandler(node: Node): string {
+  return generateStickerTemplate({
+    nodeId: node.id,
+    stickerUrl: node.data?.stickerUrl || '',
+    stickerFileId: node.data?.stickerFileId || '',
+    stickerSetName: node.data?.stickerSetName || '',
+    mediaCaption: node.data?.mediaCaption || '',
+    disableNotification: node.data?.disableNotification || false,
+  });
+}
+
+/**
+ * Генерирует обработчик голосовых (voice)
+ */
+export function generateVoiceHandler(node: Node): string {
+  return generateVoiceTemplate({
+    nodeId: node.id,
+    voiceUrl: node.data?.voiceUrl || '',
+    mediaCaption: node.data?.mediaCaption || '',
+    mediaDuration: node.data?.mediaDuration || 0,
+    disableNotification: node.data?.disableNotification || false,
+  });
+}
